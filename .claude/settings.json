@@ -12,6 +12,12 @@
       "Bash(git push origin main:*)"
     ]
   },
+  "enabledPlugins": {
+    "guard@claude-mods": true,
+    "fleet@claude-mods": true,
+    "route@claude-mods": true,
+    "lean@claude-mods": true
+  },
   "extraKnownMarketplaces": {
     "claude-mods": {
       "source": {
@@ -20,18 +26,17 @@
       }
     }
   },
-  "enabledPlugins": {
-    "guard@claude-mods": true,
-    "fleet@claude-mods": true,
-    "route@claude-mods": true,
-    "lean@claude-mods": true
-  },
   "claudeMods": {
     "guard": {
-      "secretPaths": ["Config.xcconfig"],
+      "secretPaths": [
+        "Config.xcconfig"
+      ],
       "cloudClis": [
         {
-          "names": ["fly", "flyctl"],
+          "names": [
+            "fly",
+            "flyctl"
+          ],
           "readOnly": [
             "status",
             "logs",
@@ -109,9 +114,14 @@
       }
     },
     "fleet": {
-      "coordinator": "coord",
+      "coordinator": "vigil-coord",
       "healthUrl": "https://parkagent-api.fly.dev/health",
-      "workflows": [{ "file": "nightly-fr.yml", "label": "Nightly FR" }],
+      "workflows": [
+        {
+          "file": "nightly-fr.yml",
+          "label": "Nightly FR"
+        }
+      ],
       "recentRuns": 6
     },
     "lean": {
