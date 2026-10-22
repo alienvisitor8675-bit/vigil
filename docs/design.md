@@ -15,7 +15,7 @@ Oct 22, 2026 · @Thomas Bardhi
 
 ## Summary
 
-Vigil is one orchestrator that runs many isolated coding sessions in parallel across your repos, routes each task to a model backend (Claude, a local model on your Linux tower, OpenRouter, or a custom endpoint), and records every session as one trace you can open. Claude does first drafts, anything hard or on a money/auth path, and every review. OpenCode workers on the tower do routine work for free.
+Vigil is one orchestrator that runs many isolated coding sessions in parallel across your repos, routes each task to a model backend (Claude, a local model on your Linux tower, OpenRouter, or a custom endpoint), and records every session as one trace you can open. Claude does first drafts, anything hard or on a money/auth path, and every review. OpenCode workers on local models served by the tower do routine work for free.
 
 The operating rule: **a task is a contract, not a chat.** Every session gets a written spec with a test that must go from red to green, runs in its own container and worktree, cannot merge or deploy, and ends in a PR that a fresh-context Claude reviews before a human merges. Spawn from the CLI (`vigil run`), from a Claude Code session (an MCP tool), from the web UI, or from a GitHub label; all four hit the same API.
 
@@ -50,7 +50,7 @@ Everything runs on the **Mac mini** (Apple Silicon, Docker Desktop, images built
 | Web UI | served by `vigild`, Tailscale only | New session, sessions list, session detail timeline, budgets and WIP limits; same API as the CLI and MCP |
 | Claude executor | Mac mini, one container per task | Claude Agent SDK, headless, model key as a file, guard plugin, OTel on |
 | OpenCode executor | Mac mini, one container per task | `opencode serve` (v2) + the task's clone, pointed at the session's backend |
-| `llama-server` | tower host (GPU) | Qwen3.6-35B-A3B main, gpt-oss-20b for small jobs, LFM2.5 decider; router mode |
+| `llama-server` | tower host (GPU) | Qwen3.6-35B-A3B main, gpt-oss-20b for small jobs, LFM2.5 decider; 2 slots |
 | Tower exporter | tower host | GPU, VRAM, CPU, RAM and watts sampled each second |
 | Reviewer | Mac mini, container per PR | Claude, fresh context, diff + issue + checklist only |
 | Langfuse + OTel Collector | Mac mini, Docker Compose | One trace per session |
@@ -200,7 +200,7 @@ The `~typesafe/jev-latest` alias floats, so it is not used. Vercel AI Gateway al
 
 | Backend | Where | Use |
 | --- | --- | --- |
-| Jev via Cloudflare Workers AI or OpenRouter | hosted | default decider; zero-retention route for private repos, any route for public ones |
+| Jev via Cloudflare Workers AI or OpenRouter | hosted | default decider; for a private repo only the Cloudflare zero-retention route, and only where `repos.yaml` lists it; any route for public ones |
 | Claude Haiku with constrained JSON output | hosted | ceiling in the eval, and the escalation target when Jev's confidence is low |
 | Liquid AI LFM2.5-1.2B-Instruct with a JSON-schema grammar in llama.cpp, logprobs read for confidence | tower | local fallback when offline, and the eval candidate for "can a small open model match Jev on these questions" |
 
@@ -208,7 +208,7 @@ The decider questions are declared in code (`vigild/decider/questions.py`), one 
 
 Thresholds start at 0.85 to act and 0.6 to escalate to Haiku; below 0.6 the task waits for you. The eval measures each backend's agreement with your own labels on 30 past issues, and the thresholds are tuned from that, not guessed.
 
-One repo covers both public and private targets. `vigil` is a single private repo. The decider route **and the model backends** are chosen per target repo in `configs/repos.yaml`, and `vigild` refuses to send a private repo's text to a backend or route not listed for it.
+One repo covers both public and private targets. `vigil` is a single private repo. The decider route **and the model backends** are chosen per target repo in `configs/repos.yaml`, and `vigild` refuses to send a private repo's text to a backend or route not listed for it. For a private repo the list may name local backends and `jev-cloudflare` only; vigild refuses to start with any other hosted entry there.
 
 **Private repos never go to a hosted API**, with one exception: Jev over Cloudflare zero-retention, and only where a repo lists it. Whether `thomasbardhi01/vigil` itself lists `anthropic` (for self-maintenance) is open decision Q2 in `docs/architecture.md`.
 
@@ -253,9 +253,10 @@ Hardware: Linux, RTX 5070 Ti (16 GB GDDR7), 32 GB DDR5. The right shape is a mix
 | LFM2.5-1.2B-Instruct, Q4\_K\_M (\~0.7 GB) | on GPU | local decider (`lfm-tower`) | loaded on demand |
 | Qwen3.8-27B, Q3 (\~12–13 GB) | on GPU, short ctx | eval candidate only | not resident |
 
-Both workers cannot be resident at once in 16 GB. `llama-server` runs in **router mode** (`--models-dir`, `--models-max 1`, `--sleep-idle-seconds 1800`):
-- It loads the requested model on demand and sleeps after 30 idle minutes, so the swap and idle unload need no script on the tower and no control channel from the Mac.
-- `vigild` still decides *when* to ask for gpt-oss-20b: only when the queue holds XS tasks and no `local` task is running.
+Both workers cannot be resident at once in 16 GB. `vigild` owns model lifecycle: it keeps Qwen resident, and asks for gpt-oss-20b only when the queue holds XS tasks and no `local` task is running.
+- **The open question is the mechanism.** vigild now runs on the Mac and nothing extra may be installed on the tower, so the design's swap script and timer have no control channel.
+- **Proposal P6** in `docs/architecture.md` is llama-server's router mode (`--models-dir`, `--models-max 1`, `--sleep-idle-seconds 1800`), which loads on demand and sleeps when idle.
+- **Without P6**, vigild swaps over SSH with a forced-command key.
 - **Sharing with Hearth.** Before any load, `vigild` reads free VRAM from the tower exporter, and runs one slot when under 10 GB is free. You have the whole tower for now, but the design is ready for sharing it with Hearth.
 
 Swap cost is 10–20 s of load, cheaper than the quality loss of running XS tasks on nothing.
@@ -306,7 +307,7 @@ Session flow, per task:
 {
   "$schema": "https://opencode.ai/config.json",
   "providers": { "tower": { "package": "@opencode/ai/providers/openai-compatible",
-    "settings": { "baseURL": "http://tower:8080/v1", "apiKey": "{env:LLAMA_API_KEY}" },
+    "settings": { "baseURL": "http://tower:8080/v1", "apiKey": "{file:/run/secrets/model_key}" },
     "models": { "qwen3.6-35b-a3b": { "limit": { "context": 65536 } } } } },
   "model": "tower/qwen3.6-35b-a3b",
   "permissions": [
@@ -332,7 +333,7 @@ Session flow, per task:
 }
 ```
 
-v2's `serve` has no `--auto` flag. In serve mode an `ask` becomes a permission request on the API, so the config has no `ask` effects at all. `vigild` answers any permission request it still receives with `reject` (`POST /api/session/{id}/permission/{requestID}/reply`) and logs it. The model key comes from a read-only file, never the image. OpenCode's own docs say the shell resource is raw text and best-effort, so this list is the first layer only; the container (next section) is the real one.
+v2's `serve` has no `--auto` flag. In serve mode an `ask` becomes a permission request on the API, so the config has no `ask` effects at all. `vigild` answers any permission request it still receives with `reject` (`POST /api/session/{id}/permission/{requestID}/reply`) and logs it. The model key comes from a read-only file (`{file:…}`, checked against v2 in phase 4), never the image or the environment. OpenCode's own docs say the shell resource is raw text and best-effort, so this list is the first layer only; the container (next section) is the real one.
 
 Why OpenCode over OpenHands, in one paragraph: OpenHands bundles its own sandbox and a heavier runtime per session, which duplicates what Docker Compose already gives you, and its agent loop is harder to drive turn-by-turn from outside. OpenCode is a thin server with an OpenAPI spec, a per-session SSE bus, fork/abort/diff endpoints and a permission model that mirrors your guard plugin. For a fleet where the orchestrator owns isolation, the thin server wins. If a future model needs OpenHands-specific tooling, it is one more executor adapter.
 
@@ -441,7 +442,7 @@ At a 20% escalation rate the local tier saves about a third. At 50% escalation i
 
 **Budget scale.** The table above assumed about $40/day. Your caps are $5/day and $2/task, so expect roughly 3–6 Sonnet tasks a day with their reviews. The 100% Opus audit at rung 0 is the largest line until shapes graduate.
 
-**GPU lifecycle on the tower.** `llama-server` (router mode) keeps a model loaded while requests come and sleeps it after 30 idle minutes, dropping idle power to a few watts. Load time is 15–30 s from NVMe, so the first task of a batch pays that once. gpt-oss-20b swaps in only for XS tasks, as described above.
+**GPU lifecycle on the tower.** `llama-server` keeps a model loaded while the queue has local work and unloads it after 30 idle minutes, dropping idle power to a few watts. The mechanism is router mode if P6 is accepted, and vigild over SSH if not. Load time is 15–30 s from NVMe, so the first task of a batch pays that once. gpt-oss-20b swaps in only for XS tasks, as described above.
 
 **Overflow.** RunPod serverless (scale-to-zero) running vLLM with a bigger model is the only paid GPU option in the design, and it is off until the eval shows a task shape where the tower's models fail and the hosted model passes. A persistent rented H100 at \~$2–3/hour costs more per day than the all-Claude column; it is never worth it for one developer.
 
@@ -466,9 +467,10 @@ A separate repo, `vigil`, with the same rules as ParkAgent (tests first, docs in
 
 ```text
 vigil/
-  vigild/            FastAPI app: api/, intake/, decider/, router/, scheduler/, executors/{claude,opencode}/,
+  vigild/            FastAPI app: api/, contract/, intake/, decider/, router/, scheduler/, executors/{claude,opencode}/,
                      review/, metering/, telemetry/, github/, web/ (static HTML, CSS, JS; docs/ui.md)
   cli/               `vigil` CLI and the MCP server (same client library)
+  scripts/           repo checks run in CI (check-feature-map.py)
   schemas/           task, result and event JSON schemas
   images/            Dockerfiles (linux/arm64): claude-executor (also reviewer/auditor), opencode-executor, egress-proxy
   tower/             llama-server systemd unit, models.lock, exporter/ (NVML + psutil service), check.sh
@@ -494,7 +496,7 @@ The per-phase detail (deliverables, credentials, spend) is in `docs/architecture
 | 2. Review ladder + fleet + CLI/MCP | reviewer (Sonnet) + auditor (Opus), rung-0 audit of 100%, scheduler with dep graph, 3 parallel containers, WIP limit, escalation, `vigil` CLI + MCP server, label intake | 3 batch tasks run in parallel, reviewed and audited; `vigil kill` works; dispatched once from a Claude Code session |
 | 3. Web UI + metering endpoint | the web UI in `docs/ui.md`; metering as JSON and Prometheus `/metrics`; one API behind CLI, MCP and UI | a session started from `/new` shows live on the board; its detail page shows each model call with tokens and cost summing to the session total; `/metrics` shows it; a screenshot of each page in the PR |
 | 4. OpenCode executor on Claude | OpenCode v2 executor image pointed at Claude through OpenCode's Anthropic provider; both executors pass the same contract tests | the same docs task passes through both executors with identical results and traces |
-| 5. Tower | llama-server unit (router mode), models.lock, tower exporter, GPU metering (J/token, GPU-s/token), tower presets, OpenCode provider switched to the tower, LFM added as the local decider backend | `tower/check.sh` passes; one local task opens a PR; tokens/s and J/token recorded and shown |
+| 5. Tower | llama-server unit, models.lock, tower exporter, GPU metering (J/token, GPU-s/token), tower presets, OpenCode provider switched to the tower, LFM added as the local decider backend | `tower/check.sh` passes; one local task opens a PR; tokens/s and J/token recorded and shown |
 | 6. Eval + tuning | `evals/run.py` over workers, reviewers and deciders; routing.yaml and review.yaml edited from results | results.csv committed; first shapes at rung 1; cost table in the UI uses real numbers |
 
 After phase 6: the training-data firewall exporter (the provenance tag exists from phase 1), the RunPod overflow adapter if the eval calls for it, and more repos added via `repos.yaml`.

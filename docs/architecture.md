@@ -88,21 +88,21 @@ edits this table.
 | B2 | vigild's database | SQLite in WAL mode through the stdlib `sqlite3` module | One writer and one machine. No server, and no ORM dependency. Postgres runs only inside Langfuse. |
 | B3 | Workspace per task | A **per-task clone** from a local mirror (`git clone --local` hard-links objects), not `git worktree add` | A worktree's `.git` is a file pointing at the main repo's git dir on the host. That path isn't inside the mount, so git fails in the container. Mounting the shared git dir writable would expose every other task's refs. A local clone is self-contained, and its objects are hard links, so it's nearly free. |
 | B4 | Egress enforcement | Each session gets its own `internal: true` Docker network. A **smokescreen** sidecar sits on that network and a normal one, and the worker has `HTTPS_PROXY` set to it | The design's host nftables option doesn't exist on Docker Desktop for Mac (containers run in Desktop's VM). An internal network has no default route, so the proxy is the only way out. smokescreen is a CONNECT proxy built for hostname allowlists, and it blocks private IP ranges by default. **DNS is not the boundary:** Desktop's DNS may still resolve outside names on an internal network, so the tests assert that a connection fails, not that a name fails to resolve. |
-| B5 | Proxy topology | One sidecar per session, its allowlist generated from the session's role and backend | The allowlist is exact per session (an OpenRouter session can reach openrouter.ai and nothing a Claude session can't). There's no mTLS role setup, and sessions can't reach each other. The cost is about 20 MB per session. |
+| B5 | Proxy topology | One sidecar per session, its allowlist generated from the session's role and backend. vigild also attaches the **OTel collector** to each session's internal network while the session runs, and the worker sends OTLP straight to it. Nothing else joins that network | The allowlist is exact per session (an OpenRouter session can reach openrouter.ai and nothing a Claude session can't). There's no mTLS role setup, and sessions can't reach each other. The collector is the one shared container on a session network. It only receives, and its own exits go to Langfuse and vigild. Telemetry never passes through the proxy, which blocks private addresses. The cost is about 20 MB per session. |
 | B6 | Web UI stack | FastAPI serves static `index.html`, plain ES modules and one CSS file. Live data comes from FastAPI's native SSE, read with `fetch()` and a small parser. The design is in `docs/ui.md` | No build step, no framework, no vendored library. One person can read it in an afternoon. `EventSource` can't send an `Authorization` header, and a fetch reader keeps one auth mechanism. |
-| B7 | API auth | Three bearer-token scopes: `VIGIL_API_TOKEN` (admin), `VIGIL_METRICS_TOKEN` (read metering) and `VIGIL_HEARTBEAT_TOKEN` (write heartbeats only). vigild binds `127.0.0.1` and the Mac's Tailscale address only. The UI asks for the token once and keeps it in `localStorage` | One mechanism for the CLI, MCP, UI, Hearth and outside sessions' heartbeats. Tailscale ACLs decide who can reach the port; the token decides what they can do. |
+| B7 | API auth | Three bearer-token scopes: `VIGIL_API_TOKEN` (admin), `VIGIL_METRICS_TOKEN` (read metering) and `VIGIL_HEARTBEAT_TOKEN` (write heartbeats only). vigild binds `127.0.0.1` and the Mac's Tailscale address only. The CLI and `vigil mcp` read `VIGIL_API_TOKEN` from `~/.config/vigil/env`, not from a file of their own. The UI asks for the token and keeps it **in memory only**: the shell is one page, so the token lasts until the tab closes or reloads (P7 would keep it in `localStorage`) | One mechanism for the CLI, MCP, UI, Hearth and outside sessions' heartbeats. Tailscale ACLs decide who can reach the port; the token decides what they can do. Secrets stay in the one env file. |
 | B8 | MCP server | `vigil mcp`, a stdio server built on the MCP Python SDK v2 (`MCPServer`), calling the REST API through the same client as the CLI | The design says the CLI and MCP share a client library, and the MCP server runs where Claude Code runs. With stdio, ParkAgent's `.mcp.json` needs a command, not a URL plus a secret header. |
 | B9 | HTTP client | `httpx2` everywhere | The MCP SDK v2 already depends on it, so one client instead of two. |
-| B10 | Model swap and idle unload on the tower | llama-server **router mode** (`--models-dir`, `--models-max 1`, `--sleep-idle-seconds 1800`) | The design had vigild swap ports and a systemd timer call vigild to stop a unit, and that needs a control channel from the Mac into the tower. Router mode loads on demand and sleeps when idle, with nothing else on the tower. vigild still checks free VRAM before asking for a model. |
+| B10 | Model swap and idle unload on the tower | **Proposed, not decided: P6.** llama-server router mode (`--models-dir`, `--models-max 1`, `--sleep-idle-seconds 1800`) | The design has vigild own the model lifecycle through a swap script and a systemd timer on the tower. Your rule that nothing else is installed on the tower, and vigild's move to the Mac, leave that with no control channel. Router mode is the simplest fix, but it changes a design decision, so it waits for your yes. vigild checks free VRAM before asking for a model either way. |
 | B11 | Tower exporter | A ~150-line Python service: `nvidia-ml-py` + `psutil` + `prometheus-client`, pinned in a `uv` lockfile, systemd unit | DCGM's datacenter metrics don't apply to one GeForce card. NVML gives power (mW, averaged over 1 s), a cumulative energy counter (mJ), utilization and memory. |
-| B12 | GPU attribution | Each 1 s sample's energy and GPU time is split across the local sessions with a model request in flight at that second, weighted by tokens. With one session, it all goes to that session | llama-server's `/metrics` counters are server-wide and `/slots` has no client id. Exact attribution needs each response's `timings`, which only something on the wire sees (see proposal P1). |
+| B12 | GPU attribution | As you specified: each 1 s sample goes to the **session holding the llama-server slot**, split evenly when both slots are busy. With one local session, it holds the slot. With two, vigild matches each busy slot (`/slots` `is_processing`) to the session with a request in flight on the OpenCode event stream at that second | llama-server's `/metrics` counters are server-wide, and `/slots` has no client id. So with two sessions the slot-to-session match is inferred, and the PR says so. Exact matching needs `id_slot` or the per-response `timings` on the wire (P1). |
 | B13 | Per-call API metering | Claude executor: every `claude_code.api_request` OTel log event (model, input, output, cache-read and cache-write tokens), fanned out by the collector to vigild's OTLP/HTTP logs receiver. OpenCode: the v2 event stream's message usage. **Cost is always tokens × `configs/prices.yaml`**; the SDK's `total_cost_usd` and `model_usage[*].costUSD` are reconciled against it in a test | The SDK's cost figures are client-side estimates, and `ResultMessage.usage` leaves out subagents. One price table gives one cost for every provider. |
-| B14 | Budget hard stop | Before any session starts (reviews and audits included), vigild **reserves** the session's `max_cost_usd`. A start is refused unless spent today + open reservations + this reservation ≤ the daily cap, and the same holds for the monthly cap. The SDK's `max_budget_usd` is set to the reservation, and vigild kills a session whose metered cost reaches it | The daily cap can't be exceeded by more than one in-flight request per running session. That bound is written down and tested, not hoped for. |
-| B15 | Keys in containers | The model key is a read-only file at `/run/secrets/model_key`. Claude Code reads it through an `apiKeyHelper` script, so it never enters the environment | You required a file mount. `apiKeyHelper` keeps it out of `env` and out of `/proc/*/environ`. |
+| B14 | Budget hard stop | Before any session starts (reviews and audits included), vigild **reserves** the session's `max_cost_usd`. A start is refused unless spent today + open reservations + this reservation ≤ the daily cap, and the same check runs against the **monthly cap, which is mandatory**: you said monthly spend must stay under the org's credit, and $5 × 31 days is $155, over the $100 floor. Its value is P4. The SDK's `max_budget_usd` is set to the reservation, and vigild kills a session whose metered cost reaches it | The daily cap can't be exceeded by more than one in-flight request per running session. That bound is written down and tested, not hoped for. |
+| B15 | Keys in containers | The model key is a read-only file at `/run/secrets/model_key`. Claude Code reads it through an `apiKeyHelper` script, and OpenCode through `{file:/run/secrets/model_key}`, checked against v2 in phase 4. It never enters any environment. The guard config (`secretPaths: ["run/secrets/**"]`) and the managed-settings deny list (`Read(/run/secrets/**)`) refuse the agent's own reads of it | You required a file mount. **The honest limit:** the file must be readable by the uid the agent's shell runs as, so layer 2 doesn't stop a determined read. Only the layer-3 rules do, and they are best effort against arbitrary programs. The key is the org's vigil key, capped by the Console limit. P1 (a gateway) is the fix that keeps it out of containers entirely. |
 | B16 | Guard in the Claude executor | At image build, claude-mods is cloned at a pinned SHA using a down-scoped (contents:read) App token passed as a BuildKit secret, and installed into a plugin seed dir (`CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed`). At run time the container has `CLAUDE_CODE_PLUGIN_SEED_DIR=/opt/claude-seed` and `CLAUDE_CODE_SYNC_PLUGIN_INSTALL=1`. The deny list, `enabledPlugins` and `claudeMods.guard` go in the image's **managed settings** (`/etc/claude-code/managed-settings.json`), which project settings can't loosen | The SDK's `plugins=` takes only local paths, and nothing is cloned at run time. vigild reads the SDK init message and **aborts the session if `guard` isn't in its loaded plugins** (fail closed). The managed-settings path gets checked in phase 1's first container test. |
 | B17 | Non-root executor user | uid 10001, `--read-only`, `--cap-drop ALL`, `--security-opt no-new-privileges`, `--pids-limit 512`, a memory cap, tmpfs `/tmp` | `bypassPermissions` refuses to run as root, and the design wants all of these anyway. All are standard flags on Docker Desktop. |
 | B18 | Read-only overlays on the clone | `.github/`, `.claude/`, `.opencode/`, `.git/hooks/` and `.git/config` are bind-mounted read-only over `/work` | `bypassPermissions` lets the agent write `.claude/`. Hooks and `core.hooksPath` live in `.git/`, so the pre-push hook is only a weak layer if those stay writable. |
-| B19 | GitHub App permissions | Contents: write, Pull requests: write, Issues: read, Metadata: read. **No Workflows permission**, deliberately | Label intake reads issues. Without `workflows`, GitHub itself refuses any push that touches `.github/workflows`, which is a layer-1 control for "change its own rules". claude-mods tokens are always minted `{"contents":"read"}` for that one repo (the runbook explains why a per-install setting can't do this). |
+| B19 | GitHub App permissions | Contents: write, Pull requests: write, Issues: read, Metadata: read. **No Workflows permission**, deliberately | Label intake reads issues. Without `workflows`, GitHub itself refuses any push that touches `.github/workflows`, which is a layer-1 control for "change its own rules". claude-mods tokens are always minted `{"contents":"read"}` for that one repo (the runbook explains why a per-install setting can't do this). **Residual risk:** a leaked App key, or a vigild bug, could still write to claude-mods, including the guard's own source. A second read-only App removes that (runbook). |
 | B20 | Where vigild's status issues live | In **this repo**, one issue per target repo | The App has no `issues: write` on target repos, and coord's rules forbid writing to ParkAgent. Intake still reads labels there. |
 | B21 | Decider routes | Jev on Cloudflare Workers AI: `POST /accounts/{id}/ai/run`, model `typesafe/jev` in the body. Jev on OpenRouter: the **Decisions API** (`/api/alpha/decisions`), pinned to `typesafe/jev-1.13` with `provider.zdr: true`. Haiku 5.5 with `output_config.format` JSON schema. LFM2.5-1.2B-Instruct on llama-server with `json_schema` and `n_probs` | Jev is not a chat-completions model on OpenRouter. Cloudflare's id is unversioned, so vigild records the model version each answer reports and flags a change. Cloudflare caps context at 32k, so `duplicate_of` gets issue titles, not bodies. |
 | B22 | OpenCode v2 driving | Wait on `GET /api/info`. Hold `GET /api/event` (SSE) open, and reconnect and reconcile from session state on any drop. Start with `POST /api/session` then `POST /api/session/{id}/prompt`; finish with `GET /api/session/{id}/diff`; stop with `POST /api/session/{id}/interrupt`. `opencode.json` has **no `ask` effects**, and vigild answers any permission request it does receive with `reject` and logs it | The design's endpoints are v1's. v2's `serve` has no `--auto`, and its event stream is documented as lossy. |
@@ -143,8 +143,14 @@ presets:
 
 - **Private repos.** `configs/repos.yaml` lists, per repo, which backends
   and decider routes may see its text. vigild refuses anything else at
-  submit time and again at container start. Whether `anthropic` is allowed
-  for this (private) repo is open decision Q2.
+  submit time and again at container start.
+  - **Allowed for a private repo:** the tower (and other local presets),
+    and one hosted route, `jev-cloudflare`.
+  - **Refused at config load:** a `repos.yaml` that lists any other hosted
+    backend or route for a private repo makes vigild fail to start.
+    OpenRouter, even with ZDR, is never allowed. A test proves this.
+  - **The one exception:** `anthropic` for `thomasbardhi01/vigil`, if you
+    answer yes to Q2.
 
 ## Session lifecycle
 
@@ -208,7 +214,7 @@ fails.
 | Merge or approve | the App has no merge path that passes the ruleset; ruleset on `main`; the token is one repo and one hour | token in a tmpfs file read by a credential helper | guard plugin (pinned SHA) + managed-settings deny; OpenCode `permissions` mirror |
 | Push to main | ruleset | pre-push hook, with **`.git/hooks` and `.git/config` read-only** | guard; OpenCode `git push*main*` deny |
 | Deploy / prod | no Fly or prod credential anywhere | **per-session internal network + smokescreen allowlist** | `fly *` denied |
-| Read secrets | — | no secret in the environment; **model key via file + `apiKeyHelper`**; read-only root; only `/work` and `/tmp` writable | `.env*` read denied |
+| Read secrets | — | no secret in the environment; **the model key is a file read through `apiKeyHelper`, so layer 2 does not stop the agent reading its own key (B15)**; no other secret is mounted; read-only root; only `/work` and `/tmp` writable | `.env*` and `/run/secrets/**` reads denied (guard + managed deny) |
 | Escape the worktree | — | only the clone is mounted; non-root; `--cap-drop ALL`; pids and memory caps | `external_directory` denied |
 | Change its own rules | **no `workflows` permission, so GitHub refuses a push touching `.github/workflows`** | `.github/`, `.claude/`, `.opencode/` read-only | guard's self-protection; OpenCode edit denies |
 
@@ -279,9 +285,15 @@ the diff, this phase's row, and the checklist:
 - what could be deleted.
 
 **Money.** Claude dollars below are what the **vigil key** spends:
-vigild's own sessions, reviews and audits. Coord and its build workers run
-on your Max plan and aren't counted. The caps are $5 a day and $2 a task.
-Reviews count toward the daily cap. The proposed monthly cap is $100 (P4).
+vigild's own sessions, reviews and audits.
+- **Not counted:** coord's build workers and its PR reviews are subagents
+  of coord's own session, so they run on your Max plan. This is my
+  reading of "Your session runs on my Max plan; the executor uses the
+  vigil key"; correct it if you meant otherwise.
+- **The caps:** $5 a day and $2 a task. Reviews count toward the daily
+  cap, and the monthly cap is mandatory (value: P4).
+- **"Reviews: Opus"** is read as coord's reviews of build PRs. Vigil's own
+  reviewer stays Sonnet, with an Opus auditor, as the design says.
 
 ### Phase 1: Core, all Claude (worker: Opus)
 
@@ -291,7 +303,6 @@ Reviews count toward the daily cap. The proposed monthly cap is $100 (P4).
   - `ruff`, `mypy` and `pytest`.
   - `.github/workflows/ci.yml` with jobs `lint`, `types` and `test`.
   - `scripts/check-feature-map.py`.
-  - `.gitignore` entries for `.claude/worktrees/`.
   - A vigil `CLAUDE.md` (P5).
 - **Contract.** The task, result and event JSON schemas. The spec gate.
   Intake scoring (`why`, `value`, `risk`; self-generated tasks need value
@@ -356,7 +367,9 @@ cents.
   - The WIP limit of 4 per repo.
   - Escalation (two tower failures → Claude; a task that times out twice
     is re-sized).
-  - `vigil:ready` label intake.
+  - `vigil:ready` label intake. vigild reads issues in a target repo
+    through the App. It is switched on per repo, and for ParkAgent only
+    after you confirm, the same as any worker touching ParkAgent.
 - **Clients.** `vigil` CLI (`run`, `batch`, `ls --live`, `trace`, `kill`)
   and `vigil mcp`.
 - **Tests:** demotion path, WIP limit halts dispatch, kill releases its
@@ -386,8 +399,10 @@ answered.
   - `/review`
   - `/new`
   - `/budget`
-- **The API behind it:** the stream endpoint, the heartbeat endpoint, and
-  decision labels.
+- **The API behind it:** the stream endpoint, the heartbeat endpoint,
+  decision labels, and the read views `docs/ui.md` lists. The UI also
+  carries the operations the CLI and MCP have: start, batch, kill and
+  trace.
 - **Metering endpoints:** `GET /api/metering` (JSON per session and per
   task) and `GET /metrics` (Prometheus), behind the read token.
 - **One API:** every number on screen comes from a REST call the CLI and
@@ -416,7 +431,11 @@ answered.
   `model_calls`.
 
 **Done when:** the same docs task passes through both executors with
-identical result shape and comparable traces.
+identical results and traces, as the design says.
+- **Identical results:** the same contract result fields and the same
+  files changed.
+- **Identical traces:** the same span names and attributes. Token counts
+  and timings will differ.
 
 **Spend:** about $2.
 
@@ -424,7 +443,7 @@ identical result shape and comparable traces.
 
 **Delivers:**
 - **llama-server on the tower.**
-  - The systemd unit in router mode (B10).
+  - The systemd unit, in router mode if you say yes to P6 (B10).
   - `tower/models.lock` (release tag + GGUF hashes).
   - Bound to the tower's Tailscale address, with a Tailscale ACL allowing
     only the Mac.
@@ -487,6 +506,19 @@ daily caps. Coord will ask before starting.
     `configs/repos.yaml` would list `anthropic` (and Jev over Cloudflare)
     for `thomasbardhi01/vigil` explicitly, and for no other private repo
     unless you add it. Confirm or correct.
+- **Q3. The warn colour fails contrast.**
+  - The brief says "`--warn`: `#E8EDF2` on a `--sonar-2` background" and
+    "CSS variables, nothing else".
+  - That pair is about 3.9:1. WCAG AA needs 4.5:1 below 18.7px bold or
+    24px regular, so 12–13px warn text fails.
+  - Options:
+    - (a) Keep it as written and accept it.
+    - (b) Darken `--sonar-2` to about `#2C6286` (about 5.6:1 with
+      `--ink`), which also darkens graph bodies.
+    - (c) Set warn text at 19px bold.
+  - Without an answer, phase 3 uses (a), and the PR shows it.
+  - `--dim` is 4.48:1, a hair under AA. `#707A85` would fix it, and you
+    can fold that into the same answer.
 
 ### Resolved without asking (obvious from context)
 
@@ -498,10 +530,13 @@ daily caps. Coord will ask before starting.
   `/etc/vigil/llama.env` (runbook).
 - **claude-mods read-only access.** "vigil-worker installed on
   claude-mods with Contents: read only" can't be set per installation.
-  It's enforced by down-scoped tokens and a test (runbook; a second App is
-  the alternative).
+  It's enforced by down-scoped tokens and a test (runbook). The residual
+  risk is in B19, and a second read-only App is the alternative.
 - **Phase 2's three parallel sessions** fit the $5 cap only with task caps
   around $0.75. The done-when batch uses that.
+- **Where tokens live outside the env file.** The CLI and MCP read
+  `~/.config/vigil/env` directly, so there's no extra token file. The web
+  UI holds its token in page memory only (B7).
 
 ### Proposals (your yes/no in the PR review)
 
@@ -517,8 +552,9 @@ Each says what the plan does without a yes.
     - a budget stop before the call that would cross the cap, not after;
     - llama-server `timings` per response, for exact GPU attribution;
     - private-repo backend rules enforced on the wire.
-  - **Without a yes:** your file-mount instruction (B15), plus telemetry
-    metering (B13) and the in-flight split (B12).
+  - **Without a yes:** your file-mount instruction (B15, with its stated
+    limit), telemetry metering (B13), and slot-holder attribution inferred
+    from in-flight requests (B12).
 - **P2. vigild pushes and opens the draft PR from the host.**
   - **What:** the worker only commits, and holds no GitHub token at all.
     vigild checks the branch is `vigil/*` and its files are in scope, then
@@ -531,11 +567,12 @@ Each says what the plan does without a yes.
   - **What:** 3.12 now receives security fixes only (until 2028-10), and
     3.14.8 is the best-supported line that meets the pin rule.
   - **Without a yes:** 3.12.15, as the design says.
-- **P4. A monthly cap of $100** in `configs/budgets.yaml`.
-  - **What:** vigild halts dispatch before the vigil org's credits run
-    out mid-task.
-  - **Without a yes:** no monthly cap. The Console limit is then the only
-    backstop.
+- **P4. The monthly cap's value.**
+  - **What:** a monthly cap is mandatory (B14). The proposal is $100, the
+    floor of the org's $100–200 credit, so a low month can't run the
+    credits out mid-task.
+  - **Without a yes:** $100 anyway. Tell me a different number if you
+    want one.
 - **P5. vigil's own `CLAUDE.md` and `.claude/settings.json` config.**
   - **What's wrong today:** both are ParkAgent's copies. `CLAUDE.md` (and
     `AGENTS.md`, which links to it) describes ParkAgent, so a phase-1
@@ -554,6 +591,20 @@ Each says what the plan does without a yes.
     worker can't build correctly from ParkAgent's rules. Coord's dispatch
     prompt tells the phase-1 worker which parts of the current file to
     ignore until then.
+- **P6. llama-server router mode on the tower (B10).**
+  - **What:** llama-server's router mode loads models on demand and
+    sleeps them after 30 idle minutes. It replaces the design's swap
+    script and the systemd timer that called vigild.
+  - **What it buys:** nothing installed on the tower beyond llama-server
+    and the exporter, and no control channel from the Mac.
+  - **Without a yes:** the design's swap, run from the Mac over SSH with
+    a forced-command key that can only `systemctl start|stop` the model
+    units. That puts one more key and one more `authorized_keys` line on
+    the tower.
+- **P7. The web UI keeps its token in `localStorage`.**
+  - **What:** the browser remembers the admin token across reloads.
+  - **Without a yes:** memory only, re-entered after each reload (B7).
+    That keeps secrets in the one env file, as you asked.
 
 ## Where this departs from the design, and why
 
@@ -575,8 +626,9 @@ recorded above as B-rows or proposals.
 4. **llama-server.**
    - `--metrics` can't attribute GPU time per task (B12).
    - `--jinja` and `--slots` are defaults now.
-   - Router mode replaces the hand-written swap and the idle timer that
-     called vigild from the tower (B10).
+   - The hand-written swap and the idle timer that called vigild from the
+     tower have no control channel once vigild is on the Mac. Router mode
+     would replace them; that's proposal P6, not yet applied.
    - Prebuilt CUDA binaries already include Blackwell.
    - Qwen3.6-35B-A3B Q4_K_M is about 22.1 GB, not 20, and gpt-oss-20b
      MXFP4 is 12.1 GB, not 14.

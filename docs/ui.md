@@ -25,7 +25,7 @@ These CSS variables are the only colours:
 | `--dim` | `#6B7580` | Secondary text, borders, idle state. |
 | `--sonar` | `#9FD8F0` | Accent: live activity, links, the selected row, the logo. |
 | `--sonar-2` | `#3A7CA5` | Dark accent: fills, graph bodies, hover. |
-| warn | `--ink` text on a `--sonar-2` background | Anything that needs you: cap reached, guard denial, failed, escalated. |
+| `--warn` | `--ink` text on a `--sonar-2` background | Anything that needs you: cap reached, guard denial, failed, escalated. |
 
 - **Borders** are hairlines only: 1px `--dim` at 30% opacity.
 - **Corners** are never rounded more than 2px.
@@ -35,9 +35,10 @@ These CSS variables are the only colours:
 it.
 - `--dim` on black is 4.48:1, a hair under WCAG AA's 4.5:1 for 12px text.
   `#707A85` would give about 4.8:1.
-- The warn pair (`--ink` on `--sonar-2`) is about 3.9:1. That passes AA
-  only for text 14px bold or larger, so warn text is set in 13px **bold**.
-  The phase 3 PR shows how warn text reads.
+- The warn pair (`--ink` on `--sonar-2`) is about 3.9:1. WCAG AA allows
+  that only for large text (18.7px bold or 24px regular), so 12–13px warn
+  text fails. This is question Q3 in `docs/architecture.md`; until you
+  answer, phase 3 uses the palette as written.
 
 ### Type
 
@@ -115,14 +116,16 @@ reference: a shape made of characters that breathes while it's live.
   `Authorization` header, so the UI reads the stream with `fetch()` and a
   roughly 30-line line parser. That keeps one auth mechanism, the bearer
   token, for everything.
-- **Token.** The UI asks for the token once, keeps it in `localStorage`,
-  and clears it on a 401.
+- **Token.** The UI asks for the token and keeps it in page memory only,
+  so it lasts until the tab is closed or reloaded. It is cleared on a 401.
+  P7 in `docs/architecture.md` would keep it in `localStorage`.
 - **A live row pulses** in `--sonar` once per update, for 600 ms.
 - **Keyboard:**
   - `/` focuses the filter.
   - `j` / `k` move the selected row.
   - `Enter` opens the row.
   - `Esc` clears the filter.
+  - `x` on `/job/:id` asks to kill the running session.
   - On `/job/:id`, `Enter` on a timeline line expands it.
 - **Pages, not overlays.** No modals: detail is a page, and expanding a
   timeline line opens it in place.
@@ -138,8 +141,8 @@ reference: a shape made of characters that breathes while it's live.
 ## Pages
 
 There are seven pages, and nothing else. Each lists the API calls behind
-it; the UI calls nothing else. A **job** is a task: one contract, and
-every session (attempt, review, audit) it has spawned.
+it; the UI calls nothing else. A **job** is the UI's word for a task (the API says `tasks`): one
+contract, and every session (attempt, review, audit) it has spawned.
 
 ### 1. `/`: Board
 
@@ -160,7 +163,7 @@ Above the table is a one-line header strip:
 - llama-server slots in use;
 - escalation rate over 7 days.
 
-**API:** `GET /api/jobs`, `GET /api/summary`, and the stream's `job` and
+**API:** `GET /api/tasks`, `GET /api/summary`, and the stream's `job` and
 `summary` topics.
 
 ### 2. `/job/:id`: Detail
@@ -190,12 +193,16 @@ Three columns.
   - GPU, CPU, RAM and W as per-second character sparklines.
   - J/token and GPU-s/token.
   - A link to the Langfuse trace.
+- **Kill.** `x` puts an inline line under the header: `kill pa-0142? y/n`.
+  `y` stops the running session (`POST /api/sessions/{id}/kill`), the same
+  call as `vigil kill`.
 
 **API:**
-- `GET /api/jobs/{id}`
-- `GET /api/jobs/{id}/events?after=…` (paged)
+- `GET /api/tasks/{id}`
+- `GET /api/tasks/{id}/events?after=…` (paged)
 - `GET /api/events/{id}` (full content for one line)
-- `GET /api/jobs/{id}/metering`
+- `GET /api/metering?task={id}`
+- `POST /api/sessions/{id}/kill`
 - the stream's `job:{id}` topic
 
 ### 3. `/sessions`
@@ -267,7 +274,12 @@ Start a session. It is one form, not a wizard, with these fields:
 The server's spec gate, intake gate, private-repo rule and budget check
 answer inline. The form never re-implements them.
 
-**API:** `GET /api/repos`, `GET /api/backends`, `POST /api/tasks`.
+**Batch.** Below the form, a textarea takes a batch YAML file, the same
+format `vigil batch` reads. It submits to `POST /api/batches`, and each
+task passes the same gates.
+
+**API:** `GET /api/repos`, `GET /api/backends`, `POST /api/tasks`,
+`POST /api/batches`.
 
 ### 7. `/budget`
 

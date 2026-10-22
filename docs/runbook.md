@@ -19,13 +19,18 @@ those things.
   ```
 
 - **vigild loads that file once at startup** and never writes it. The
-  Docker Compose stack (Langfuse, the OTel collector, the egress proxy)
-  reads the same file through `docker compose --env-file
-  ~/.config/vigil/env`.
-- **No container gets a secret in its environment.**
-  - The Claude executor gets its model key as a read-only file mount at
+  CLI and `vigil mcp` read `VIGIL_API_TOKEN` from it too, so there is no
+  second token file.
+- **The Docker Compose stack (Langfuse and the OTel collector) reads its
+  own secrets** from the same file through `docker compose --env-file
+  ~/.config/vigil/env`. Those are the only containers that hold secrets
+  in their environment, and none of them runs agent code.
+- **No worker container gets a secret in its environment.**
+  - The executor gets its model key as a read-only file mount at
     `/run/secrets/model_key`. The `key_ref` of the session's backend names
     which variable vigild writes into that file.
+  - The agent's own uid can read that file. Only the guard and
+    managed-settings deny rules stop it (`docs/architecture.md` B15).
   - A worker that needs GitHub gets a one-hour installation token, never
     the App's private key.
   - Langfuse keys stay in the collector.
@@ -53,15 +58,15 @@ off, and `vigil doctor` reports which ones are off.
 |---|---|---|---|---|---|
 | `ANTHROPIC_API_KEY` | Claude executor, reviewer, auditor, and the Haiku decider. | Console → org **vigil** → API keys. It already exists. | Org "vigil" only. Set a Console spend limit at or under the monthly credit ($100–200); vigild's own caps sit below it (daily $5, per task $2, monthly see `configs/budgets.yaml`). | 1 | `GET https://api.anthropic.com/v1/models` → 200 |
 | `VIGIL_GITHUB_APP_CLIENT_ID` | Identifies the vigil-worker App when vigild signs its JWT. Not secret, but kept with the key it pairs with. | GitHub → Settings → Developer settings → GitHub Apps → vigil-worker → **Client ID**. | — | 1 | `GET /app` with the JWT → 200 |
-| `VIGIL_GITHUB_APP_KEY_PATH` | Path to the App's private key, normally `~/.config/vigil/vigil-worker.pem`. | Same page → **Generate a private key**. Save the `.pem` beside the env file and `chmod 600` it. | Never mounted into any container. vigild mints per-task installation tokens from it. | 1 | same as above, plus `GET /app/installations` lists vigil, parkagent and claude-mods |
+| `VIGIL_GITHUB_APP_KEY_PATH` | Path to the App's private key, normally `~/.config/vigil/vigil-worker.pem`. | Same page → **Generate a private key**. Save the `.pem` beside the env file and `chmod 600` it. | Never mounted into any container. vigild mints per-task installation tokens from it. | 1 | same as above, plus `GET /app/installations` finds the one installation on your account, and `GET /installation/repositories` (with an installation token) lists vigil, parkagent and claude-mods |
 | `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | The OTel collector sends traces to Langfuse with these (HTTP Basic auth). | Generate both yourself, e.g. `printf 'pk-lf-%s' "$(openssl rand -hex 16)"` and `printf 'sk-lf-%s' "$(openssl rand -hex 24)"`. Langfuse's headless init (`LANGFUSE_INIT_PROJECT_PUBLIC_KEY` / `_SECRET_KEY`) creates the project with them on first start. | One Langfuse project, "vigil". | 1 | `GET <langfuse>/api/public/health`, then an authenticated `GET /api/public/projects` → 200 |
 | `LANGFUSE_INIT_USER_EMAIL`, `LANGFUSE_INIT_USER_PASSWORD` | Your Langfuse login, created on first start. | Choose them. | Local only (Tailscale). | 1 | login page loads |
-| `LANGFUSE_NEXTAUTH_SECRET`, `LANGFUSE_SALT`, `LANGFUSE_ENCRYPTION_KEY`, `LANGFUSE_POSTGRES_PASSWORD`, `LANGFUSE_CLICKHOUSE_PASSWORD`, `LANGFUSE_REDIS_PASSWORD`, `LANGFUSE_MINIO_PASSWORD` | Langfuse's own internals, read only by the Compose stack. | `openssl rand -hex 32` for each, except `LANGFUSE_ENCRYPTION_KEY`, which must be exactly 64 hex characters (`openssl rand -hex 32`). | Compose services only. | 1 | Compose services healthy |
+| `LANGFUSE_NEXTAUTH_SECRET`, `LANGFUSE_SALT`, `LANGFUSE_ENCRYPTION_KEY`, `LANGFUSE_POSTGRES_PASSWORD`, `LANGFUSE_CLICKHOUSE_PASSWORD`, `LANGFUSE_REDIS_PASSWORD`, `LANGFUSE_MINIO_PASSWORD` | Langfuse's own internals, read only by the Compose stack. | `openssl rand -hex 32` for each. It prints 64 hex characters, which is exactly the length `LANGFUSE_ENCRYPTION_KEY` requires. | Compose services only. | 1 | Compose services healthy |
 | `CLOUDFLARE_ACCOUNT_ID` | Account for Workers AI, where the Jev decider runs (zero data retention). | Cloudflare dashboard → right sidebar of any zone or Workers page. | — | 1 (Jev; Haiku covers until then) | `POST …/ai/run` with a one-question Jev request → 200 |
 | `CLOUDFLARE_API_TOKEN` | Calls Jev on Workers AI. | Cloudflare → My Profile → API Tokens → Create Custom Token: **Account · Workers AI · Read** and **Account · Workers AI · Edit**, limited to that one account, with a TTL if you want one. | Workers AI only. | 1 (Jev) | same |
-| `OPENROUTER_API_KEY` | The OpenRouter backend preset, and Jev's alternative route. | openrouter.ai → Keys → Create key, with a **credit limit** (for example $10, monthly reset). | That key's limit only. Never used for a private repo unless `configs/repos.yaml` lists the route for that repo. | when you first pick the preset (3 at the earliest) | `GET https://openrouter.ai/api/v1/key` → 200 |
+| `OPENROUTER_API_KEY` | The OpenRouter backend preset, and Jev's alternative route. | openrouter.ai → Keys → Create key, with a **credit limit** (for example $10, monthly reset). | That key's limit only. Never used for a private repo: vigild refuses to start if `configs/repos.yaml` lists it for one. | 4 (OpenCode's second backend), or earlier if you want the preset sooner | `GET https://openrouter.ai/api/v1/key` → 200 |
 | `LLAMA_API_KEY` | llama-server's `--api-key`; vigild, the exporter scrape and OpenCode workers send it. | `openssl rand -hex 32`. Put it in **both** `~/.config/vigil/env` and the tower's `/etc/vigil/llama.env`. | Tower only, reached over Tailscale. | 5 | `GET http://<tower>:8080/health` with the key → 200 |
-| `VIGIL_API_TOKEN` | Admin bearer token for the REST API, the CLI, the MCP server and the web UI. | `openssl rand -hex 32`. The CLI reads it from `~/.config/vigil/cli-token` (mode `600`). | Full control of vigild. | 1 (API), 2 (CLI/MCP) | `GET /api/health` with it → 200 |
+| `VIGIL_API_TOKEN` | Admin bearer token for the REST API, the CLI, the MCP server and the web UI. | `openssl rand -hex 32`. The CLI and `vigil mcp` read it from this same env file. The web UI asks for it and keeps it in page memory only. | Full control of vigild. | 1 (API), 2 (CLI/MCP) | `GET /api/health` with it → 200 |
 | `VIGIL_METRICS_TOKEN` | Read-only bearer token for `/metrics` and `/api/metering`, for Hearth and Prometheus. | `openssl rand -hex 32`. Hand it to Hearth yourself. | Read-only metering. | 3 | `GET /metrics` with it → 200 |
 | `VIGIL_HEARTBEAT_TOKEN` | Lets an outside session (vigil-coord, or ParkAgent's coord if you wire it) post heartbeats for the UI's `/sessions` page. | `openssl rand -hex 32`. Give it only to sessions you want listed. | Write heartbeats; nothing else. | 3 | `POST /api/heartbeat` with it → 204 |
 
@@ -102,8 +107,8 @@ needs, and nothing else.
      tell coord.
    - `thomasbardhi01/parkagent`: needed for phase 1's done-when check.
      Coord asks you before any worker touches ParkAgent.
-4. Run `vigil doctor` (phase 1). It should list the three installations and
-   mint and then revoke one test token per repo.
+4. Run `vigil doctor` (phase 1). It should find the one installation, list
+   its three repositories, and mint and then revoke one test token per repo.
 
 How tokens are used:
 - **One token per task**, for that task's repository only, valid for one
