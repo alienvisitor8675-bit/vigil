@@ -391,7 +391,8 @@ answered.
 
 **Delivers:**
 - **The web UI in `docs/ui.md`:** the surveillance-console look,
-  character graphs, and seven pages:
+  character graphs, and eight pages (the Vigil UI canvas is the visual
+  reference):
   - `/` board
   - `/job/:id` detail
   - `/sessions`
@@ -399,6 +400,7 @@ answered.
   - `/review`
   - `/new`
   - `/budget`
+  - `/talk`: the bridge's web client; conversation only, no decisions
 - **The API behind it:** the stream endpoint, the heartbeat endpoint,
   decision labels, and the read views `docs/ui.md` lists. The UI also
   carries the operations the CLI and MCP have: start, batch, kill and

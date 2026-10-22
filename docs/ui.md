@@ -140,8 +140,9 @@ reference: a shape made of characters that breathes while it's live.
 
 ## Pages
 
-There are seven pages, and nothing else. Each lists the API calls behind
-it; the UI calls nothing else. A **job** is the UI's word for a task (the API says `tasks`): one
+These eight pages, and nothing else. The Vigil UI canvas is the visual
+reference for all eight, Talk included. Each page lists the API calls
+behind it; the UI calls nothing else. A **job** is the UI's word for a task (the API says `tasks`): one
 contract, and every session (attempt, review, audit) it has spawned.
 
 ### 1. `/`: Board
@@ -294,6 +295,30 @@ task passes the same gates.
 
 **API:** `GET /api/budgets`.
 
+### 8. `/talk`
+
+A conversation with a coordinator: the standing fleet coord, or a job's
+coord. It is the web client of the bridge (`docs/design.md`, "Talking to
+coordinators from anywhere").
+
+- **Left:** the coordinators, each with its job and current backend.
+- **Centre:** the thread, newest at the bottom.
+  - Your messages are marked `human · web`.
+  - Messages relayed from Claude or a local chat show their channel and
+    relay model.
+  - A send box sits under the thread.
+- **Backend switch:** a select above the thread.
+  - Switching starts a fresh session on the new backend, with the thread
+    as context, and the switch shows as a line in the thread.
+  - A local backend is offered only for shapes at trust rung 3.
+- **A conversation surface, not a decision surface.** Nothing on `/talk`
+  approves, merges, or dispatches. When a coord needs a decision, it
+  files an inbox item, and the thread shows a link to it.
+
+**API:** `GET /api/coords`, `GET /api/coords/{id}/thread`,
+`POST /api/coords/{id}/messages`, `POST /api/coords/{id}/backend`, and
+the stream's `talk:{id}` topic.
+
 ## Files
 
 ```text
@@ -318,4 +343,4 @@ string.
 - `/metrics` shows its counters.
 - Each page is under 100 KB, with no horizontal scroll at 1280px.
 - `/`, `j`, `k` and `Enter` work.
-- The PR includes a screenshot of each of the seven pages.
+- The PR includes a screenshot of each of the eight pages.
