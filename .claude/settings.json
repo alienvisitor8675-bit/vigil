@@ -1,0 +1,121 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./ios/Config.xcconfig)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh secret set:*)",
+      "Bash(fly deploy:*)",
+      "Bash(fly secrets set:*)",
+      "Bash(fly ssh:*)",
+      "Bash(git push origin main:*)"
+    ]
+  },
+  "extraKnownMarketplaces": {
+    "claude-mods": {
+      "source": {
+        "source": "github",
+        "repo": "thomasbardhi01/claude-mods"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "guard@claude-mods": true,
+    "fleet@claude-mods": true,
+    "route@claude-mods": true,
+    "lean@claude-mods": true
+  },
+  "claudeMods": {
+    "guard": {
+      "secretPaths": ["Config.xcconfig"],
+      "cloudClis": [
+        {
+          "names": ["fly", "flyctl"],
+          "readOnly": [
+            "status",
+            "logs",
+            "releases",
+            "version",
+            "auth whoami",
+            "apps list",
+            "machine list",
+            "machine status",
+            "secrets list",
+            "postgres list",
+            "ips list",
+            "checks list"
+          ],
+          "valueFlags": [
+            "-a",
+            "--app",
+            "-c",
+            "--config",
+            "-t",
+            "--access-token",
+            "-o",
+            "--org",
+            "-r",
+            "--region",
+            "-i",
+            "--image",
+            "-e",
+            "--env",
+            "--vm-size",
+            "--dockerfile"
+          ]
+        }
+      ],
+      "deniedPrefixes": [
+        "gh repo delete",
+        "gh repo edit",
+        "gh repo archive",
+        "gh release create",
+        "gh release delete",
+        "gh release edit",
+        "gh ruleset",
+        "gh variable set",
+        "gh variable delete"
+      ],
+      "denyWorkflowRunOnDefaultBranch": true,
+      "blockedMessage": "A human merges every PR and runs deploys (CLAUDE.md); secrets live in the vault."
+    },
+    "route": {
+      "startsOn": true,
+      "model": "haiku",
+      "neverRoute": {
+        "globs": [
+          "server/src/services/sessions*",
+          "server/src/services/wallet*",
+          "server/src/services/limits*",
+          "server/src/routes/session*",
+          "server/src/routes/parked*",
+          "server/src/routes/assistant*",
+          "prisma/**"
+        ],
+        "keywords": [
+          "merge",
+          "deploy",
+          "migrate",
+          "migration",
+          "migrations",
+          "money",
+          "pay",
+          "payment",
+          "payments",
+          "cap",
+          "caps"
+        ]
+      }
+    },
+    "fleet": {
+      "coordinator": "coord",
+      "healthUrl": "https://parkagent-api.fly.dev/health",
+      "workflows": [{ "file": "nightly-fr.yml", "label": "Nightly FR" }],
+      "recentRuns": 6
+    },
+    "lean": {
+      "refuseOnBranchPrefix": "audit"
+    }
+  }
+}
