@@ -13,6 +13,10 @@ Oct 22, 2026 · @Thomas Bardhi
 >
 > - The design addendum (2026-10-22): "The factory floor" and "Job execution protocol", merged after the trust ladder. Where the addendum conflicted with corrections already here (per-task clones, OpenCode v2 endpoints), the corrections were kept, as the addendum directs.
 >
+> - The bridge ("Talking to coordinators from anywhere"): one message bus per coordinator, written to from the web UI's `/talk`, the vigil MCP server, and `vigil-bridge` for local chats.
+>
+> - The documentation standard ("context baked into every job"): an eight-layer doc tree, packet assembly from it, write-back at every stage, and freshness checks; placed after the job execution protocol.
+>
 > It also corrects the facts the research disproved. How each part is built, the choices picked at build time, the full phase plan and the open decisions are in `docs/architecture.md`; versions and citations are in `docs/sources.md`.
 
 ## Summary
@@ -49,7 +53,7 @@ Everything runs on the **Mac mini** (Apple Silicon, Docker Desktop, images built
 | --- | --- | --- |
 | `vigild` (orchestrator) | Mac mini, native under launchd | Task queue, dependency graph, routing, backends, budgets, metering, container lifecycle, status issue, REST API, web UI |
 | `vigil` CLI + MCP server | Mac mini (or any tailnet machine) | `vigil run`, `vigil ls`, `vigil trace`, `vigil kill`; the same calls exposed as MCP tools so a Claude Code session can dispatch |
-| Web UI | served by `vigild`, Tailscale only | New session, sessions list, session detail timeline, budgets and WIP limits; same API as the CLI and MCP |
+| Web UI | served by `vigild`, Tailscale only | Eight pages (board, job detail, sessions, decider, review, new session, budget, talk) per `docs/ui.md`; same API as the CLI and MCP |
 | Claude executor | Mac mini, one container per task | Claude Agent SDK, headless, model key as a file, guard plugin, OTel on |
 | OpenCode executor | Mac mini, one container per task | `opencode serve` (v2) + the task's clone, pointed at the session's backend |
 | `llama-server` | tower host (GPU) | Qwen3.6-35B-A3B main, gpt-oss-20b for small jobs, LFM2.5 decider; 2 slots |
@@ -277,7 +281,25 @@ flowchart TD
 
 **The inbox is the only place you work.** One page, three queues: *Specs to approve* (drafted by a coord from an issue, with the decider's value/risk and the planned worker split), *Ready to merge* (green CI, clean review, audit sample passed, with the diff summary), *Questions and pages* (a coord blocked, a budget hit, a post-merge failure, a demoted shape). Everything else is visible but needs nothing from you. Push notifications for the third queue only.
 
+The inbox is the only surface for **decisions**. `/talk` (the bridge, below) is a conversation surface, not a decision surface:
+- Nothing on `/talk` approves a spec, merges, or dispatches.
+- A coord that needs a decision files an inbox item, even when the question came up in a conversation.
+
 **Auto-merge is earned per shape, like review.** The merge queue auto-merges only when: the shape is at rung 3, CI green, reviewer clean, auditor sample clean, no money/auth/consent path, and post-merge verification is configured for that repo. Anything else waits in *Ready to merge*. A post-merge failure on an auto-merged PR auto-reverts and opens a fix job. You can turn auto-merge off per repo in one line of `repos.yaml`.
+
+**Talking to coordinators from anywhere: the bridge.** Vigil has one message bus per coordinator (the standing *fleet coord* that drafts specs and triages, plus one coord per job). Three clients write to it, and every message carries `provenance: human` plus the channel it came through:
+
+| Client | How it connects | What you do |
+| --- | --- | --- |
+| Web UI `/talk` | vigild directly | pick a coord, see its backend (Claude API, tower Qwen over Tailscale, OpenRouter, Ollama, custom), type; the coord answers in the same thread |
+| Claude.ai or Claude Code | vigil MCP server (`vigil_talk`, `vigil_listen`, `vigil_jobs`, `vigil_approve`) added as a connector or in `.mcp.json` | say "tell the pa-0142 coord to keep limits in config"; Claude relays it verbatim, the coord's reply comes back into your chat |
+| Ollama / any local chat | `vigil-bridge`, a 200-line client that speaks MCP to vigild and OpenAI-chat to the local model; also works with Open WebUI's MCP support | same as above from a fully local chat; no text leaves the Mac and tower |
+
+The bridge never lets the relaying model change your words: `vigil_talk` takes the user's text as a quoted argument and vigild logs both the relay model and the exact text. A coord's backend is chosen per job at creation (and for the fleet coord in `configs/vigild.yaml`); that is the default. `/talk` may switch it between turns. A switch:
+- starts a fresh session on the new backend, with the thread history as context;
+- is logged.
+
+A local backend is still allowed only on shapes at trust rung 3.
 
 **Frontier practices Vigil adopts, each a test in the repo:**
 
@@ -331,6 +353,37 @@ This is how a job runs, written the way a release process is written at a compan
 Role prompts are short, imperative, and never change mid-job. Changing a prompt is a PR with an eval run attached. No session is ever asked to "continue" in a chat; a new stage is a new packet.
 
 **When to move on.** A stage advances only when its acceptance column is true and the owner has written the artifact. Vigild enforces this in one state machine (`vigild/jobs/fsm.py`) with a test per transition. There is no manual override except yours from the inbox, and that is logged.
+
+## Documentation standard: context baked into every job
+
+The rule: **the repo is the source of truth, every job reads from it through one assembled packet, and every job writes back to it before it closes.** Nothing a job learns lives only in a chat. This follows Anthropic's guidance (curate what the model sees and when; keep `CLAUDE.md` light and about real gotchas; load reference material progressively as a tree, not one giant file; use dedicated skills for verification and review; prefer the model's judgment to long rulebooks) and Cognition's (share full context, keep writes single-threaded, review with a clean context, invest in context engineering rather than prompt tricks).
+
+**Is a graph the right store?** No, not as something you maintain. The repo already is a graph: files, symbols, imports, routes, tests and PRs are nodes and edges, and git keeps them current for free. A separate knowledge graph is a second copy that drifts the first week, which is the same reason ParkAgent chose Mermaid-in-Markdown over Figma. The X conversation about graphs is mostly about memory for chat agents, not about codebases. So: *derive* graph views when a packet is assembled (a code map with symbols and edges, regenerated per commit and cached), *maintain* only plain text that humans and agents both read, and *query* the derived map through a read-only search subagent. Mermaid stays the drawing format because it is text, reviewable in the same PR, and renders on GitHub and in the UI.
+
+**The documentation tree.** Eight layers, each with one owner, one update trigger and one CI check. ParkAgent already has layers 1–3; Vigil adds the rest.
+
+| # | Layer | Holds | Owner · when written | Check |
+| --- | --- | --- | --- | --- |
+| 1 | `CLAUDE.md` = `AGENTS.md` | rules, real gotchas, how to run tests; ≤ 200 lines | you; by PR | lint: length, no duplicated facts from layers 2–3, `claude doctor` clean |
+| 2 | `docs/architecture.md` | the system's flows as Mermaid: money path, state machine, job tree, deploy | the PR that changes a flow | CI: Mermaid parses; a PR touching a flow's files without touching this file fails |
+| 3 | `docs/feature-map.md` + `.mmd` | every route, job, screen and feature with `file:line` evidence | generated by the code-map agent, committed | CI: fails if a route or job in code is missing from the map |
+| 4 | `docs/decisions/ADR-NNNN.md` | one page per architectural decision: context, options, choice, consequences | coord, when a plan changes architecture; you, when you overrule | PR template requires an ADR link for `architecture` labels |
+| 5 | `docs/knowledge/lessons.jsonl` | one line per closed job: what the reviewer caught, what a fix job revealed, what the next job should know; tagged by path and shape | vigild at job close, from `close.md` | nightly audit prunes lines older than 90 days unless referenced |
+| 6 | `.vigil/<job>/` on the branch | `intake.json`, `spec.md`, `plan.md`, `worker_report.json`, `review.json`, `audit.json`, `close.md` | each stage's owner | the stage gate: missing or invalid artifact = stage not done |
+| 7 | code map (derived, not committed) | symbols, imports, callers, tests per file, coverage, churn; built per commit, cached | vigild, on packet assembly | rebuilt if the cache's commit ≠ HEAD |
+| 8 | claude.ai project | handoffs, research, reviews of reviews: only what does not belong in the repo | you and your Claude sessions | none; it is a notebook, never a dependency of a job |
+
+**How a packet is assembled from the tree** (progressive disclosure, with a token budget per layer, dropped items logged in `plan.md`):
+
+1. Always: layer 1 whole; the role prompt.
+2. By files in scope: the layer-2 diagrams whose node names match those files; the layer-3 rows for those files; layer-7 symbols, callers and tests for those files.
+3. By search: layer-5 lessons tagged with those paths or that shape; layer-4 ADRs those files reference.
+4. For fix jobs: the parent's layer-6 artifacts and the failure logs.
+5. On demand: a read-only search subagent over the whole repo and the code map, so a worker never guesses where something lives.
+
+**What each stage writes back.** Spec and plan write layer 6; a plan that changes a flow also writes layer 2 and an ADR; build writes layer 6 and any layer-2/3 updates the spec requires (checked, not trusted); close writes `close.md`, which vigild distils into one layer-5 line and, if the job shipped a new route or job, re-runs the code-map agent for layer 3. The UI's job page links every layer-6 artifact, and the session packet is downloadable, so you can see at any moment exactly what a worker was given.
+
+**Freshness.** Drift is caught by machines, not memory: the layer-3 CI check, the layer-2 "docs in the same PR" check, a nightly audit that diffs layer 1 against layers 2–3 for duplicated or contradicting facts, and a staleness score per file on the dashboard (days since a doc mentioning it was updated versus days since the file changed). A repo whose staleness score crosses a threshold gets a docs job proposed to the inbox.
 
 ## Tower: local model serving
 
@@ -447,7 +500,7 @@ The SDK runs the Claude Code CLI as a child process and exports spans, metrics a
 | From | How | Example |
 | --- | --- | --- |
 | Terminal | `vigil` CLI (Python, `uv tool install`, on the Mac mini) | `vigil run parkagent#142 --tier auto`, `vigil batch parkagent-batch.yaml`, `vigil ls --live`, `vigil trace pa-0142`, `vigil kill pa-0142` |
-| Claude Code session (your Mac) | `vigil` MCP server added to `.mcp.json`; tools `vigil_run`, `vigil_status`, `vigil_trace`, `vigil_kill` | "Dispatch the three test tasks from the batch file to the tower and tell me when PRs are open" |
+| Claude Code session (your Mac) | `vigil` MCP server added to `.mcp.json`; tools `vigil_run`, `vigil_status`, `vigil_trace`, `vigil_kill`, plus the bridge's `vigil_talk`, `vigil_listen`, `vigil_jobs`, `vigil_approve` (`vigil_approve` files your decision into the inbox; it is not a second decision surface) | "Dispatch the three test tasks from the batch file to the tower and tell me when PRs are open" |
 | Browser | web UI served by `vigild`, Tailscale only (`docs/ui.md`) | `/new`: repo, base, backend preset or custom endpoint, spec, limits |
 | GitHub | label `vigil:ready` on an issue; `vigild` polls or receives a webhook | coord labels issues; the fleet picks them up |
 
@@ -501,7 +554,8 @@ Self-hosted Langfuse is **six** containers: web, worker, Postgres, ClickHouse, R
 Tool content is off by default; the Claude tier turns on `OTEL_LOG_TOOL_DETAILS=1` so commands and file paths show, and `OTEL_LOG_TOOL_CONTENT=1` only for the reviewer, whose inputs are a diff you already own. Prompts are logged for both tiers because you own the repos.
 
 **Web UI.** Langfuse's sessions view is the drill-down. The fleet view is `vigild`'s own web UI (phase 3), specified in `docs/ui.md`:
-- seven pages: board, job detail, sessions, decider, review ladder, new session, budget;
+- these eight pages and nothing else: board, job detail, sessions, decider, review ladder, new session, budget, talk;
+- the Vigil UI canvas is the visual reference for all eight, Talk included;
 - plain HTML, CSS and a little vanilla JS, with no build step;
 - served on Tailscale only, from the same API as the CLI and MCP server.
 
@@ -565,7 +619,7 @@ vigil/
   images/            Dockerfiles (linux/arm64): claude-executor (also reviewer/auditor), opencode-executor, egress-proxy
   tower/             llama-server systemd unit, models.lock, exporter/ (NVML + psutil service), check.sh
   compose.yaml       otel-collector, langfuse (6 services); vigild itself runs natively under launchd
-  configs/           backends.yaml, routing.yaml, budgets.yaml, prices.yaml, repos.yaml, review.yaml,
+  configs/           vigild.yaml (fleet coord backend), backends.yaml, routing.yaml, budgets.yaml, prices.yaml, repos.yaml, review.yaml,
                      egress.yaml, opencode.json, managed-settings.json, otel-collector.yaml
   evals/             specs/, run.py, results/
   docs/              design.md, architecture.md, feature-map.md, runbook.md, sources.md, ui.md
