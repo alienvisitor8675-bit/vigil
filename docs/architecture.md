@@ -80,18 +80,21 @@ flowchart LR
 
   subgraph LRN["Learning epic (planned, after phase 5; design.md Learning loop)"]
     HT[("hidden tests<br/>vigild records only")]
-    VR["verifier → reward.json"]
+    VR["reward computation<br/>reward.json"]
     RP["weekly replay<br/>Opus + best local"]
   end
   JOB -. "spec time" .-> HT
-  HT -. "verifier container only" .-> VR
+  VF["verifier (B33, built)<br/>plain dev image, offline"]
+  HT -. "verifier container only" .-> VF
+  VF -. "raw reports" .-> VR
   VR -. "reward rows" .-> DB
   VR -. "episode · attempt · reward spans" .-> OC
   RP -. "replay jobs" .-> JOB
 ```
 
-The dotted *Learning epic* nodes are planned and not built. Their
-conflicts with B33, B35, the budgets and the provenance rules are the
+The nodes inside *Learning epic* are planned and not built. The verifier
+beside them is built (B33); only the reward computation and `reward.json`
+are new. Their conflicts with B33, B35, the budgets and the provenance rules are the
 *Open* notes in `docs/design.md` "Learning loop".
 
 ## Build-time choices
@@ -520,8 +523,7 @@ This is an epic, not an eighth phase. The spec is `docs/design.md`
   confirms:
   - #9, hidden-test validity: below ~80%, nothing else proceeds;
   - #10, reward validity: drop components under ~0.7 AUROC;
-  - #11, swap gap: needs phase 5, and one harness for Claude and local
-    models (phase 4).
+  - #11, swap gap: needs phase 5; the executor is a confound (Open 22).
 - **Then the epic's features:**
   - hidden tests;
   - the reward computer and its graded signals;
@@ -549,8 +551,8 @@ This is an epic, not an eighth phase. The spec is `docs/design.md`
   needs an exact pin in `docs/sources.md` and a one-line reason when
   it's adopted.
 - **Spend.** The issues estimate it:
-  - #9: about $4–10;
-  - #10: about $8–90;
+  - #9: about $3–8;
+  - #10: about $6–85;
   - #11: about $60–80.
 
   #10 and #11 need a budget of their own that never draws from the

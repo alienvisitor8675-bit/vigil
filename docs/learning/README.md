@@ -15,6 +15,6 @@ This is the index for Vigil's learning epic. It is design only for now.
   1. [#9](https://github.com/thomasbardhi01/vigil/issues/9): hidden-test validity;
   2. [#10](https://github.com/thomasbardhi01/vigil/issues/10): reward validity;
   3. [#11](https://github.com/thomasbardhi01/vigil/issues/11): swap gap (needs phase 5).
-- **Related:** [#8](https://github.com/thomasbardhi01/vigil/issues/8), "vigil bench", covers the SWE-bench Pro public sample. That sample is the epic's external anchor, and #11 proposes how the two fit together.
+- **Related:** [#8](https://github.com/thomasbardhi01/vigil/issues/8), "vigil bench", covers the SWE-bench Pro public sample. That sample is the epic's external anchor: tasks 1–50 of #8's seeded draw, never tuned on. #8 records the reconciliation.
 
 Each experiment's results and decision are committed here when it has run.

@@ -121,19 +121,20 @@ flowchart LR
   vigild --> SI[GitHub status issue]
   subgraph Learning["learning epic (planned, after phase 5)"]
     HT[(hidden tests · vigild only)]
-    VR[Verifier: reward.json]
+    VR[reward computation · reward.json]
     PM[Post-merge: 30-day retroactive reward]
     MID[Middle loop: incident → playbook, eval case]
     RP[Weekly replay: Opus + best local]
   end
   D -.spec time.-> HT
-  HT -.-> VR
-  PR -.-> VR
+  VF[vigild verifier · built, B33] -.raw reports.-> VR
+  HT -.-> VF
+  PR -.-> VF
   VR -.reward.json.-> RV
   H -.-> PM
   PM -.incident.-> MID
   MID -.playbooks into packets.-> Q
-  RP -.-> VR
+  RP -.-> VF
   VR -.episode, attempt, reward spans.-> OC
 ```
 
@@ -365,22 +366,22 @@ This is how a job runs, written the way a release process is written at a compan
 
 **How workers are housed.** Three session kinds, one contract. A *coord* is a Claude Agent SDK process (Opus) in its own container, long-lived for the job, resumable. A *Claude worker* is an Agent SDK process (Sonnet by default) in a fresh container with one clone on one branch; it is not an OpenCode session, because the SDK gives hooks, permission modes and OTel for free. A *local worker* is a headless `opencode serve` in a fresh container pointed at the tower (or OpenRouter, or any endpoint), driven over HTTP. Reviewers and auditors are Claude workers with `edit: deny`. Containers are the unit of isolation and of cost; a session never outlives its stage.
 
-**Stages.** Each row is a gate. The artifact is a file committed on the job's branch under `.vigil/` or a record in vigild; the acceptance check is code, not judgment. Text marked **Learning (planned)** belongs to the learning epic ("Learning loop", below). It is not current behaviour, and its *Open N* notes are unresolved conflicts with this table.
+**Stages.** Each row is a gate. The artifact is a file committed on the job's branch under `.vigil/` or a record in vigild; the acceptance check is code, not judgment. Text marked **Learning (planned)** belongs to the learning epic ("Learning loop", below). It is not current behaviour. A *see Open N* points to the unresolved conflict, defined in that section.
 
 | Stage | Input | Owner | Artifact produced | Acceptance (machine-checked) | On failure |
 | --- | --- | --- | --- | --- | --- |
 | 0 Intake | issue, label, or `vigil run` text; your rough ideas | decider | `intake.json`: value, risk, size, touches\_money, duplicate\_of, confidences | confidences above act threshold; not a duplicate; WIP free | wait in inbox or page you |
-| 1 Spec | intake + repo docs + your notes | coord (Claude). **Learning (planned):** a separate fresh-context session writes the hidden tests from the spec and the product model only; it is never the worker's session | `spec.md`: goal, non-goals, acceptance criteria as testable statements, `test_cmd` per criterion, files in/out of scope, money paths, interfaces (when workers run in parallel), risks, rollback; `plan.md`: worker split with a contract per worker, dependency order, estimated size, each criterion's verification level. **Learning (planned):** `hidden_tests` (a vigild record, never on the branch); `reward_schema` (which graded signals apply to the shape); a difficulty estimate; `plan.md` cites the product-model invariants each worker touches, which are the key for matching recovery playbooks into the packet | spec gate: every criterion has a test command; every worker contract validates against the schema; money paths flagged match the path rules; parallel workers have disjoint files and pinned interfaces; every criterion has a verify entry, and one left at level 0 says why. **Learning (planned):** the hidden tests fail on base (*Open 3, 11, 15*) | coord revises up to 2×, then pages you |
+| 1 Spec | intake + repo docs + your notes | coord (Claude). **Learning (planned):** a separate fresh-context session writes the hidden tests from the spec and the product model only; it is never the worker's session | `spec.md`: goal, non-goals, acceptance criteria as testable statements, `test_cmd` per criterion, files in/out of scope, money paths, interfaces (when workers run in parallel), risks, rollback; `plan.md`: worker split with a contract per worker, dependency order, estimated size, each criterion's verification level. **Learning (planned):** `hidden_tests` (a vigild record, never on the branch); `reward_schema` (which graded signals apply to the shape); a difficulty estimate; `plan.md` must cite the product-model invariants each worker touches; the citations are the retrieval key for matching recovery playbooks into the packet | spec gate: every criterion has a test command; every worker contract validates against the schema; money paths flagged match the path rules; parallel workers have disjoint files and pinned interfaces; every criterion has a verify entry, and one left at level 0 says why. **Learning (planned):** the hidden tests fail on base; every plan entry that touches a product-model invariant cites it, and every citation resolves (*see Open 1, 13, 14, 15*) | coord revises up to 2×, then pages you |
 | 2 Approve | spec + plan | you (inbox) | approval record with your edits | signed by you | job stays `spec_pending` |
-| 3 Build | one worker contract | worker, then vigild | branch with commits; `worker_report.json`: test before/after, files changed, summary, self-check answers, open questions; a draft PR that **vigild** pushes and opens from the host (P2, owner 2026-10-22), never the worker | `must_fail_first` observed; `test_cmd` exits 0; files changed ⊆ scope; no test weakened (diff of test files reviewed by a check); lint/types clean; turns and cost under limits; all checked on the host before the push | retry with findings appended (attempt 2), then escalate tier. **Learning (planned):** the attempt protocol. There are up to N attempts (N = 2 to start). Between attempts the repo is reset, and the worker gets its failed patch plus category-level verifier feedback. Each attempt is its own attempt span, under one episode span per task, with its own reward (*Open 8*) |
-| 4 Verify | branch | CI (GitHub Actions). **Learning (planned):** vigild's verifier, as the reward computer | CI run; coverage delta; flake status. **Learning (planned):** `reward.json`, signed by vigild. It holds the gates, the mutation score (mutmut, Stryker, cargo-mutants) and the coverage delta on changed lines only, property and stateful results, a visual diff where the shape needs one, the cost tie-break, and hidden-test results by category | all required checks green on a clean runner, not the worker's shell; flaky tests quarantined, not counted. **Learning (planned):** the reward is computed only in the verifier, from a clean checkout of head; the worker's own claim is logged at zero weight; the reward's inputs are hashed onto the Phoenix span (*Open 4, 5*) | back to build with the CI log attached. **Learning (planned):** the worker sees only the visible tests plus category-level feedback ("hidden 3/7 pass; failing: concurrency, empty-input") |
-| 5 Review | PR diff + issue + spec. **Learning (planned):** plus `reward.json`, with the reviewer told to find what it missed (*Open 6*) | reviewer (fresh context) | `review.json`: findings\[\] {severity, file, line, claim, fix}, verdict. **Learning (planned):** each finding labelled (type, severity), and later tagged real or false by audit | zero findings of severity ≥ medium; checklist complete | findings become a fix task on the same branch; two rounds, then escalate |
-| 6 Audit | review + diff | auditor (Opus, sampled by rung). **Learning (planned):** it samples top-reward jobs as well as random ones (*Open 17*) | `audit.json`: findings the reviewer missed, match rate. **Learning (planned):** real/false tags on review findings; reward–audit agreement per component | match rate feeds the trust ladder; no missed high finding. **Learning (planned):** a reward component whose agreement falls below its threshold is frozen out of the reward until recalibrated | demote shape; findings become a fix task |
-| 7 Integrate | all worker PRs for the job | coord | integration branch, integration test run, PR stack order | integration tests pass; stacked PRs rebase clean | coord opens an integration fix task |
-| 8 Merge | ready PRs | you, or auto-merge at rung 3 | merge commits with job fingerprint. **Learning (planned; the spec's "Integrate"):** the merge record stores the reward, the model and its version, and the harness config hash | ruleset satisfied; auto-merge conditions | waits in inbox |
-| 9 Post-merge | merged commits | vigild watcher | verify record: post-merge CI, nightly suite, error-rate window. **Learning (planned; the spec calls this a new stage):** the full suite plus a canary in the integration env; regressions bisected to a job; a regression within 30 days that bisects to the job sets its reward to 0 | 48 h window clean | auto-revert if auto-merged; fix job as child, coord resumed. **Learning (planned):** it also auto-opens an incident that runs the middle loop (*Open 2*) |
+| 3 Build | one worker contract | worker, then vigild | branch with commits; `worker_report.json`: test before/after, files changed, summary, self-check answers, open questions; a draft PR that **vigild** pushes and opens from the host (P2, owner 2026-10-22), never the worker | `must_fail_first` observed; `test_cmd` exits 0; files changed ⊆ scope; no test weakened (diff of test files reviewed by a check); lint/types clean; turns and cost under limits; all checked on the host before the push | retry with findings appended (attempt 2), then escalate tier. **Learning (planned):** the attempt protocol. There are up to N attempts (N = 2 to start). Between attempts the repo is reset, and the worker gets its failed patch plus category-level verifier feedback. Each attempt is its own episode span with its own reward (*see Open 2*) |
+| 4 Verify | branch | CI (GitHub Actions). **Learning (planned):** vigild's verifier, as the reward computer | CI run; coverage delta; flake status. **Learning (planned):** `reward.json`, signed by vigild. It holds the gates, the mutation score (mutmut, Stryker, cargo-mutants) and the coverage delta on changed lines only, property and stateful results, a visual diff where the shape needs one, the cost tie-break, and hidden-test results by category | all required checks green on a clean runner, not the worker's shell; flaky tests quarantined, not counted. **Learning (planned):** the reward is computed only in the verifier, from a clean checkout of head; the worker's own claim is logged at zero weight; the reward's inputs are hashed onto the Phoenix span (*see Open 10, 11, 14, 16*) | back to build with the CI log attached. **Learning (planned):** the worker sees only the visible tests plus category-level feedback ("hidden 3/7 pass; failing: concurrency, empty-input") |
+| 5 Review | PR diff + issue + spec. **Learning (planned):** plus `reward.json`, with the reviewer told to find what it missed (*see Open 17*) | reviewer (fresh context) | `review.json`: findings\[\] {severity, file, line, claim, fix}, verdict. **Learning (planned):** each finding labelled (type, severity), and later tagged real or false by audit | zero findings of severity ≥ medium; checklist complete | findings become a fix task on the same branch; two rounds, then escalate |
+| 6 Audit | review + diff | auditor (Opus, sampled by rung). **Learning (planned):** it samples top-reward jobs as well as random ones (*see Open 12*) | `audit.json`: findings the reviewer missed, match rate. **Learning (planned):** real/false tags on review findings; reward–audit agreement per component | match rate feeds the trust ladder; no missed high finding. **Learning (planned):** a reward component whose agreement falls below its threshold is frozen out of the reward until recalibrated | demote shape; findings become a fix task |
+| 7 Integrate | all worker PRs for the job | coord | integration branch, integration test run, PR stack order. **Learning (planned):** the merge record stores the reward, the model and its version, and the harness config hash (the spec puts it here; the merge itself is stage 8: *see Open 18*) | integration tests pass; stacked PRs rebase clean | coord opens an integration fix task |
+| 8 Merge | ready PRs | you, or auto-merge at rung 3 | merge commits with job fingerprint | ruleset satisfied; auto-merge conditions | waits in inbox |
+| 9 Post-merge | merged commits | vigild watcher | verify record: post-merge CI, nightly suite, error-rate window. **Learning (planned; the spec calls this a new stage):** the full suite plus a canary in the integration env; regressions bisected to a job; a regression within 30 days that bisects to the job sets its reward to 0 | 48 h window clean | auto-revert if auto-merged; fix job as child, coord resumed. **Learning (planned):** it also auto-opens an incident that runs the middle loop (*see Open 19*) |
 | 10 Close | verify record | vigild | job summary, cost, lineage, lessons line appended to `docs/feature-map.md` | docs updated in the merged PRs | n/a |
-| Replay. **Learning (planned):** a new stage, weekly, outside any job | closed jobs and synthesized hard tasks; the current harness | vigild | per-model results (Opus and the best local) on the tune split; the held-out split once per release | only tune-split results drive trust-ladder promotions and harness-parameter tuning (turn budgets, packet size, retry depth, routing thresholds) | the change is not made; the result is reported (*Open 1, 9, 12, 14*) |
+| Replay. **Learning (planned):** a new stage, weekly, outside any job | closed jobs and synthesized hard tasks; the current harness | vigild | per-model results (Opus and the best local) on the tune split; the held-out split once per release | only tune-split results drive trust-ladder promotions and harness-parameter tuning (turn budgets, packet size, retry depth, routing thresholds) | the change is not made; the result is reported (*see Open 3, 4, 5, 6*) |
 
 **Your way of working, mapped.** You arrive with a feature request and ideas; you build; you fix until the MR survives a hard audit; then you fix the bugs that surface after. In Vigil that is: your request and ideas go into stage 1 as `notes` on the spec (the coord must address each idea in the plan, adopting or rejecting it with a reason); stages 3–6 are the build-and-fix loop, bounded by attempt counts; stage 9 is the after-ship fix loop, bounded by fix-job depth. You stop being the loop and become the two gates (2 and 8).
 
@@ -398,7 +399,7 @@ The worker packet also explains `ask_coord` (owner decisions 2026-10-22, phase 1
 **Learning (planned):**
 - The context pack also carries the recovery playbooks that the plan's product-model citations match.
 - An attempt after the first carries its failed patch and the category-level verifier feedback. It never carries the hidden tests.
-- Packet templates may evolve (GEPA/DSPy style), but only in the outer loop, with the verifier as the metric, re-run per model (*Open 9*).
+- Packet templates may evolve (GEPA/DSPy style), but only in the outer loop, with the verifier as the metric, re-run per model (*see Open 4*).
 
 Role prompts are short, imperative, and never change mid-job. Changing a prompt is a PR with an eval run attached. No session is ever asked to "continue" in a chat; a new stage is a new packet.
 
@@ -470,7 +471,7 @@ How far each acceptance criterion's check reaches. Levels 0, 1 and 3 only, for n
 How Vigil gets better from its own jobs.
 - **Design only.** Nothing in this section is built. It is the **learning epic**, after phase 5: `docs/feature-map.md` "Learning", `docs/learning/README.md`, and the first three experiments, #9, #10 and #11.
 - **The stage changes** are written into the job execution protocol, marked **Learning (planned)**.
-- **Conflicts.** Where this contradicts the current design, an *Open N* note says so. The owner decides; nothing here overrides the sections above until then.
+- **Conflicts.** Where this contradicts the current design, an *Open N* note says so. Each note is defined once, in reading order, and the protocol table points back to it. The owner decides each one; nothing here overrides the sections above until then.
 
 **Principle.** Vigil learns in the harness, not the weights. The model is a swappable executor.
 - **Where learning lands:** in artifacts that a new model can read:
@@ -481,42 +482,59 @@ How Vigil gets better from its own jobs.
   - a replay eval set.
 - **Weight training:** only on the local tier, offline, from Vigil's own verifier-labelled trajectories.
 - **Rejected: co-evolving harness and policy** (HarnessForge style). It couples the harness to one model, which is what breaks under a swap, and it needs harness changes to be self-graded.
-- *Open 16:* contradicts this doc's terms ("How workers are housed"; architecture "Backends"). Here an executor is a harness (Agent SDK, OpenCode) and a model is a backend, and the Claude executor drives `anthropic` backends only, so "the same harness" across Opus and a local model needs the OpenCode executor (phase 4). Owner to decide.
-- *Open 15:* "product model" is defined nowhere in this design. The closest things are layers 2–4 of the documentation tree and the level-3 models of the verification ladder. Owner to decide what it is, where it lives and who writes it.
+- *Open 1:* "product model" is defined nowhere in this design, yet the spec uses it throughout:
+  - hidden tests are written from it;
+  - plans must cite its invariants;
+  - a reward gate checks contradictions against it;
+  - the middle loop writes product-model PRs.
+
+  The closest things are layers 2–4 of the documentation tree and the level-3 models of the verification ladder. A self-generated product-model PR also meets the intake rules: self-generated work needs `value ≥ 3`, and "nothing self-generated touches a money, auth or consent path". Owner to decide what the product model is, where it lives and who writes it.
 
 **Three loops, plus the tower.**
 - **Inner, per job: the attempt protocol (FC-SWE), no training.**
   - Up to N attempts, starting at N = 2.
   - Between attempts, vigild resets the repo and gives the worker its failed patch plus category-level verifier feedback.
   - Each attempt is its own episode span with its own reward, so credit never leaks from a recovery to a failed first attempt.
-  - *Open 8:* contradicts stage 3's "retry with findings appended, then escalate tier", "Escalation forks full context", best-of-n on the tower, and architecture B35 (the owner retries a failed worker from the inbox, on what's left of its cap). Owner to decide.
+  - *Open 2:* contradicts stage 3 and the current retry rules:
+    - **Automatic retry.** Stage 3's "retry with findings appended (attempt 2), then escalate tier" and architecture B35 have a failed worker block the job with one inbox item, and **the owner** retries. The protocol retries automatically.
+    - **Reset against fork.** "Escalation forks full context" starts an escalated attempt from the failed attempt's whole context. The protocol resets the repo and passes only the patch and feedback.
+    - **Parallel against sequential.** Best-of-n on the tower runs 2–3 attempts in parallel; the protocol runs them one after another.
+    - **One cap.** B35 gives a retry only what's left of the task's $2 cap, so N attempts share one $2 cap.
+    - **The counter.** The contract's `attempt` field already counts escalation steps: routing rule 5 fires at `attempt ≥ 3`, and the escalation ladder sends attempt 3 to Sonnet. Protocol attempts would collide with it.
+
+    Owner to decide.
 - **Middle, per incident: PROBE's shape.**
   - The flow: a telemetry bundle from the Phoenix spans → a structured diagnosis (anchor, primary cause, behavioural mistake, evidence, bounded confidence) → a gated hint.
   - Every hint target traces to evidence. A hint has a target, an operation, a verification signal and a boundary.
   - An infrastructure failure is never turned into a corrective hint.
-  - The result is stored as a recovery playbook and an eval case. Where the cause was a wrong assumption, it is also a product-model PR.
-  - *Open 2:* the incident opens automatically, next to the fix job of stage 9. Owner to decide.
-  - *Open 15:* a self-generated product-model PR meets the intake rules (value ≥ 3; never a money, auth or consent path). Owner to decide.
+  - The result is stored as a recovery playbook and an eval case. Where the cause was a wrong assumption, it is also a product-model PR (see Open 1).
 - **Outer, weekly and per release: replay.**
   - Closed jobs and synthesized hard tasks are replayed against the current harness with two models: Opus and the best local.
   - Replay drives trust-ladder promotions and harness-parameter tuning (turn budgets, packet size, retry depth, routing thresholds), on the tune split only.
   - The held-out split is reported once per release.
-  - *Open 1:* contradicts phase 7, "Eval", which replays 10 issues a quarter. Owner to decide.
-  - *Open 9:* contradicts the trust ladder, which promotes only from live audits, keeps money, auth and consent at rung 0 forever, and keeps `deps` at rung 1. It also contradicts policy as code, under which config and prompts change only by a reviewed PR. Owner to decide.
-  - *Open 12:* contradicts the budget caps. Owner to decide.
-  - *Open 14:* contradicts owner-only approval out of `spec_pending`, which replayed and synthesized jobs would need. Owner to decide.
+  - *Open 3:* contradicts phase 7, "Eval", and the "Eval protocol". Those replay 10 closed issues a quarter ("Ten replayed issues per quarter decide which task shapes the tower keeps"), score them by CI, the reviewer and "would a human merge this unchanged", decide by ≥ 70% first-try CI and ≤ 1 finding, and come after phase 6. The outer loop is weekly, scored by the reward, decided on a tune split, and comes after phase 5. Owner to decide whether the epic absorbs phase 7 or builds on it.
+  - *Open 4:* contradicts the trust ladder and policy as code.
+    - **A second promotion path.** The ladder promotes a shape only from live audit match rates (20 PRs at rung 1, 40 at rung 2). It keeps money, auth and consent "at rung 0 permanently", and starts `deps` at rung 1 with the owner always reviewing. Replay results aren't audits of live reviews, so promotion from replay is a second path, and it must never touch those shapes.
+    - **Automatic policy changes.** Harness-parameter tuning and packet-template evolution change config and prompts. Under policy as code, config changes only "reviewed by PR like code", and "changing a prompt is a PR with an eval run attached".
+
+    Owner to decide.
+  - *Open 5:* contradicts the budget caps: $5 a day, $2 a task, $100 a month, all hard stops.
+    - **Daily and monthly caps.** A weekly replay of even 20 tasks with Opus, at up to $2 each, is up to about $40 a week. That is eight days of the daily cap and about 40% of the monthly cap, before any live job.
+    - **The task cap.** The $2 cap truncates Opus and Sonnet runs (the design's cost model puts a Sonnet S/M task near $3), which biases the swap gap toward zero.
+    - **The experiments.** The spec's "a few dollars" holds for #9 (about $3–8), not for #10 (about $6–85) or #11 (about $60–80).
+
+    The precedent is #8, whose bench has its own budget that "never draws from the daily job cap", and phase 7's "one-time eval budget". Either is a new cap the gateway would enforce. Owner to decide.
+  - *Open 6:* contradicts owner-only approval. "Inbox approval by the owner is the only exit from `spec_pending`", and replayed and synthesized jobs have no owner approval. #8 handles this with an automatic, labelled approval for bench tasks, which is a new exit. Owner to decide.
 - **Tower, later and optional: a rejection-sampling fine-tune.**
   - An 8B-class local model, trained with QLoRA from verifier-passing trajectories.
   - GRPO is out of scope on a 16 GB card.
   - Not scheduled until the middle loop has produced a few hundred passing trajectories.
-  - *Open 7:* contradicts the training-data firewall ("What an expert would insist on" 8; "Training-data firewall"). The exporter takes `local` only, but:
-    - replays also run Opus;
-    - a local trajectory's packet carries Claude-written specs, feedback and playbooks;
-    - Phoenix spans have no provenance check;
-    - the middle loop yields playbooks, not trajectories;
-    - the firewall is scheduled after phase 6, which is after this epic.
+  - *Open 7:* contradicts "Claude outputs never enter a training set" and the provenance rule.
+    - **Mixed trajectories.** A `local` trajectory's packet carries Claude-written text: the spec, the plan, hidden-test feedback and playbooks. Exporting the trajectory exports that text.
+    - **No provenance on spans.** Phoenix, the proposed episode store, keeps spans with no provenance tag and no CHECK constraint, while every stored artifact must carry one.
 
     Owner to decide.
+  - *Open 8:* contradicts the training-data firewall's label rule. Fine-tuning is "allowed only on its own attempts graded by your test suite". Hidden tests are written by a Claude session (provenance `claude`), so a trajectory that is labelled passing because of hidden tests isn't graded by the repo's own suite. Owner to decide.
 
 **Reward: lexicographic, never a weighted sum.**
 1. **Gates; any failure scores 0:**
@@ -533,45 +551,87 @@ How Vigil gets better from its own jobs.
 3. **Cost, as the tie-break:** tokens, wall-clock, GPU-hours, fix-job depth.
 4. **Retroactive:** a regression within 30 days that bisects to the job sets its reward to 0.
 
+*Open 9:* the quality tier overlaps the verification ladder. Property and stateful tests are already verification level 1 (phase 2: Hypothesis, SwiftCheck, Schemathesis, and Hypothesis stateful tests for the FSM). The reward should read level 1's results rather than add a second property-test mechanism. Owner to decide.
+
 How the reward is computed and checked:
 - It is computed only in the verifier container, from a clean checkout of head.
 - The worker's own claimed result is logged at zero weight.
 - The reward's inputs are hashed onto the Phoenix span.
-- Audit deliberately samples top-reward jobs. Reward–audit agreement is tracked per component, and a component below its threshold is frozen out of the reward until it is recalibrated.
+- Audit deliberately samples top-reward jobs as well as random ones. Reward–audit agreement is tracked per component, and a component below its threshold is frozen out of the reward until it is recalibrated.
 
 Where it conflicts:
-- *Open 4:* contradicts architecture B33. The verifier container runs head's code, which B33 treats as able to forge its report, so B33 has vigild decide on the host. A key to sign `reward.json` can't sit in a container. Owner to decide.
-- *Open 5:* contradicts the verifier's plain dev image, its lack of network, and its one-at-a-time runs, which mutation tools need to change. Owner to decide.
-- *Open 6:* "reviewer findings" is an LLM judgment inside the reward, against the keep-out list below. Also, `reward.json` is emitted at Verify, before Review. Owner to decide.
-- *Open 17:* sampling top-reward jobs skews the audit samples the ladder's statistics assume. Owner to decide.
+- *Open 10:* contradicts architecture B33. The verifier container runs head's code, and B33 says that code can forge its report ("the report is evidence of what ran, not a defence against a hostile test"), which is why vigild decides the verdict on the host. A reward computed inside the container can be forged by the code it judges. A key to sign `reward.json` can't be in a container either ("No secret in … a container"). The likely reading is that containers emit raw reports and vigild computes and signs `reward.json` on the host. Owner to decide.
+- *Open 11:* the verifier container can't see every reward input. The cost tie-break comes from the gateway's metering, and reviewer findings come from Review, both of them in vigild. The container has no network. "Computed only in the verifier container" can hold for the gates and the test-derived quality signals, not for reviewer findings or the cost tier. Owner to decide.
+- *Open 12:* there would be three audit sampling rules: the ladder's random sample by rung (25%, 10%), the verification ladder's "audit sampling … weight criteria by verify level", and now top-reward jobs. The ladder's missed-finding statistics are only valid on the random sample, so they must be computed from it alone. Owner to decide.
 
 **Hidden tests.**
 - **Who writes them:** at spec time, a separate fresh-context session writes acceptance tests from the spec and the product model only. The spec author's session is never the worker's session.
 - **They must fail on base.**
 - **Where they live:** vigild stores them, and they enter only the verifier container.
 - **What the worker sees:** only the visible tests, plus category-level feedback ("hidden 3/7 pass; failing: concurrency, empty-input").
-- *Open 3:* contradicts stage 1 and layer 6. Stage artifacts are committed on the job's branch, which a worker clones. Must-fail-first is about the worker's own tests. The inbox shows the owner every test before approval. Owner to decide.
-- *Open 11:* contradicts the private-repo rule. A hosted author can't write a private repo's hidden tests. Owner to decide.
+- *Open 13:* contradicts stage 1 and stage 2 as they stand.
+  - **Who writes tests.** Today the coord writes a `test_cmd` per criterion and the worker writes the failing tests. Hidden tests add a second test author at spec time.
+  - **Where artifacts live.** Every stage-1 artifact is in layer 6, `.vigil/<job>/` on the job's branch, which the worker clones. Hidden tests would be the first vigild-only artifact.
+  - **What the owner sees.** The inbox shows the owner each worker's `test_cmd` before approval. It is undecided whether the owner approves tests the worker never sees.
+
+  Owner to decide.
+- *Open 14:* contradicts the verifier's run set (architecture B33). The verifier runs only the approved spec's `test_cmd`, three times (base; before, which is the base plus the worker's tests; after, which is head), with the base's runner files. The superset check and must-fail-first ("one of the worker's own new or changed tests fails before and passes after") are computed over that set. Hidden tests need runs of their own: on base for "must fail on base" and on head for the gate. Adding them to the same runs changes the executed-set comparison. Owner to decide.
+- *Open 15:* contradicts the private-repo rule. A private repo's text goes only to local backends (and `jev-cloudflare`), with `anthropic` allowed for vigil alone. The following can't run for any other private repo, so there the author must be local or there are no hidden tests:
+  - an Opus hidden-test author;
+  - a Claude diagnosis in the middle loop;
+  - an Opus replay;
+  - LLM-driven task synthesis.
+
+  Owner to decide.
 
 **Phase changes.** Each one is in the job execution protocol's table, at its stage:
-- **Spec:** `hidden_tests`, `reward_schema` and a difficulty estimate.
-- **Plan:** cites the product-model invariants it touches; the citations are the retrieval key for playbooks.
-- **Build:** the attempt protocol, with episode and attempt spans.
-- **Verify:** becomes the reward computer: mutation testing (mutmut for Python, Stryker for TypeScript, cargo-mutants for Rust), changed-line coverage, property tests, visual diff, and `reward.json` signed by vigild.
-- **Review:** gets `reward.json`, and labelled findings.
-- **Audit:** samples top-reward jobs too.
-- **Merge** (the spec's "Integrate"): the reward, the model and its version, and the harness config hash.
-- **Post-merge** (stage 9, which the spec calls new): the full suite plus a canary, bisection, retroactive reward, and an incident.
-- **Replay:** a new stage, weekly.
+- **Spec:** new artifacts: `hidden_tests`, `reward_schema` (which graded signals apply per shape), and a difficulty estimate.
+- **Plan:** must cite the product-model invariants it touches. The citations are the retrieval key for matching recovery playbooks into the packet. The planned spec gate refuses a plan entry that touches an invariant without citing it, and a citation that doesn't resolve.
+- **Build:** the attempt protocol above, with episode and attempt spans.
+- **Verify:** becomes the reward computer. It adds:
+  - mutation testing: mutmut for Python, Stryker for TypeScript, cargo-mutants for Rust;
+  - changed-line coverage;
+  - property tests;
+  - visual diff;
+  - `reward.json`, signed by vigild.
+  - *Open 16:* contradicts the verifier's image and limits:
+    - **Tools.** The verifier uses the repo's plain dev image, built from the repo's lockfiles only, and mutmut, Stryker and cargo-mutants aren't in any of them. Adding a tool to the target repo is a deps job that changes the repo; adding it to the image makes a second image definition.
+    - **Network.** The verifier has no network, but SWE-smith's LM-driven strategies and Change2Task need a model.
+    - **Time.** Mutation runs multiply suite time, while the verifier allows one container at a time per machine and 15 minutes per run, shared with live jobs.
+
+    Owner to decide.
+- **Review:** reviewers receive `reward.json` and are told to find what it missed. Findings are labelled (type, severity), and audit later tags them real or false.
+  - *Open 17:* contradicts the order of the stages and the review contract.
+    - **Order.** `reward.json` is emitted at Verify, before Review exists, so it can't hold the "reviewer findings by severity" component unless it is recomputed after Review.
+    - **What a reviewer sees.** The review contract gives every reviewer "the diff, the issue, the spec, and the checklist", and rung 1 runs two reviewers "both blind". A reviewer told to find "what reward.json missed" skips what it caught. The auditor then counts those as missed, so match rates, the ladder's currency, fall for reasons unrelated to the reviewer.
+    - **A tension, not a contradiction:** the spec keeps "LLM-as-judge" out of the reward but allows it "as reviewer", and reviewer findings feed the reward.
+
+    Owner to decide.
+- **Audit:** samples top-reward jobs as well as random ones (see Open 12).
+- **Integrate:** the merge record stores the reward, the model and its version, and the harness config hash.
+  - *Open 18:* the spec puts this at "Integrate", which is stage 7: the coord's integration branch and stacked PRs. The merge record itself is made at stage 8, "Merge". The protocol table writes it at stage 7, as the spec says, and notes stage 8. Owner to decide which stage carries it.
+- **Post-merge** (a new stage in the spec):
+  - the full suite plus a canary in the integration env;
+  - regressions bisected to a job;
+  - retroactive reward;
+  - an incident opened automatically, which runs the middle loop.
+  - *Open 19:* contradicts stage 9 and phase 6, which already define post-merge: the watcher on "post-merge CI, nightly suite, error-rate window", with a "48 h window clean".
+    - **The window.** The 30-day retroactive window is not the 48 h one. A job reaches the terminal `done` after 48 h, so its reward would change after `done`, outside the job FSM.
+    - **The canary.** "A canary in the integration env" names an environment this design doesn't define.
+    - **The incident.** It runs a paid model session without the owner. That sits against "Audits produce findings, not tasks", even though stage 9 already opens fix jobs automatically.
+
+    Owner to decide.
+- **Replay:** a new stage, weekly, as described under the outer loop.
 
 **Measurement.** Three pools, each with a frozen 20% held-out:
 - merged-PR replay from our repos;
 - synthesized hard tasks from our repos: SWE-smith bug injection and Change2Task merged-change conversion, with the original tests as hidden tests;
 - a 50-task seeded SWE-bench Pro public sample, as an external anchor only.
 
-The anchor and #8:
-- **Overlap.** #8, "vigil bench", already covers this sample, with 50–100 tasks, its own tune and held-out split, and its own budget outside the daily cap.
-- **Proposed reconciliation (#11; owner to decide).** #8's seeded draw is the anchor. Its first 50 tasks in seed order are the learning anchor, and the learning metrics read only those. Nothing tunes on them.
+**The anchor and #8, reconciled.** #8 ("vigil bench") already covers this sample. The proposal, recorded in #8 for the owner to confirm:
+- #8 draws more than 50 tasks; it already says 50–100.
+- Tasks 1–50 in seed order are the learning anchor, and nothing ever tunes on them.
+- #8's tune split comes only from tasks 51 onward.
 
 Metrics, in priority order:
 1. **Durable-fix rate:** the hidden tests pass and there is no attributed regression at 30 days.
@@ -582,17 +642,20 @@ Metrics, in priority order:
 6. **Harness lift:** the Vigil pipeline minus a mini-swe-agent baseline, on the same model and tasks.
 
 "Near frontier" is claimed only when the first two improve on held-out across two consecutive releases while the public anchor does not widen.
-- *Open 13:* the spec doesn't say which gap on the anchor must not widen, or why an anchor that is never tuned on needs a held-out split. Owner to decide.
-- *Open 1:* the outer loop is a second replay, beside the phase 7 eval ("Eval protocol"). Owner to decide.
+- *Open 20:* two loose ends in the spec's measurement:
+  - a frozen 20% held-out is redundant for the anchor, which is never tuned on;
+  - "the public anchor does not widen" names no gap.
+
+  Owner to decide which gap; the swap gap measured on the anchor is the likely one.
 
 **Borrow and keep out.**
 - **Borrow:**
-  - SWE-smith and Change2Task for task synthesis, inside the verifier container (*Open 5*);
+  - SWE-smith and Change2Task for task synthesis, inside the verifier container (see Open 16);
   - mini-swe-agent as the baseline executor in replay;
   - Harbor as the runner for the public sample (#8 already evaluates it first);
   - PROBE's three layers for incidents;
   - FC-SWE's attempt protocol;
-  - GEPA/DSPy-style prompt evolution, for packet templates only, with the verifier as the metric, only in the outer loop, re-run per model;
+  - GEPA/DSPy-style prompt evolution, for packet templates only, with the verifier as the metric, only in the outer loop, re-run per model (see Open 4);
   - Phoenix as the episode store, with new `episode`, `attempt` and `reward` span kinds.
 - **Keep out:**
   - OpenHands as a runtime (a second orchestrator);
@@ -601,14 +664,13 @@ Metrics, in priority order:
   - self-refine within one session;
   - full co-evolution.
 - **Every tool named here is planned, not adopted:** mutmut, Stryker, cargo-mutants, SWE-smith, Change2Task, mini-swe-agent, Harbor, GEPA/DSPy. When one is adopted, its PR gives it an exact pin at least two weeks old, recorded in `docs/sources.md`, and a one-line reason (the no-new-dependency rule).
-- *Open 10:* mini-swe-agent and Harbor are a second agent loop and a second runner, against "one way to do each thing". Each would need the gateway for its model calls. Owner to decide.
+- *Open 21:* contradicts "one way to do each thing" and "one task contract for every executor". mini-swe-agent is a third agent loop, and Harbor is a second runner of agent jobs beside vigild. Each would need a contract adapter, and the gateway for every model call ("Nothing else holds a provider key"). Owner to decide.
 
-**The epic.** It sits after phase 5 (feature map "Learning"). Its first three items each run on data from the first ParkAgent run, for a few dollars. They run only through vigild, after the owner confirms; no session touches ParkAgent directly.
+**The epic.** It sits after phase 5 (feature map "Learning"). Its first three items each run on data from the first ParkAgent run, for a few dollars (see Open 5 for what they actually cost). They run only through vigild, after the owner confirms; no session touches ParkAgent directly.
 1. **Hidden-test validity (#9).** For 20 closed ParkAgent jobs, a fresh Opus session generates hidden tests from the spec plus the product model, and they run against the merged fix. Below ~80% pass, the spec stage is the bottleneck and nothing else proceeds first.
 2. **Reward validity (#10).** Compute the full reward on 30 merged and 30 rejected historical PRs. Report each component's AUROC against the human outcome, and drop components under ~0.7.
-3. **Swap gap (#11).** A 20-task replay on the same harness: Opus vs Sonnet vs Qwen3.6 on the tower. It needs phase 5 (and phase 4: *Open 16*). If the local model is under ~20% where Opus is over 60%, move the routing boundary toward Sonnet and defer tower training.
-
-*Open 12:* "a few dollars" holds for #9 (about $4–10), not for #10 (about $8–90) or #11 (about $60–80, where the $2 task cap also truncates the Claude runs). Weekly replay has the same problem. #8's rule, a separate budget that never draws from the daily cap, is the precedent. Owner to decide.
+3. **Swap gap (#11).** A 20-task replay on the same harness: Opus vs Sonnet vs Qwen3.6 on the tower. It needs phase 5. If the local model is under ~20% where Opus is over 60%, move the routing boundary toward Sonnet and defer tower training.
+   - *Open 22:* the executor is a confound in #11. Today Claude models run in the Claude executor and the tower's models run in OpenCode, so "the same harness" (Vigil's packets, verifier and prompts) still differs in the agent loop. The gap would then measure executor plus model unless all three models run in one executor. A minor point: `configs/repos.yaml` lists no local backend for ParkAgent, so the Qwen runs need a config change. Owner to decide.
 
 ## Tower: local model serving
 
@@ -829,9 +891,9 @@ The eval is a replay of closed ParkAgent issues with the merged PR hidden, score
 
 The eval also decides the GPU question: if DeepSeek V4.1 Flash passes shapes the tower fails, a RunPod serverless adapter is worth building; if not, it isn't.
 
-**Learning (planned):** the learning epic's outer loop is a second, weekly replay, with its own reward and its own tune and held-out splits ("Learning loop"). How it relates to this eval and to phase 7 is *Open 1*.
+**Learning (planned):** the learning epic's outer loop is a second, weekly replay, with its own reward and its own tune and held-out splits ("Learning loop"). How it relates to this eval and to phase 7 is *Open 3* there.
 
-**Training-data firewall (optional later phase).** Fine-tuning the local model is allowed only on its own attempts graded by your test suite. Every artifact `vigild` stores carries `provenance: claude | local | human`, the training exporter filters on `provenance == local`, and a unit test asserts that a fixture tagged `claude` is rejected. Merged PRs written by Claude are never exported. This keeps you inside Anthropic's terms without relying on memory. **Learning (planned):** the learning epic's tower loop is the first user of this exporter (*Open 7*).
+**Training-data firewall (optional later phase).** Fine-tuning the local model is allowed only on its own attempts graded by your test suite. Every artifact `vigild` stores carries `provenance: claude | local | human`, the training exporter filters on `provenance == local`, and a unit test asserts that a fixture tagged `claude` is rejected. Merged PRs written by Claude are never exported. This keeps you inside Anthropic's terms without relying on memory. **Learning (planned):** the learning epic's tower loop (later, optional, not scheduled) would be the first user of this exporter. Its conflicts with this paragraph are *Open 7* and *Open 8* in "Learning loop".
 
 ## Repo layout and build order
 
@@ -873,7 +935,7 @@ The per-phase detail (deliverables, credentials, spend) is in `docs/architecture
 | 6. Post-merge + fix jobs + auto-merge | the post-merge watcher (48 h window), fix jobs as children with the coord resumed, auto-revert, auto-merge for shapes at rung 3 | defined when the phase is dispatched |
 | 7. Eval | `evals/run.py` over workers, reviewers and deciders; routing.yaml and review.yaml edited from results | results.csv committed; first shapes at rung 1; cost table uses real numbers |
 
-After phase 6: the training-data firewall exporter (the provenance tag exists from phase 1), the RunPod overflow adapter if the eval calls for it, and more repos added via `repos.yaml`. The learning epic's tower loop needs that exporter (*Open 7*).
+After phase 6: the training-data firewall exporter (the provenance tag exists from phase 1), the RunPod overflow adapter if the eval calls for it, and more repos added via `repos.yaml`. The learning epic's tower loop (later, optional, not scheduled) would use that exporter.
 
 ## What you set up by hand, and the answers
 
