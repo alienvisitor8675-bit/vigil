@@ -187,6 +187,7 @@ class Hold:
     preset: Preset
     body: dict[str, Any]
     released: bool = False
+    probe: str | None = None  # the backend breaker's half-open probe this call claimed
 
 
 def _hash(token: str) -> str:
@@ -217,6 +218,28 @@ class Gateway:
         # vigild's circuit breakers (plan 2a, item 4): every upstream answer
         # counts for or against the preset's backend breaker
         self.breakers: Any = None
+
+    def _backend_gate(self, preset_name: str) -> str | None:
+        """An open backend breaker refuses the call before it is sent, unless
+        it has cooled down and this call claims its one half-open probe
+        (review B6, A11). Returns the claimed scope, to release if the call
+        never reaches upstream."""
+        if self.breakers is None:
+            return None
+        from vigild.breakers import Kind
+
+        scope = f"backend:{preset_name}"
+        if not self.breakers.is_open(Kind.BACKEND, scope):
+            return None
+        if self.breakers.claim_probe(Kind.BACKEND, scope):
+            return scope
+        raise GatewayError(529, "overloaded_error", f"{preset_name}: its backend breaker is open")
+
+    def _release_probe(self, scope: str | None) -> None:
+        if scope is not None and self.breakers is not None:
+            from vigild.breakers import Kind
+
+            self.breakers.release_probe(Kind.BACKEND, scope)
 
     def _upstream(self, preset_name: str, ok: bool, detail: str = "") -> None:
         """N 5xx or timeouts in a row trip the preset's backend breaker; any
@@ -419,9 +442,15 @@ class Gateway:
             amount = 0.0
             if path in METERED_PATHS:
                 amount = self._hold(gs.session_id, self.worst_case(model, body, len(raw)))
+            try:
+                probe = self._backend_gate(gs.preset)  # last: nothing refuses after a claim
+            except GatewayError:
+                if amount:
+                    self.release(Hold(gs.session_id, amount, preset, body))
+                raise
         except GatewayError as e:
             raise self._refuse(gs, e) from None
-        return Hold(gs.session_id, amount, preset, body)
+        return Hold(gs.session_id, amount, preset, body, probe=probe)
 
     # --- forwarding ------------------------------------------------------------------
 
@@ -483,6 +512,7 @@ class Gateway:
             raise
         except BaseException:
             self.release(hold)
+            self._release_probe(hold.probe)  # the call never reached upstream
             raise
         self._upstream(gs.preset, resp.status_code < 500, f"HTTP {resp.status_code}")
         ctype = resp.headers.get("content-type", "")
@@ -673,7 +703,12 @@ class Gateway:
         if fallback:
             self._fallback_hold(repo, amount)
         try:
-            return self._call(repo, preset, p, model, raw, amount, purpose, job_id)
+            probe = self._backend_gate(preset)
+            try:
+                return self._call(repo, preset, p, model, raw, amount, purpose, job_id)
+            except GatewayError:
+                self._release_probe(probe)  # refused before upstream (the budget)
+                raise
         finally:
             if fallback:
                 self._fallback_done(repo, amount)

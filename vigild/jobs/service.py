@@ -35,7 +35,7 @@ from vigild.router.rules import RoutingError, route
 class Runner(Protocol):
     def on_job_created(self, job_id: str, needs_spec: bool) -> None: ...
     def on_approved(self, job_id: str) -> None: ...
-    def on_resume(self, job_id: str) -> None: ...
+    def on_resume(self, job_id: str) -> str | None: ...
     def on_rebuild(self, repo: str, base_sha: str) -> None: ...
 
 
@@ -555,9 +555,10 @@ class JobService:
             failed(job)  # an abandoned job counts toward the repo's breaker (item 4)
         return job
 
-    def reset(self, item_id: int) -> list[str]:
+    def reset(self, item_id: int) -> dict[str, list[str]]:
         """Reset a tripped circuit breaker (plan 2a, item 4): it closes, and
-        the jobs it paused resume. Returns their ids."""
+        the jobs it paused resume: `resumed`, or `queued` behind their own
+        run that is still finishing (review B4)."""
         with self.store.tx():
             item = self._question(item_id)
             if item.body.get("kind") != "breaker" or "reset" not in (
@@ -570,7 +571,10 @@ class JobService:
             )  # fmt: skip
             self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
         reset = getattr(self.runner, "on_breaker_reset", None)
-        return list(reset(int(item.body["breaker"]), item_id)) if reset else []
+        if reset is None:
+            return {"resumed": [], "queued": []}
+        out = reset(int(item.body["breaker"]), item_id)
+        return out if isinstance(out, dict) else {"resumed": list(out), "queued": []}
 
     def rebuild(self, item_id: int) -> None:
         """Build and validate a repo's failed dev image again (round 2)."""

@@ -257,6 +257,10 @@ class BarePublisher:
 
     ws: Workspace | None = None
     prs: list[dict[str, Any]] = field(default_factory=list)
+    closed: list[str] = field(default_factory=list)
+
+    def close(self, repo: str, url: str) -> None:
+        self.closed.append(url)
 
     def publish(
         self,
@@ -482,10 +486,10 @@ def _approve(w: World) -> str:
 def test_daily_cap_halts_dispatch(world: World) -> None:
     w = world
     job = _request(w)
-    # spend the day elsewhere: $4.50 of $5 is held, so no $1 worker fits
+    # spend the day elsewhere: $4.98 of $5 is held, so no worker's share fits
     w.budget.reserve(session_id=None, task_id="other-1", amount=2.0, purpose="worker")
     w.budget.reserve(session_id=None, task_id="other-2", amount=2.0, purpose="worker")
-    w.budget.reserve(session_id=None, task_id="other-3", amount=0.5, purpose="worker")
+    w.budget.reserve(session_id=None, task_id="other-3", amount=0.98, purpose="worker")
     item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
     w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
     assert [c[0] for c in w.standin.calls] == ["coord"]  # no worker started
@@ -493,7 +497,10 @@ def test_daily_cap_halts_dispatch(world: World) -> None:
     jobrow = w.store.get_job(job)
     assert jobrow.state.value == "blocked" and jobrow.blocked_from is not None
     pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
-    assert any("daily" in p["title"] for p in pages)
+    # 2a round 2 (review B1): the job's own page; nothing metered reached the cap
+    (page,) = [p for p in pages if p["job_id"] == job]
+    assert page["body"]["kind"] == "budget" and page["body"]["cap"] == "daily"
+    assert not [p for p in pages if p["body"].get("kind") == "breaker"]
 
 
 def test_a_dev_image_that_fails_refuses_dispatch_and_offers_rebuild(world: World) -> None:
@@ -732,7 +739,7 @@ def test_resume_after_the_cap_redispatches(world: World) -> None:  # item 18
     job = _request(w)
     held = [
         w.budget.reserve(session_id=None, task_id=f"other-{i}", amount=a, purpose="worker")
-        for i, a in enumerate((2.0, 2.0, 0.5))
+        for i, a in enumerate((2.0, 2.0, 0.98))
     ]
     item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
     w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
@@ -742,13 +749,13 @@ def test_resume_after_the_cap_redispatches(world: World) -> None:  # item 18
     page = next(
         p
         for p in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
-        if "cap" in p["title"]
+        if p["job_id"] == job
     )
-    # phase 2a, item 4: the cap is a breaker; resetting it resumes the jobs it held
-    assert page["body"]["kind"] == "breaker" and page["body"]["breaker_kind"] == "daily_cap"
-    r = w.client.post(f"/api/inbox/{page['id']}/reset", headers=auth(w.tokens.admin))
+    # 2a round 2 (review B1): held reservations aren't spend: the job's own page,
+    # and its retry runs the work on what's left of each task's cap
+    assert page["body"]["kind"] == "budget" and "retry" in page["body"]["actions"]
+    r = w.client.post(f"/api/inbox/{page['id']}/retry", headers=auth(w.tokens.admin))
     assert r.status_code == 200, r.text
-    assert r.json()["resumed"] == [job]
     assert w.store.get_job(job).state.value == "ready"
     assert len(w.publisher.prs) == 2
 
@@ -1195,13 +1202,17 @@ def test_a_job_already_running_is_not_started_twice(world: World) -> None:  # ro
 
     w.runner.background = True
     w.runner.run_coord = slow  # type: ignore[method-assign]
-    w.runner.on_resume(job)
-    w.runner.on_resume(job)  # a second resume while the first runs
+    assert w.runner.on_resume(job) == "started"
+    # a second resume while the first runs is queued, never run at once (2a review B4)
+    assert w.runner.on_resume(job) == "queued"
+    assert w.runner.on_resume(job) == "queued"  # and asked twice, it runs once more
+    time.sleep(0.05)
+    assert started == [job]
     gate.set()
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and w.runner.running():
         time.sleep(0.01)
-    assert started == [job]
+    assert started == [job, job]
 
 
 def test_sessions_run_in_the_session_image_and_tests_in_the_dev_image(world: World) -> None:

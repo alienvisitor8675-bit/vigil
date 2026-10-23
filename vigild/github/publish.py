@@ -66,6 +66,21 @@ class RestPulls:
         url: str = r.json()["html_url"]
         return url
 
+    def close(self, repo: str, number: int) -> None:
+        """Close a PR vigild opened (a deps PR its review failed; owner, 2026-10-23)."""
+        r = self.http.patch(
+            f"{self.api}/repos/{repo}/pulls/{number}",
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            json={"state": "closed"},
+            timeout=30.0,
+        )
+        if r.status_code != 200:
+            raise PublishError(f"closing {repo}#{number} failed (HTTP {r.status_code})")
+
     def state(self, repo: str, number: int) -> str:
         """A PR's state: open, merged or closed (vigild's PR poll, plan 2a item 5)."""
         r = self.http.get(

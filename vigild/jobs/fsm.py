@@ -139,6 +139,16 @@ def _merged(c: Ctx) -> list[str]:
     return [] if c.evidence.get("merge_commits") else ["no merge commits recorded"]
 
 
+def _merged_by_hand(c: Ctx) -> list[str]:
+    """Review B7: the owner merged every PR of the job before (or instead of)
+    vigild's review finishing; vigild's PR poll saw each one merged."""
+    errs = _merged(c)
+    live = [t for t in c.store.list_tasks(c.job.id) if t.state not in ("superseded", "abandoned")]
+    if not live or any(t.state != "merged" for t in live):
+        errs.append("not every PR of the job has merged")
+    return errs
+
+
 def _abandon(c: Ctx) -> list[str]:
     if c.actor is not Actor.OWNER or c.channel != "inbox":
         return ["only the owner, from the inbox, abandons a job"]
@@ -160,6 +170,7 @@ EDGES: dict[tuple[JobState, JobState], Guard] = {
     (S.IN_REVIEW, S.BUILDING): _findings,
     (S.IN_REVIEW, S.READY): _reviews_clean,
     (S.READY, S.MERGED): _merged,
+    (S.IN_REVIEW, S.MERGED): _merged_by_hand,
     (S.MERGED, S.VERIFYING): _none,
     (S.VERIFYING, S.DONE): _verified,
     (S.SPEC_PENDING, S.ABANDONED): _abandon,
@@ -168,7 +179,12 @@ HOLDS = (S.BLOCKED, S.ESCALATED)
 TERMINAL = (S.DONE, S.ABANDONED)
 # Out of a hold, besides resuming where it left (review round 2, N5): the
 # owner sends a failed build back to the coord, or abandons the job.
-FROM_HOLD = {S.SPEC_PENDING: "replan", S.ABANDONED: "abandon"}
+FROM_HOLD = {S.SPEC_PENDING: "replan", S.ABANDONED: "abandon", S.MERGED: "prs_merged"}
+# What vigild itself may do to a held job, each with its evidence: resume it
+# once the deps job it waits on merged (round 3) or once a backend breaker's
+# probe closed it (review B6), and record it merged once the owner merged
+# every PR of it by hand (review B7). Everything else is the owner's.
+VIGILD_HOLD_ACTIONS = ("deps_merged", "probe_closed", "prs_merged")
 NEVER_FORCED = {(S.SPEC_PENDING, S.APPROVED)}
 
 
@@ -211,13 +227,16 @@ def transition(
                     f"no transition {frm.value} -> {to.value}; it can only resume "
                     f"{job.blocked_from.value if job.blocked_from else '?'}, re-plan or abandon"
                 )
-            deps_merged = (
-                actor is Actor.VIGILD
-                and evidence.get("action") == "deps_merged"
-                and job.blocked_on is not None
-                and to == job.blocked_from
-            )
-            if not owner_inbox and not deps_merged:
+            vigild_may = actor is Actor.VIGILD and action in VIGILD_HOLD_ACTIONS
+            if action == "deps_merged":
+                vigild_may = vigild_may and job.blocked_on is not None and to == job.blocked_from
+            elif action == "probe_closed":
+                vigild_may = vigild_may and to == job.blocked_from
+            elif action == "prs_merged":
+                errors = _merged_by_hand(ctx)
+                if errors:
+                    raise TransitionError("; ".join(errors))
+            if not owner_inbox and not vigild_may:
                 raise TransitionError("only the owner, from the inbox, moves a held job")
             if to == job.blocked_from and job.blocked_on:
                 # round 3: back to work only once the deps job it waits for has merged

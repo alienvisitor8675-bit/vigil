@@ -148,3 +148,26 @@ def test_a_score_no_label_gives_is_asked_of_the_decider(
     assert issue["decider"]["value"]["backend"] == "jev-openrouter"
     (row,) = store.q("SELECT question, backend, action FROM decisions")
     assert (row["question"], row["backend"], row["action"]) == ("value", "jev-openrouter", "act")
+
+
+def test_a_failure_after_the_claim_pages_and_never_loses_the_issue(
+    intake: tuple[LabelIntake, FakeIssues], store: Store, runner: RecordingRunner
+) -> None:
+    """Review B11: the issue was claimed before scoring and submit, so any
+    other exception lost it, with no event and no page."""
+    li, issues = intake
+    issues.issues = [{**ISSUE, "labels": [{"name": LABEL}]}]  # value and risk: asked
+
+    class Broken:
+        def decide(self, *a: Any, **kw: Any) -> Any:
+            raise RuntimeError("the decider fell over")
+
+    li.decider = Broken()
+    assert li.poll() == [] and li.poll() == []
+    pages = [i for i in store.list_inbox() if i.body.get("kind") == "intake_failed"]
+    assert len(pages) == 1 and pages[0].body["issue"] == 7  # paged once, not every poll
+    assert "RuntimeError" in pages[0].body["error"]
+    assert any(e.type == "intake_failed" for e in store.events())
+    li.decider = None  # fixed: the next poll makes the job
+    (job_id,) = li.poll()
+    assert runner.created == [job_id]

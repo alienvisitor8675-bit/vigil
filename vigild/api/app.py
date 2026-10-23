@@ -244,12 +244,13 @@ def rebuild(request: Request, item_id: int) -> dict[str, Any]:
 def reset(request: Request, item_id: int) -> dict[str, Any]:
     """Reset a tripped circuit breaker; the jobs it paused resume."""
     try:
-        resumed = _svc(request).jobs.reset(item_id)
+        out = _svc(request).jobs.reset(item_id)
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
         raise HTTPException(409, str(e)) from e
-    return {"item_id": item_id, "status": "reset", "resumed": resumed}
+    # `queued`: the job's last run is still finishing; it picks up after (B4)
+    return {"item_id": item_id, "status": "reset", **out}
 
 
 @router.post("/api/inbox/{item_id}/dismiss", dependencies=[ADMIN])

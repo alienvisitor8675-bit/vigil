@@ -35,6 +35,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import math
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -120,6 +121,8 @@ class Publisher(Protocol):
         existing: str | None = None,
     ) -> str: ...
 
+    def close(self, repo: str, url: str) -> None: ...
+
 
 class Pager(Protocol):
     def page(
@@ -182,6 +185,10 @@ class JobRunner:
         self.deferred: list[str] = []  # approved builds reconcile found, not yet started
         self._running: set[str] = set()
         self._running_lock = threading.Lock()
+        # a resume that arrives while the job's run is going: run it after (B4)
+        self._queued: dict[str, Callable[[str], None]] = {}
+        # the WIP room check and the move to running, for every job at once (B10)
+        self._wip_lock = threading.Lock()
         self.closers: list[Callable[[], None]] = []  # e.g. the docker client (item 0)
         self.ladder = Ladder(store, cfg)
         self.deps = deps  # the deps executor (item 5); None: deps jobs fail
@@ -189,6 +196,7 @@ class JobRunner:
         # one set of breakers, shared with the gateway (item 4)
         self.breakers = breakers or Breakers(store, cfg)
         self.breakers.pager = self._breaker_page
+        self.breakers.on_close = self._probe_closed  # a probe closed a backend breaker
         self._sdk_seen: set[tuple[str, str]] = set()
         self.slots = Slots(cfg.vigild.scheduler.sessions)  # across every job (item 2)
 
@@ -203,31 +211,47 @@ class JobRunner:
         with self._running_lock:
             return sorted(self._running)
 
-    def _spawn(self, fn: Callable[[str], None], job_id: str) -> None:
-        # round 3, F7: one run per job at a time, whatever starts it
+    def _spawn(self, fn: Callable[[str], None], job_id: str) -> str:
+        """One run per job at a time, whatever starts it (round 3, F7). A run
+        asked for while one is going is queued, not dropped (review B4): it
+        starts when the current one ends. Returns "started" or "queued"."""
         with self._running_lock:
             if job_id in self._running:
-                log.info("%s is already running; not starting it twice", job_id)
-                return
+                self._queued[job_id] = fn  # the latest ask wins; it reads the job's state then
+                log.info("%s is running; its next run is queued", job_id)
+                return "queued"
             self._running.add(job_id)
 
         def safe(j: str) -> None:
+            run: Callable[[str], None] | None = fn
             try:
-                fn(j)
-            except Exception as e:  # never die silently: page, and let the owner resume
-                log.exception("runner failed on %s", j)
-                self._block(j, f"vigild error: {type(e).__name__}")
-                self._page(
-                    j, f"vigild error on {j}", {"error": f"{type(e).__name__}: {e}"}, resumable=True
-                )
+                while run is not None:
+                    try:
+                        run(j)
+                    except Exception as e:  # never die silently: page; the owner chooses
+                        log.exception("runner failed on %s", j)
+                        self._block(j, f"vigild error: {type(e).__name__}")
+                        self._page(
+                            j, f"vigild error on {j}",
+                            {"kind": "vigild_error", "error": f"{type(e).__name__}: {e}",
+                             "actions": ["retry", "abandon"]},
+                            resumable=True,
+                        )  # fmt: skip
+                    with self._running_lock:
+                        run = self._queued.pop(j, None)
+                        if run is None:
+                            self._running.discard(j)  # in the same lock: no ask is lost
             finally:
-                with self._running_lock:
-                    self._running.discard(j)
+                if run is not None:  # vigild itself is going down mid-run
+                    with self._running_lock:
+                        self._queued.pop(j, None)
+                        self._running.discard(j)
 
         if self.background:
             threading.Thread(target=safe, args=(job_id,), daemon=True).start()
         else:
             safe(job_id)
+        return "started"
 
     def on_job_created(self, job_id: str, needs_spec: bool) -> None:
         if needs_spec:
@@ -236,18 +260,18 @@ class JobRunner:
     def on_approved(self, job_id: str) -> None:
         self._spawn(self.build, job_id)
 
-    def on_resume(self, job_id: str) -> None:
+    def on_resume(self, job_id: str) -> str | None:
+        """Pick a job's work up where its state says. "started", "queued"
+        (its current run finishes first), or None (nothing to run)."""
         state = self.store.get_job(job_id).state
-        if state is JobState.SPEC_PENDING:
-            self._spawn(self.run_coord, job_id)
-        elif state is JobState.APPROVED:
-            self._spawn(self.build, job_id)
-        elif state is JobState.PLANNING:
-            self._spawn(self._plan_and_dispatch, job_id)
-        elif state is JobState.BUILDING:
-            self._spawn(self.dispatch, job_id)
-        elif state is JobState.IN_REVIEW:
-            self._spawn(self.review, job_id)
+        fn: Callable[[str], None] | None = {
+            JobState.SPEC_PENDING: self.run_coord,
+            JobState.APPROVED: self.build,
+            JobState.PLANNING: self._plan_and_dispatch,
+            JobState.BUILDING: self.dispatch,
+            JobState.IN_REVIEW: self.review,
+        }.get(state)
+        return self._spawn(fn, job_id) if fn is not None else None
 
     # --- startup reconcile (item 7) ------------------------------------------------------
 
@@ -304,6 +328,11 @@ class JobRunner:
                     resumable=True,
                 )
                 out["held"] += 1
+            elif job.state is JobState.IN_REVIEW:
+                # review B3: reviews a restart cut off run again; a review
+                # session is read-only, so nothing of it needs keeping
+                self.deferred.append(job.id)
+                out["requeued"] += 1
             elif job.state is JobState.SPEC_PENDING and job.id in failed_coord:
                 self._page(
                     job.id,
@@ -394,8 +423,8 @@ class JobRunner:
         itself, building it when the lockfiles changed."""
         started, self.deferred = self.deferred, []
         for job_id in started:
-            if self.store.get_job(job_id).state is JobState.BUILDING:
-                self.on_resume(job_id)  # workers a restart cut off (item 3)
+            if self.store.get_job(job_id).state in (JobState.BUILDING, JobState.IN_REVIEW):
+                self.on_resume(job_id)  # workers or reviews a restart cut off (item 3, B3)
             else:
                 self.on_approved(job_id)
         return len(started)
@@ -447,43 +476,98 @@ class JobRunner:
         self._block(job_id, f"breaker {b.kind.value} ({b.scope})")
         self.breakers.hold(b, job_id)
 
-    def on_breaker_reset(self, breaker_id: int, item_id: int) -> list[str]:
+    def on_breaker_reset(self, breaker_id: int, item_id: int) -> dict[str, list[str]]:
         """The owner reset a breaker from the inbox: every job it held goes
-        back to where it was and picks up its work."""
-        resumed = []
-        for job_id in self.breakers.reset(breaker_id):
+        back to where it was and picks up its work. A job whose last run is
+        still finishing is `queued`, not `resumed` (review B4)."""
+        return self._resume_held(
+            self.breakers.reset(breaker_id), Actor.OWNER,
+            {"inbox_item_id": item_id, "action": "resume", "breaker": breaker_id},
+        )  # fmt: skip
+
+    def _probe_closed(self, held: list[str], item_id: int) -> None:
+        """A backend breaker's probe succeeded (B6): its page is done, and the
+        jobs it held resume."""
+        if item_id:
+            self.store.resolve_inbox_item(item_id, "vigild")
+        self._resume_held(held, Actor.VIGILD, {"action": "probe_closed"})
+
+    def _resume_held(
+        self, job_ids: list[str], actor: Actor, evidence: dict[str, Any]
+    ) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {"resumed": [], "queued": []}
+        for job_id in job_ids:
             try:
                 job = self.store.get_job(job_id)
                 if job.state is not JobState.BLOCKED or job.blocked_from is None:
                     continue
                 transition(
-                    self.store, job_id, job.blocked_from, Actor.OWNER, channel="inbox",
-                    evidence={"inbox_item_id": item_id, "action": "resume", "breaker": breaker_id},
+                    self.store, job_id, job.blocked_from, actor,
+                    channel="inbox" if actor is Actor.OWNER else None, evidence=evidence,
                 )  # fmt: skip
             except TransitionError, KeyError:
-                log.warning("breaker %s: could not resume %s", breaker_id, job_id)
+                log.warning("could not resume %s (%s)", job_id, evidence)
                 continue
-            resumed.append(job_id)
-            self.on_resume(job_id)
-        return resumed
+            status = self.on_resume(job_id)
+            out["queued" if status == "queued" else "resumed"].append(job_id)
+        return out
 
-    def _budget_breaker(self, job_id: str, e: BudgetExceeded, task_id: str | None) -> Breaker:
-        """A reservation refused at a cap trips that cap's breaker (B14's hard
-        stops, one page however many jobs hit it)."""
+    def _refused_budget(
+        self, job_id: str, e: BudgetExceeded, task_id: str | None
+    ) -> Breaker | None:
+        """A reservation refused at a cap (review B1). A task's own cap
+        exhausted trips its per-task breaker; the global daily or monthly
+        breaker trips only when the day's (month's) metered spend has
+        actually reached the cap. Anything else (open reservations fill the
+        day, a wave too big for what's left) is the job's own problem: None,
+        and the caller pages the job."""
         kind = CAP_KIND.get(e.cap, Kind.DAILY)
-        if kind is Kind.PER_TASK and task_id:
+        if kind is Kind.PER_TASK and task_id and self.budget.task_spent(task_id) > 0:
             return self.breakers.trip(
                 kind, f"task:{task_id}", {"detail": e.detail}, job_id=job_id,
                 actions=("reset", "replan", "abandon"),
             )  # fmt: skip
-        return self.breakers.trip(kind, GLOBAL, {"detail": e.detail})
+        return self._spend_check()
+
+    def _spend_check(self) -> Breaker | None:
+        """Trip the global daily (monthly) breaker once the day's (month's)
+        metered spend reaches its cap (B14's hard stops; review B1)."""
+        b = self.cfg.budgets
+        for kind, spent, cap in (
+            (Kind.DAILY, self.budget.spent_today(), b.daily_usd),
+            (Kind.MONTHLY, self.budget.spent_month(), b.monthly_usd),
+        ):
+            if spent >= cap - 1e-9:
+                return self.breakers.trip(
+                    kind, GLOBAL, {"spent_usd": round(spent, 4), "cap_usd": cap}
+                )
+        return None
+
+    def _budget_page(self, job_id: str, e: BudgetExceeded, tasks: list[str]) -> None:
+        """A job whose reservation didn't fit gets its own page (review B1):
+        retry (each task on what's left of its cap), re-plan or abandon."""
+        b = self.cfg.budgets
+        self._block(job_id, f"budget: {e}")
+        self._page(
+            job_id, f"{job_id}: the budget can't fit this work now",
+            {"kind": "budget", "cap": e.cap, "detail": e.detail, "tasks": tasks,
+             "day": {"spent_usd": round(self.budget.spent_today(), 4),
+                     "held_usd": round(self.budget.open_today(), 4), "cap_usd": b.daily_usd},
+             "actions": ["retry", "replan", "abandon"],
+             "next": "retry once reservations settle or tomorrow (UTC), re-plan with smaller "
+             "max_cost_usd, or abandon"},
+            resumable=True,
+        )  # fmt: skip
 
     def _healthy(self, preset: str) -> str | None:
         """The preset itself, or while its backend breaker is open the first
         healthy fallback (routing.yaml `fallbacks`); None pauses dispatch."""
         for p in [preset, *self.cfg.routing.fallbacks.get(preset, [])]:
-            if not self.breakers.is_open(Kind.BACKEND, f"backend:{p}"):
+            scope = f"backend:{p}"
+            if not self.breakers.is_open(Kind.BACKEND, scope):
                 return p
+            if self.breakers.probe_ready(Kind.BACKEND, scope):
+                return p  # cooled down: its first call is the probe (the gateway claims it)
         return None
 
     def child_job(self, parent_id: str, **kw: Any) -> Job | None:
@@ -664,6 +748,7 @@ class JobRunner:
                 self.gateway.revoke(s.id)
                 self.budget.settle(reservation)
                 self.store.update_session(s.id, ended_at=iso())
+                self._spend_check()
 
     def _replan_context(self, job_id: str) -> dict[str, Any]:
         """The failures the owner sent back with the latest re-plan, if any."""
@@ -726,7 +811,11 @@ class JobRunner:
                 )
             except BudgetExceeded as e:
                 self.store.update_session(coord.id, status="refused")
-                self._hold_for(job_id, self._budget_breaker(job_id, e, None))
+                b = self._refused_budget(job_id, e, None)
+                if b is not None:
+                    self._hold_for(job_id, b)
+                else:
+                    self._budget_page(job_id, e, [])
                 return
             try:
                 draft = self._coord_attempt(
@@ -944,10 +1033,13 @@ class JobRunner:
                     raise RoutingError(f"the dev image lacks {lacking}")
                 r = route(task, self.cfg)
             except RoutingError as e:
-                self._page(
-                    job_id, f"{job_id}: {w.task_id} can't run", {"error": str(e)}, resumable=True
-                )
                 self._block(job_id, f"routing: {e}")
+                self._page(
+                    job_id, f"{job_id}: {w.task_id} can't run",
+                    {"kind": "cant_run", "error": str(e),
+                     "actions": ["retry", "replan", "abandon"]},
+                    resumable=True,
+                )  # fmt: skip
                 return
             contract = task.model_copy(
                 update={"tier": r.tier, "tier_reason": r.tier_reason, "backend": r.preset}
@@ -985,34 +1077,40 @@ class JobRunner:
             if self._refused_by_visibility(job):
                 return None
             for tid in batch:
-                b = self._paused(job, tid, building=True)
+                # the WIP breaker holds only work that would open a new PR: a
+                # fix round pushes to its PR and drains the stack (review B5)
+                b = self._paused(job, tid, building=wip.opens_a_pr(self.store, tid))
                 routed = self.store.get_task(tid).backend_preset or self.cfg.routing.fallback
                 if b is None and self._healthy(routed) is None:
                     b = self._backend_breaker(routed)  # no healthy backend for it
                 if b is not None:
                     self._hold_for(job_id, b)
                     return None
-            free = wip.room(self.store, job.repo, limit)
-            admitted: list[str] = []
-            for tid in batch:
-                if wip.opens_a_pr(self.store, tid):
-                    if free <= 0:
-                        wip_held.add(tid)
-                        continue
-                    free -= 1
-                admitted.append(tid)
-            if not admitted:
-                return {}
-            try:
-                held = self._reserve_wave(job_id, admitted)
-            except Refused:
-                return None
-            for tid in admitted:
-                if self.store.get_task(tid).state == "failed":
-                    # another attempt; the third is routed by rule 5 (escalated)
-                    attempt = int(self.store.get_task(tid).contract.get("attempt") or 1)
-                    self._reroute(job_id, tid, attempt=attempt + 1)
-                self.store.update_task(tid, state="running")  # takes its place in the stack
+            # the room check, the reservations and the move to running are one
+            # step for every job's dispatch at once (review B10)
+            with self._wip_lock:
+                free = wip.room(self.store, job.repo, limit)
+                admitted: list[str] = []
+                for tid in batch:
+                    if wip.opens_a_pr(self.store, tid):
+                        if free <= 0:
+                            wip_held.add(tid)
+                            continue
+                        free -= 1
+                    admitted.append(tid)
+                if not admitted:
+                    return {}
+                retrying = [t for t in admitted if self.store.get_task(t).state == "failed"]
+                try:
+                    held = self._reserve_wave(job_id, admitted)
+                except Refused:
+                    return None
+                for tid in admitted:
+                    self.store.update_task(tid, state="running")  # its place in the stack
+            for tid in retrying:
+                # another attempt; the third is routed by rule 5 (escalated)
+                attempt = int(self.store.get_task(tid).contract.get("attempt") or 1)
+                self._reroute(job_id, tid, attempt=attempt + 1)
             return {
                 tid: functools.partial(self._run_worker, job_id, tid, *held[tid])
                 for tid in admitted
@@ -1184,20 +1282,40 @@ class JobRunner:
             resumable=can_retry,
         )
 
+    def _wave_share(self, task_ids: list[str]) -> float:
+        """What the day (and the month) has left, divided across a wave's
+        workers (review B1), floored to a hundredth of a cent so the shares
+        never sum past it."""
+        b = self.cfg.budgets
+        n = sum(1 for t in task_ids if self.store.get_task(t).contract.get("shape") != "deps")
+        left = min(
+            b.daily_usd - self.budget.spent_today() - self.budget.open_today(),
+            b.monthly_usd - self.budget.spent_month() - self.budget.open_month(),
+        )
+        return math.floor(max(0.0, left) / max(1, n) * 1e4) / 1e4
+
     def _reserve_wave(self, job_id: str, task_ids: list[str]) -> dict[str, tuple[int, float]]:
         """Reserve every worker of a wave before any starts, each for what's
-        left of its own cap; on a refusal, release them, block the job and
-        page: dispatch halts."""
+        left of its own cap or its share of what the day has left, whichever
+        is less (review B1: a plan of default caps fits the day instead of
+        tripping a cap). On a refusal, release them, block the job and page:
+        dispatch halts. A retry gets the same treatment, on what's left of
+        each task's cap."""
         held: dict[str, tuple[int, float]] = {}
+        share = self._wave_share(task_ids)
         for tid in task_ids:
             if self.store.get_task(tid).contract.get("shape") == "deps":
                 held[tid] = (0, 0.0)  # a deps job runs no model: nothing to reserve
                 continue
-            _, _, amount = self.remaining(tid)
+            _, spent, left = self.remaining(tid)
+            amount = min(left, share)
             try:
                 if amount < MIN_RETRY_USD:
                     raise BudgetExceeded(
-                        "per_task", f"task {tid} has ${amount:.2f} of its cap left"
+                        # its own cap used up, or too little of the day left for it
+                        "per_task" if left < MIN_RETRY_USD and spent > 0 else "daily",
+                        f"task {tid}: ${left:.2f} of its cap left, ${share:.2f} of the day "
+                        "for each worker of its wave",
                     )
                 held[tid] = (
                     self.budget.reserve(
@@ -1210,7 +1328,11 @@ class JobRunner:
                     self.budget.settle(rid, 0.0)
                 for t2 in task_ids:
                     self.store.update_task(t2, state="waiting")
-                self._hold_for(job_id, self._budget_breaker(job_id, e, tid))
+                b = self._refused_budget(job_id, e, tid)
+                if b is not None:
+                    self._hold_for(job_id, b)
+                else:
+                    self._budget_page(job_id, e, task_ids)
                 raise Refused(str(e)) from e
         return held
 
@@ -1719,14 +1841,10 @@ class JobRunner:
             )  # fmt: skip
         names = ", ".join(f"{r.package}=={r.version}" for r in reqs)
         head = self.workspace.commit_files(clone, task_id, res.files, f"deps: {names}")
-        try:
-            # the full suite, offline, on the base plus the new lockfiles
-            new_image = self.dev_images.ensure_fresh(job.repo, head, source="vault")
-        except StaleDevImage as e:
-            return self._fail(
-                job_id, s, task_id, f"{task_id}: the new lockfiles fail the suites",
-                {"error": str(e)},
-            )  # fmt: skip
+        # No dev image is built from these lockfiles before the owner merges
+        # them (review A5): building one runs the package manager with the
+        # build network. The parent's next session builds it from the merged
+        # base and validates it offline; a failure pages (rebuild or dismiss).
         report = WorkerReport.model_validate({
             "task_id": task_id, "job_id": job_id, "files_changed": sorted(res.files),
             "summary": f"Adds {names}. New in the lockfiles: {', '.join(res.added) or 'none'}.",
@@ -1740,10 +1858,12 @@ class JobRunner:
         )  # fmt: skip
         body = (
             f"Deps job `{job_id}` (no model; B39). Adds {names} for `{job.parent_job_id}`.\n\n"
-            f"New in the lockfiles, each at least 14 days old by its registry: "
-            f"{', '.join(res.added) or 'none'}.\n\nThe dev image `{new_image}` was rebuilt from "
-            "these lockfiles and every suite passed offline. Shape `deps`, rung 1: **the owner "
-            "reviews every deps PR.** Opened by vigild; a human merges."
+            f"New in the lockfiles, each at least 14 days old by the newest upload time of "
+            f"the files the lock pins: {', '.join(res.added) or 'none'}. No source builds: "
+            "every package is a prebuilt wheel or tarball.\n\nThe dev image is rebuilt from "
+            "these lockfiles only after you merge, and its suites run offline then. Shape "
+            "`deps`, rung 1: **the owner reviews every deps PR.** Opened by vigild; a human "
+            "merges."
         )
         try:
             url = self.publisher.publish(
@@ -1757,7 +1877,7 @@ class JobRunner:
         )
         self.store.update_task(task_id, state="pr_open")
         self.store.add_event(
-            "pr_open", {"pr_url": url, "branch": branch, "head": head, "image": new_image},
+            "pr_open", {"pr_url": url, "branch": branch, "head": head},
             Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
         )  # fmt: skip
         return True
@@ -1791,13 +1911,26 @@ class JobRunner:
                         f"pr_{st}", {"pr_url": url}, Provenance.HUMAN, job_id=job.id, task_id=t.id
                     )
             live = [t for t in self.store.list_tasks(job.id) if t.state not in DEAD_TASK]
-            if job.state is JobState.READY and live and all(t.state == "merged" for t in live):
-                transition(
-                    self.store, job.id, JobState.MERGED, Actor.VIGILD,
-                    evidence={"merge_commits": [self._task_head(t.id) for t in live]},
-                )  # fmt: skip
-                merged_jobs.append(job.id)
-                self._resume_dependents(job.id)
+            if not live or any(t.state != "merged" for t in live):
+                continue
+            # merged however it happened (review B7): through vigild's review
+            # (ready), by the owner while the review ran (in_review), or by
+            # hand while a page held the job (blocked)
+            evidence: dict[str, Any] = {"merge_commits": [self._task_head(t.id) for t in live]}
+            if job.state in (JobState.BLOCKED, JobState.ESCALATED):
+                evidence["action"] = "prs_merged"
+            elif job.state not in (JobState.READY, JobState.IN_REVIEW):
+                continue
+            try:
+                transition(self.store, job.id, JobState.MERGED, Actor.VIGILD, evidence=evidence)
+            except TransitionError as e:
+                log.warning("pr poll: %s not moved to merged: %s", job.id, e)
+                continue
+            for item in self.store.list_inbox():
+                if item.job_id == job.id:
+                    self.store.resolve_inbox_item(item.id, "vigild")  # nothing left to act on
+            merged_jobs.append(job.id)
+            self._resume_dependents(job.id)
         return merged_jobs
 
     def _resume_dependents(self, dep_id: str) -> None:
@@ -1885,16 +2018,18 @@ class JobRunner:
             return
         flagged = {tid: f for tid, (kind, f) in outcomes.items() if kind == "deps_findings"}
         if flagged:
-            self._block(job_id, f"deps review findings: {sorted(flagged)}")
-            self._page(
-                job_id,
-                f"{job_id}: the review flagged the deps PR; it has no worker to fix it",
-                {"kind": "deps_review", "findings": flagged, "actions": ["abandon"],
-                 "next": "abandon it (the job waiting on it stays blocked) and add the "
-                 "dependency by hand, or re-plan the job that needs it"},
-            )  # fmt: skip
+            self._deps_review_failed(job_id, flagged)
             return
         fixes = sorted(tid for tid, (kind, _) in outcomes.items() if kind == "fix")
+        # a task a previous pass sent to a fix round, while another's review
+        # failed, is still owed its round: it goes with this one (review B2)
+        pending = [
+            t.id for t in self.store.list_tasks(job_id) if t.state == "fix" and t.id not in fixes
+        ]
+        for tid in pending:
+            fix = self._fix_round(self.store.get_task(tid))
+            outcomes[tid] = ("fix", len(fix["findings"]) if fix else 0)
+        fixes = sorted({*fixes, *pending})
         if fixes:
             limit = self.cfg.routing.escalate_review_rounds
             over = [
@@ -1926,6 +2061,50 @@ class JobRunner:
         transition(self.store, job_id, JobState.READY, Actor.VIGILD)
         self.breakers.success(Kind.REPO_FAILURES, f"repo:{job.repo}")
         self._ready(job_id)
+
+    def _deps_review_failed(self, job_id: str, flagged: dict[str, Any]) -> None:
+        """Owner ruling 3: a deps PR has no worker to fix it. A failed review
+        closes the PR and regenerates the deps job once, on a new branch; a
+        second failed review closes that PR too and pages the owner. The
+        parent job stays blocked on this one throughout."""
+        job = self.store.get_job(job_id)
+        again: list[str] = []
+        for tid in sorted(flagged):
+            t = self.store.get_task(tid)
+            url = self._task_pr(tid)
+            if url:
+                try:
+                    self.publisher.close(job.repo, url)
+                except PublishError as e:
+                    log.warning("could not close %s: %s", url, e)
+                self.store.add_event(
+                    "pr_closed", {"pr_url": url, "why": "deps review failed"},
+                    Provenance.HUMAN, job_id=job_id, task_id=tid,
+                )  # fmt: skip
+            closed = self.store.q(
+                "SELECT COUNT(*) n FROM events WHERE task_id=? AND type='pr_closed'", (tid,)
+            )[0]["n"]
+            if closed >= 2:  # this was the regenerated PR: the owner decides
+                self.store.update_task(tid, state="closed")
+                continue
+            contract = {**t.contract, "branch": f"vigil/{tid}-r{closed + 1}"}
+            self.store.update_task(tid, contract=contract, state="queued")
+            again.append(tid)
+        if again and len(again) == len(flagged):
+            transition(
+                self.store, job_id, JobState.BUILDING, Actor.VIGILD,
+                evidence={"findings": flagged, "deps_regenerated": again},
+            )  # fmt: skip
+            self.dispatch(job_id)
+            return
+        self._block(job_id, f"deps review findings, twice: {sorted(flagged)}")
+        self._page(
+            job_id,
+            f"{job_id}: the review flagged the deps PR twice; both PRs are closed",
+            {"kind": "deps_review", "findings": flagged, "actions": ["abandon"],
+             "next": "abandon it (the job waiting on it stays blocked) and add the "
+             "dependency by hand, or re-plan the job that needs it"},
+        )  # fmt: skip
 
     def _ready(self, job_id: str) -> None:
         """Stage 8's queue: the job's PRs, each with its review and audit."""
@@ -2142,7 +2321,7 @@ class JobRunner:
         except (RepoPolicyError, BudgetExceeded) as e:
             self.store.update_session(s.id, status="refused")
             if isinstance(e, BudgetExceeded):
-                self._budget_breaker(job.id, e, None)
+                self._refused_budget(job.id, e, None)  # a cap metered spend reached trips
             return None, str(e)
         clone_id = f"{t.id}-{role.value}{rnd}"
         try:
@@ -2240,6 +2419,17 @@ class GitHubPublisher:
                 existing=existing,
             )
 
+    def close(self, repo: str, url: str) -> None:
+        """Close one of vigild's PRs, with a one-repo `pull_requests: write`
+        token, revoked after (a deps PR whose review failed, owner ruling 3)."""
+        from vigild.github.publish import RestPulls
+
+        prefix = f"https://github.com/{repo}/pull/"
+        if not url.startswith(prefix) or not url[len(prefix) :].isdigit():
+            raise PublishError(f"{url} isn't a PR of {repo}")
+        with self.app.lease(repo, {"pull_requests": "write"}) as tok:
+            RestPulls(self.http, tok.token).close(repo, int(url[len(prefix) :]))
+
 
 class GitHubPRs:
     """vigild's PR poll (item 5): a PR's state, read with a one-repo,
@@ -2272,4 +2462,7 @@ class NoPublisher:
         scope: list[str],
         existing: str | None = None,
     ) -> str:
+        raise PublishError("the GitHub App is not configured (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)")
+
+    def close(self, repo: str, url: str) -> None:
         raise PublishError("the GitHub App is not configured (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)")

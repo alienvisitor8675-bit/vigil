@@ -61,18 +61,18 @@ def test_the_daily_and_monthly_caps(world: World, cap: str) -> None:
         w.runner.cfg.budgets.daily_usd = 50.0
         w.runner.cfg.budgets.monthly_usd = 4.0
     a, b = _request(w), _request(w)  # both drafted before the day fills up
-    held = [
-        w.budget.reserve(session_id=None, task_id=f"other-{i}", amount=a, purpose="worker")
-        for i, a in enumerate((2.0, 1.5))
-    ]
+    # metered spend reaches the cap (2a round 2, review B1: not a reservation)
+    spent = w.store.x(
+        "INSERT INTO ledger (task_id, amount_usd, day, month, ts) VALUES (?,?,?,?,?)",
+        ("other", 5.0 if cap == "daily" else 4.0, w.budget._day(), w.budget._month(), "x"),
+    )
     _approve(w, a)
     _approve(w, b)
     assert _workers(w) == 0  # dispatch paused, everywhere
     assert {w.store.get_job(a).state.value, w.store.get_job(b).state.value} == {"blocked"}
     (page,) = _pages(w)  # one page for both jobs
     assert page["body"]["breaker_kind"] == f"{cap}_cap" and page["body"]["scope"] == "global"
-    for rid in held:
-        w.budget.settle(rid, 0.0)
+    w.store.x("DELETE FROM ledger WHERE id=?", (spent,))  # say the owner raised the cap
     assert sorted(_reset(w, page)) == sorted([a, b])
     assert w.store.get_job(a).state.value == "ready"
 
@@ -188,14 +188,16 @@ def test_backend_errors(cfg: Config, store: Store) -> None:
     # after the cool-down, one half-open probe; its success closes the breaker
     now[0] += timedelta(seconds=cfg.vigild.breakers.backend_cooldown_seconds + 1)
     upstream.status = 200
-    assert not gw.breakers.is_open(Kind.BACKEND, scope)  # the probe goes through
+    # a read moves nothing (2a review B6, A11): still open, and ready for its probe
+    assert gw.breakers.is_open(Kind.BACKEND, scope)
+    assert gw.breakers.probe_ready(Kind.BACKEND, scope)
     with TestClient(create_gateway_app(gw)) as c:
         ok = c.post("/v1/messages", json=_msg(), headers={"authorization": f"Bearer {tok}"})
     assert ok.status_code == 200
     assert gw.breakers._row(Kind.BACKEND, scope).state == "closed"  # type: ignore[union-attr]
     # and the owner resets one from the inbox
     opus = gw.breakers._row(Kind.BACKEND, "backend:claude-opus")
-    assert opus is not None and gw.breakers.reset(opus.id) == []
+    assert opus is not None and gw.breakers.reset(opus.id) == []  # it held no job
     assert not gw.breakers.is_open(Kind.BACKEND, "backend:claude-opus")
     assert sid
 

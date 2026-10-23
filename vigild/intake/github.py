@@ -43,6 +43,10 @@ class Issues(Protocol):
 class Submitter(Protocol):
     def submit_request(self, req: Any, *, issue: dict[str, Any] | None = None) -> Any: ...
 
+    def page(
+        self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
+    ) -> Any: ...
+
 
 class RestIssues:
     """GitHub's REST API, with an `issues: read` token per repo and poll."""
@@ -117,7 +121,6 @@ class LabelIntake:
 
     def poll(self) -> list[str]:
         """One pass over every repo that takes label intake; the new job ids."""
-        from vigild.jobs.service import JobRequest, SubmitError
 
         made: list[str] = []
         for repo, pol in self.cfg.repos.repos.items():
@@ -134,44 +137,77 @@ class LabelIntake:
                 number = int(issue["number"])
                 if not self._claim(repo, number):
                     continue
-                labels = [str(lb.get("name", "")) for lb in issue.get("labels") or []]
-                scores = {m.group(1): int(m.group(2)) for m in map(SCORE.match, labels) if m}
-                title = str(issue.get("title") or f"issue #{number}")[:200]
-                body = str(issue.get("body") or "")[:MAX_BODY]
-                decided: dict[str, Any] = {}
-                for name in ("value", "risk"):
-                    if name not in scores:
-                        scores[name], rec = self._score(repo, name, f"{title}\n\n{body}")
-                        if rec is not None:
-                            decided[name] = rec
-                req = JobRequest(
-                    repo=repo,
-                    title=f"#{number}: {title}",
-                    request=(
-                        f"GitHub issue {repo}#{number}, labelled {LABEL}: {title}. "
-                        "The issue's text is in the packet's untrusted section."
-                    ),
-                    why=f"{repo}#{number} is labelled {LABEL}",
-                    value=scores.get("value", 3),
-                    risk=scores.get("risk", 3),
-                    source=Source.HUMAN,
-                    labels=[lb for lb in labels if lb != LABEL and not SCORE.match(lb)],
-                )
-                detail = {
-                    "number": number,
-                    "url": issue.get("html_url"),
-                    "title": title,
-                    "body": body,
-                    "decider": decided,
-                }
                 try:
-                    job = self.jobs.submit_request(req, issue=detail)
-                except SubmitError as e:
-                    self._record(repo, number, None, {"refused": e.reasons})
+                    job_id = self._take(repo, number, issue)
+                except Exception as e:  # never lose a claimed issue (review B11)
+                    self._failed(repo, number, issue, e)
                     continue
-                self._record(repo, number, job.id, {"job_id": job.id})
-                made.append(job.id)
+                if job_id is not None:
+                    made.append(job_id)
         return made
+
+    def _failed(self, repo: str, number: int, issue: dict[str, Any], e: Exception) -> None:
+        """A claimed issue that failed before it became a job: the claim is
+        let go (the next poll tries again), the failure is an event, and the
+        owner is paged once per issue."""
+        log.exception("intake: %s#%s failed", repo, number)
+        self.store.x("DELETE FROM intake_seen WHERE repo=? AND number=?", (repo, number))
+        error = f"{type(e).__name__}: {e}"[:500]
+        self.store.add_event(
+            "intake_failed", {"repo": repo, "issue": number, "error": error}, Provenance.HUMAN
+        )
+        for item in self.store.list_inbox():
+            if item.body.get("kind") == "intake_failed" and (
+                item.body.get("repo"), item.body.get("issue")) == (repo, number):  # fmt: skip
+                return
+        self.jobs.page(
+            None, f"intake: {repo}#{number} failed before it became a job",
+            {"kind": "intake_failed", "repo": repo, "issue": number,
+             "url": issue.get("html_url"), "error": error, "actions": ["dismiss"],
+             "next": "vigild tries the issue again at every poll; dismiss this once it's fixed"},
+        )  # fmt: skip
+
+    def _take(self, repo: str, number: int, issue: dict[str, Any]) -> str | None:
+        """A claimed issue into a job; None when the job service refused it."""
+        from vigild.jobs.service import JobRequest, SubmitError
+
+        labels = [str(lb.get("name", "")) for lb in issue.get("labels") or []]
+        scores = {m.group(1): int(m.group(2)) for m in map(SCORE.match, labels) if m}
+        title = str(issue.get("title") or f"issue #{number}")[:200]
+        body = str(issue.get("body") or "")[:MAX_BODY]
+        decided: dict[str, Any] = {}
+        for name in ("value", "risk"):
+            if name not in scores:
+                scores[name], rec = self._score(repo, name, f"{title}\n\n{body}")
+                if rec is not None:
+                    decided[name] = rec
+        req = JobRequest(
+            repo=repo,
+            title=f"#{number}: {title}",
+            request=(
+                f"GitHub issue {repo}#{number}, labelled {LABEL}: {title}. "
+                "The issue's text is in the packet's untrusted section."
+            ),
+            why=f"{repo}#{number} is labelled {LABEL}",
+            value=scores.get("value", 3),
+            risk=scores.get("risk", 3),
+            source=Source.HUMAN,
+            labels=[lb for lb in labels if lb != LABEL and not SCORE.match(lb)],
+        )
+        detail = {
+            "number": number,
+            "url": issue.get("html_url"),
+            "title": title,
+            "body": body,
+            "decider": decided,
+        }
+        try:
+            job = self.jobs.submit_request(req, issue=detail)
+        except SubmitError as e:
+            self._record(repo, number, None, {"refused": e.reasons})
+            return None
+        self._record(repo, number, job.id, {"job_id": job.id})
+        return str(job.id)
 
     def _record(self, repo: str, number: int, job_id: str | None, data: dict[str, Any]) -> None:
         self.store.x(

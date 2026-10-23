@@ -132,12 +132,20 @@ def update_command(deps: list[DepRequest], exclude_newer: str | None = None) -> 
     parts: list[str] = []
     py = [f"{d.package}=={d.version}" for d in deps if d.ecosystem == "pypi"]
     js = [f"{d.package}@{d.version}" for d in deps if d.ecosystem == "npm"]
+    # No source builds (coord decision 11): uv resolves from wheels only, so no
+    # build backend runs; pnpm runs no install scripts. Cargo has no
+    # equivalent (a build.rs always runs), so a Rust repo has no deps jobs yet.
     if py:
         cutoff = f"--exclude-newer {shlex.quote(exclude_newer)} " if exclude_newer else ""
-        parts.append(f"uv add --no-sync {cutoff}" + " ".join(shlex.quote(x) for x in py))
+        parts.append(f"uv add --no-sync --no-build {cutoff}" + " ".join(shlex.quote(x) for x in py))
     if js:
-        parts.append("pnpm add -w --lockfile-only " + " ".join(shlex.quote(x) for x in js))
+        parts.append(
+            "pnpm add -w --lockfile-only --ignore-scripts " + " ".join(shlex.quote(x) for x in js)
+        )
     return " && ".join(parts)
+
+
+NO_BUILD = re.compile(r"no-build|no wheel|source distribution", re.IGNORECASE)
 
 
 def lock_packages(path: str, text: str | None) -> set[tuple[str, str]]:
@@ -168,6 +176,45 @@ def lock_packages(path: str, text: str | None) -> set[tuple[str, str]]:
             pkg2, sep, ver = k.rpartition("@")
             if sep and pkg2 and ver:
                 out.add((pkg2, ver))
+    return out
+
+
+def lock_hashes(path: str, text: str | None) -> dict[tuple[str, str], frozenset[str]]:
+    """The exact files a lockfile pins for each registry package, by hash
+    (review A4): a uv lock's sdist and wheel hashes (sha256 hex), a pnpm
+    lock's tarball integrity."""
+    name = path.rsplit("/", 1)[-1]
+    out: dict[tuple[str, str], frozenset[str]] = {}
+    if not text:
+        return out
+    if name == UV_LOCK:
+        try:
+            doc = tomllib.loads(text)
+        except tomllib.TOMLDecodeError:
+            return out
+        for pkg in doc.get("package") or []:
+            if "registry" not in (pkg.get("source") or {}):
+                continue
+            files = [pkg.get("sdist") or {}, *(pkg.get("wheels") or [])]
+            hashes = {
+                str(f["hash"]).split(":", 1)[-1]
+                for f in files
+                if isinstance(f, dict) and f.get("hash")
+            }
+            out[(str(pkg.get("name")).lower(), str(pkg.get("version")))] = frozenset(hashes)
+    elif name == PNPM_LOCK:
+        import yaml
+
+        try:
+            doc2 = yaml.safe_load(text) or {}
+        except yaml.YAMLError:
+            return out
+        for key, val in ((doc2.get("packages") if isinstance(doc2, dict) else None) or {}).items():
+            k = str(key).lstrip("/").split("(", 1)[0]
+            pkg2, sep, ver = k.rpartition("@")
+            integrity = ((val or {}).get("resolution") or {}).get("integrity")
+            if sep and pkg2 and ver and integrity:
+                out[(pkg2, ver)] = frozenset({str(integrity)})
     return out
 
 
@@ -218,39 +265,69 @@ def manifest_errors(path: str, before: str | None, after: str | None) -> list[st
 
 
 class Registry(Protocol):
-    def published(self, ecosystem: str, name: str, version: str) -> datetime | None: ...
+    def published(
+        self, ecosystem: str, name: str, version: str, hashes: frozenset[str] = frozenset()
+    ) -> datetime | None: ...
+
+
+def _when(t: str) -> datetime:
+    return datetime.fromisoformat(t.replace("Z", "+00:00"))
 
 
 class HttpRegistry:
-    """Publish times from the registries themselves (PyPI's JSON API, the npm
-    registry's packument), read by vigild on the host."""
+    """Upload times from the registries themselves (PyPI's JSON API, the npm
+    registry's packument), read by vigild on the host.
+
+    A release's age is the **newest** upload among the exact files the lock
+    pins (review A4): a wheel added yesterday to an old release is a new
+    file. A pinned file the registry doesn't list has no age (None)."""
 
     def __init__(self, http: Any) -> None:
         self.http = http
 
-    def published(self, ecosystem: str, name: str, version: str) -> datetime | None:
+    def published(
+        self, ecosystem: str, name: str, version: str, hashes: frozenset[str] = frozenset()
+    ) -> datetime | None:
         if ecosystem == "pypi":
             r = self.http.get(f"https://pypi.org/pypi/{name}/{version}/json", timeout=20.0)
             if r.status_code != 200:
                 return None
-            times = [u.get("upload_time_iso_8601") for u in r.json().get("urls") or []]
-            stamps = [datetime.fromisoformat(t.replace("Z", "+00:00")) for t in times if t]
-            return min(stamps) if stamps else None
+            files = r.json().get("urls") or []
+            if hashes:
+                files = [f for f in files if (f.get("digests") or {}).get("sha256") in hashes]
+                if {(f.get("digests") or {}).get("sha256") for f in files} != set(hashes):
+                    return None  # a pinned file the registry doesn't list
+            stamps = [_when(f["upload_time_iso_8601"]) for f in files
+                      if f.get("upload_time_iso_8601")]  # fmt: skip
+            return max(stamps) if stamps else None
         r = self.http.get(f"https://registry.npmjs.org/{name}", timeout=20.0)
         if r.status_code != 200:
             return None
-        t = (r.json().get("time") or {}).get(version)
-        return datetime.fromisoformat(t.replace("Z", "+00:00")) if t else None
+        doc = r.json()
+        if hashes:
+            integrity = (((doc.get("versions") or {}).get(version) or {}).get("dist") or {}).get(
+                "integrity"
+            )
+            if integrity not in hashes:
+                return None  # the tarball the lock pins isn't the one published
+        t = (doc.get("time") or {}).get(version)
+        return _when(t) if t else None
 
 
-def too_new(added: set[tuple[str, str, str]], registry: Registry, now: datetime) -> list[str]:
+def too_new(
+    added: set[tuple[str, str, str]],
+    registry: Registry,
+    now: datetime,
+    pinned: dict[tuple[str, str, str], frozenset[str]] | None = None,
+) -> list[str]:
     """Every (ecosystem, name, version) the lockfile newly pulls in must be at
-    least 14 days old by its registry's publish time; the ones that aren't,
-    or whose time can't be read, as a list."""
+    least 14 days old by the newest upload of the files the lock pins for it;
+    the ones that aren't, or whose time can't be read, as a list."""
     out = []
     for eco, name, ver in sorted(added):
+        hashes = (pinned or {}).get((eco, name, ver), frozenset())
         try:
-            when = registry.published(eco, name, ver)
+            when = registry.published(eco, name, ver, hashes)
         except Exception as e:  # the registry is down: no proof of age
             out.append(f"{name}=={ver}: publish time unreadable ({type(e).__name__})")
             continue
@@ -321,6 +398,12 @@ class DepsExecutor:
             res = DepsResult(output=output[-4000:])
             if code != 0:
                 res.errors.append(f"the package manager failed (exit {code})")
+                if NO_BUILD.search(output):
+                    res.errors.append(
+                        "a dependency has no prebuilt wheel or tarball and needs a source "
+                        "build, which deps jobs refuse: the owner decides (add it by hand, "
+                        "or pick a version with a wheel)"
+                    )
                 return res
             others = sorted(
                 str(p.relative_to(work))
@@ -345,16 +428,19 @@ class DepsExecutor:
                 old = before.get(path, b"").decode(errors="replace")
                 res.errors += manifest_errors(path, old or None, data.decode(errors="replace"))
             added: set[tuple[str, str, str]] = set()
+            pinned: dict[tuple[str, str, str], frozenset[str]] = {}
             for eco, lock in LOCKFILE_OF.items():
                 for path in [p for p in lockfiles if p.rsplit("/", 1)[-1] == lock]:
                     if path in res.files:
-                        new = lock_packages(path, res.files[path].decode(errors="replace"))
+                        text = res.files[path].decode(errors="replace")
+                        new = lock_packages(path, text)
                         old_set = lock_packages(
                             path, before.get(path, b"").decode(errors="replace")
                         )
                         added |= {(eco, n, v) for n, v in new - old_set}
+                        pinned |= {(eco, n, v): h for (n, v), h in lock_hashes(path, text).items()}
             res.added = sorted(f"{n}=={v}" for _, n, v in added)
-            res.errors += too_new(added, self.registry, self.clock())
+            res.errors += too_new(added, self.registry, self.clock(), pinned)
             return res
         finally:
             shutil.rmtree(work, ignore_errors=True)

@@ -72,10 +72,11 @@ RUN pnpm install --frozen-lockfile \
  && chmod -R a+rX /opt/deps /ms-playwright
 WORKDIR /opt/deps
 
-# data/'s Python deps, frozen, into a venv outside the checkout.
+# data/'s Python deps, frozen, into a venv outside the checkout; wheels only
+# (--no-build: no build backend runs at image build, coord decision 11).
 COPY data/pyproject.toml data/uv.lock data/.python-version data/
 RUN cd data && uv python install "$(cat .python-version)" \
- && uv sync --frozen --no-install-project \
+ && uv sync --frozen --no-build --no-install-project \
  && chmod -R a+rX /opt/python /opt/data-venv
 
 # vigil-session-prepare: puts the dependencies above next to whatever is at

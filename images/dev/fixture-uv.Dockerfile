@@ -19,7 +19,8 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
 
 WORKDIR /opt/deps
 COPY pyproject.toml uv.lock ./
-RUN UV_OFFLINE=0 uv sync --frozen --no-install-project && chmod -R a+rX /opt/venv
+# --no-build: wheels only, no build backend runs at image build (coord decision 11)
+RUN UV_OFFLINE=0 uv sync --frozen --no-build --no-install-project && chmod -R a+rX /opt/venv
 
 COPY --chmod=0555 <<'EOF' /usr/local/bin/vigil-prepare
 #!/bin/sh

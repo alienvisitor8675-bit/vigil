@@ -9,7 +9,7 @@ success closes it.
 
 | kind | scope | trips when |
 |---|---|---|
-| daily_cap, monthly_cap | global | a reservation hits the cap (B14) |
+| daily_cap, monthly_cap | global | the day's (month's) metered spend reaches the cap (B14) |
 | per_task_cap | task:<id> | a task's reservation is exhausted |
 | wip | repo:<name> | four open fleet PRs (B41) |
 | escalations | global | more than `max_escalations_per_day` escalations today (UTC) |
@@ -20,6 +20,16 @@ success closes it.
 | decider_credit | route:jev-cloudflare | Cloudflare answers 2021: the route is off until reset |
 | decider_fallback_cap | repo:<name> | a Haiku fallback call would cross the repo's day cap |
 
+**A read never moves a breaker** (review B6, A11): `is_open` and `blocking`
+only report. A backend breaker past its cool-down is `probe_ready`; its one
+half-open probe is claimed (`claim_probe`) by the gateway, at the call it
+lets through upstream, and released (`release_probe`) when that call never
+reached upstream. The probe's success closes the breaker and hands the jobs
+it held to `on_close` (the runner resumes them); its failure opens it again.
+
+The daily and monthly breakers trip when the day's (month's) metered spend
+reaches the cap, not when one reservation doesn't fit: a job whose wave
+doesn't fit gets its own page (review B1).
 """
 
 from __future__ import annotations
@@ -86,6 +96,8 @@ class Breakers:
         self.cfg = cfg
         self.pager = pager
         self.clock = clock
+        # the jobs a breaker held, when a probe closes it (the runner resumes them)
+        self.on_close: Callable[[list[str], int], Any] | None = None
 
     # --- reading --------------------------------------------------------------------
 
@@ -114,16 +126,35 @@ class Breakers:
         return self._load(rows[0])
 
     def is_open(self, kind: Kind, scope: str) -> bool:
-        """Open pauses its scope. A backend breaker past its cool-down goes
-        half-open: this caller's probe is let through, and only it."""
+        """Open (or half-open, a probe in flight) pauses its scope. A read
+        only: nothing moves here."""
         b = self._row(kind, scope)
-        if b is None or b.state == "closed":
-            return False
-        cooled = b.reopen_at is not None and iso(self.clock()) >= b.reopen_at
-        if b.state == "open" and kind is Kind.BACKEND and cooled:
+        return b is not None and b.state != "closed"
+
+    def _cooled(self, b: Breaker) -> bool:
+        return b.reopen_at is not None and iso(self.clock()) >= b.reopen_at
+
+    def probe_ready(self, kind: Kind, scope: str) -> bool:
+        """An open backend breaker past its cool-down, with no probe in
+        flight: work may go to it, and its first call will be the probe."""
+        b = self._row(kind, scope)
+        return b is not None and b.kind is Kind.BACKEND and b.state == "open" and self._cooled(b)
+
+    def claim_probe(self, kind: Kind, scope: str) -> bool:
+        """Claim the one half-open probe, where the upstream call is made."""
+        with self.store.lock:
+            b = self._row(kind, scope)
+            if b is None or b.kind is not Kind.BACKEND or b.state != "open" or not self._cooled(b):
+                return False
             self._set(b, state="half_open")
-            return False
-        return True
+            return True
+
+    def release_probe(self, kind: Kind, scope: str) -> None:
+        """The claimed call never reached upstream: the next caller may probe."""
+        with self.store.lock:
+            b = self._row(kind, scope)
+            if b is not None and b.state == "half_open":
+                self._set(b, state="open")
 
     def blocking(
         self,
@@ -237,15 +268,21 @@ class Breakers:
             return None
 
     def success(self, kind: Kind, scope: str) -> None:
-        """The run of failures ends; a half-open backend breaker closes."""
+        """The run of failures ends; a half-open backend breaker closes, and
+        the jobs it held go to `on_close`."""
+        held: list[str] = []
+        item_id = 0
         with self.store.lock:
             b = self._row(kind, scope)
             if b is None:
                 return
             if b.state == "half_open":
-                self._close(b, by="probe")
+                held = self._close(b, by="probe")
+                item_id = int(b.item_id or 0)
             elif b.state == "closed" and b.count:
                 self._set(b, count=0)
+        if held and self.on_close is not None:
+            self.on_close(held, item_id)
 
     def hold(self, b: Breaker, job_id: str) -> None:
         """Note a job this breaker paused; resetting it resumes the job."""
