@@ -1268,8 +1268,8 @@ class JobRunner:
                     "deps_job": child,
                     "actions": ["abandon"],
                     "next": f"deps job {child} waits in Specs to approve. It changes only the "
-                    "manifests and lockfiles, rebuilds the dev image, runs the suites and opens "
-                    "its own PR; when that merges, this job resumes on its own.",
+                    "manifests and lockfiles and opens its own PR; when that merges, the dev "
+                    "image is rebuilt from it and this job resumes on its own.",
                 },
             )
             return
