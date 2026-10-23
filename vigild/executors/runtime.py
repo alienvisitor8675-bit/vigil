@@ -458,6 +458,8 @@ class DockerRuntime:
                         on_event(msg["vigil_event"])
                     elif "vigil_transcript" in msg:
                         on_event({"type": "transcript", "data": msg["vigil_transcript"]})
+                    elif "vigil_checkpoint" in msg:
+                        on_event({"type": "checkpoint", "data": msg["vigil_checkpoint"]})
                     elif "vigil_result" in msg:
                         result = msg["vigil_result"]
             code = int(worker.wait().get("StatusCode", -1))

@@ -133,3 +133,32 @@ class LocalTestRunner:
         found = {f.name: f.read_bytes() for f in reports.glob("*.xml") if REPORT_NAME.match(f.name)}
         shutil.rmtree(reports, ignore_errors=True)
         return RunResult(p.returncode, (p.stdout + p.stderr)[-max_output:], reports=found)
+
+
+def checkpoint_bundle(clone: Path, out_dir: Path, *, branch: str, base_sha: str) -> str:
+    """What the harness's checkpoint does (phase 2a, item 3): the work so far
+    as a commit off the branch, in a throwaway index, bundled as
+    checkpoint.bundle; the branch and the index are untouched."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    index = Path(tempfile.mkdtemp(prefix="vigil-ckpt-")) / "index"
+    env = {"GIT_INDEX_FILE": str(index)}
+    head = _pinned(clone, "rev-parse", f"refs/heads/{branch}")
+
+    def g(*args: str) -> str:
+        gd = str(clone / ".git")
+        e = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        e.update({"GIT_DIR": gd, "GIT_COMMON_DIR": gd, "GIT_WORK_TREE": str(clone), **env})
+        return subprocess.run(
+            ["git", *PINS, *args], cwd=clone, env=e, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    g("read-tree", head)
+    g("add", "-A")
+    tree = g("write-tree")
+    shutil.rmtree(index.parent, ignore_errors=True)
+    commit = _pinned(clone, "commit-tree", tree, "-p", head, "-m", "vigil: checkpoint")
+    _pinned(clone, "update-ref", "refs/vigil/checkpoint", commit)
+    bundle = out_dir / "checkpoint.bundle"
+    bundle.unlink(missing_ok=True)
+    _pinned(clone, "bundle", "create", "-q", str(bundle), "refs/vigil/checkpoint", f"^{base_sha}")
+    return commit

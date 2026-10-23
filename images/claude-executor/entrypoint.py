@@ -44,6 +44,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -158,11 +159,11 @@ def git_env() -> dict[str, str]:
     return env
 
 
-def git(*args: str, check: bool = True) -> str:
+def git(*args: str, check: bool = True, env: dict[str, str] | None = None) -> str:
     p = subprocess.run(
         ["git", *git_pins(), *args],
         cwd=WORK,
-        env=git_env(),
+        env={**git_env(), **(env or {})},
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -205,6 +206,58 @@ def in_scope(path: str, scope: list[str]) -> bool:
     return any(path == g or _match_segs(path.split("/"), g.split("/")) for g in scope)
 
 
+def stage(task: dict[str, Any], env: dict[str, str] | None = None) -> list[str]:
+    """Stage the work (in `env`'s index, or the clone's): tracked changes, and
+    new files in the task's scope or under `.vigil/`. Returns what's left out."""
+    scope = [str(x) for x in (task.get("spec") or {}).get("files_in_scope") or []]
+    git("add", "-u", env=env)  # tracked files: changes and deletions
+    untracked = git("ls-files", "-z", "--others", "--exclude-standard", env=env).split("\0")
+    keep = [
+        p
+        for p in untracked
+        if p
+        and (p.startswith(".vigil/") or in_scope(p, scope))
+        and "__pycache__" not in p.split("/")  # bytecode is never the work
+        and not p.endswith((".pyc", ".pyo"))
+    ]
+    if keep:
+        git("add", "--", *keep, env=env)
+    return sorted(p for p in untracked if p and p not in keep)
+
+
+CHECKPOINT_REF = "refs/vigil/checkpoint"
+CHECKPOINT_SECONDS = 30.0
+
+
+def checkpoint(task: dict[str, Any], turns: int) -> str:
+    """The work so far, as a commit off the branch (phase 2a, item 3), bundled
+    for vigild as /vigil/out/checkpoint.bundle. A throwaway index: the
+    branch, HEAD and the agent's own index are untouched. vigild imports it at
+    once and binds it to the commit named on the checkpoint line, so a
+    crashed or killed worker resumes from its last commit."""
+    branch, base_sha = task.get("branch"), task.get("base_sha")
+    if not branch or not base_sha:
+        raise HarnessRefused("task.json names no branch or base_sha")
+    check_git_dir()
+    head = git("rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
+    # the agent uid's git makes the index in the sticky /tmp, and removes it
+    index = Path(tempfile.gettempdir()) / f"vigil-ckpt-{os.urandom(8).hex()}.index"
+    env = {"GIT_INDEX_FILE": str(index)}
+    try:
+        git("read-tree", head, env=env)
+        stage(task, env)
+        tree = git("write-tree", env=env)
+    finally:
+        subprocess.run(["rm", "-f", str(index)], check=False, timeout=30, **as_agent())
+    what = task.get("task_id") or task.get("job_id")
+    commit = git("commit-tree", tree, "-p", head, "-m", f"vigil: checkpoint {what} turn {turns}")
+    git("update-ref", CHECKPOINT_REF, commit)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(OUT / "checkpoint.bundle")
+    git("bundle", "create", "-q", str(OUT / "checkpoint.bundle"), CHECKPOINT_REF, f"^{base_sha}")
+    return commit
+
+
 def snapshot(task: dict[str, Any], role: str) -> tuple[str, list[str]]:
     """Commit what the agent left and bundle the branch from the base. Returns
     the head commit, which vigild binds the imported bundle to, and the
@@ -221,20 +274,7 @@ def snapshot(task: dict[str, Any], role: str) -> tuple[str, list[str]]:
     ref = f"refs/heads/{branch}"
     if git("symbolic-ref", "-q", "HEAD", check=False) != ref:
         raise HarnessRefused(f"HEAD is not on {branch}")
-    scope = [str(x) for x in (task.get("spec") or {}).get("files_in_scope") or []]
-    git("add", "-u")  # tracked files: changes and deletions
-    untracked = git("ls-files", "-z", "--others", "--exclude-standard").split("\0")
-    keep = [
-        p
-        for p in untracked
-        if p
-        and (p.startswith(".vigil/") or in_scope(p, scope))
-        and "__pycache__" not in p.split("/")  # bytecode is never the work
-        and not p.endswith((".pyc", ".pyo"))
-    ]
-    left_out = sorted(p for p in untracked if p and p not in keep)
-    if keep:
-        git("add", "--", *keep)
+    left_out = stage(task)
     if git("diff", "--cached", "--name-only"):
         what = task.get("task_id") or task.get("job_id")
         git("commit", "-q", "--no-verify", "-m", f"vigil: {role} {what}")
@@ -387,6 +427,8 @@ async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
     stderr_tail: collections.deque[str] = collections.deque(maxlen=20)
     options = ClaudeAgentOptions(**agent_options(role, token, stderr_tail.append))
     result: dict[str, Any] = {"plugins": [], "denials": [], "tool_calls": 0}
+    turns = 0
+    last_checkpoint = time.monotonic()
     async for msg in query(prompt=packet, options=options):
         if isinstance(msg, SystemMessage) and msg.subtype == "init":
             plugins = [
@@ -420,8 +462,10 @@ async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
                         },
                     )
         elif isinstance(msg, UserMessage) and isinstance(msg.content, list):
+            ran_tools = False
             for b in msg.content:
                 if isinstance(b, ToolResultBlock):
+                    ran_tools = True
                     text = b.content if isinstance(b.content, str) else json.dumps(b.content)
                     emit_event(
                         token,
@@ -434,6 +478,16 @@ async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
                             },
                         },
                     )
+            if ran_tools:
+                turns += 1
+                if role == "worker" and time.monotonic() - last_checkpoint >= CHECKPOINT_SECONDS:
+                    last_checkpoint = time.monotonic()
+                    try:
+                        task = json.loads((WORK / ".vigil" / "task.json").read_text())
+                        commit = checkpoint(task, turns)
+                        emit("vigil_checkpoint", {"head": commit, "turns": turns})
+                    except (HarnessRefused, OSError, ValueError) as e:
+                        emit_event(token, {"type": "state", "data": {"checkpoint": str(e)[:300]}})
         elif isinstance(msg, ResultMessage):
             result.update(
                 {

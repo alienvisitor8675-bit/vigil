@@ -221,20 +221,33 @@ class Workspace:
         return path
 
     def import_result(
-        self, repo: str, task_id: str, out_dir: Path, branch: str, base_sha: str, *, head: str
+        self,
+        repo: str,
+        task_id: str,
+        out_dir: Path,
+        branch: str,
+        base_sha: str,
+        *,
+        head: str,
+        checkpoint: bool = False,
     ) -> str:
         """Take the session's branch from the bundle the harness wrote; return its head.
 
         `head` is the commit the harness named on its result line (PID 1's
         stdout, out of the agent's reach). The bundle sits in a directory the
         agent uid can write, so a tip that isn't `head` is refused (review round 2, N1).
+        `checkpoint` (phase 2a, item 3) takes a running worker's checkpoint
+        instead: `checkpoint.bundle`'s `refs/vigil/checkpoint`, into
+        `refs/vigil/<task>-ckpt`, bound the same way to the commit named on
+        its checkpoint line.
         """
         if not SHA.match(base_sha):
             raise WorkspaceError("bad base sha")
         if not SHA.match(head or ""):
             raise WorkspaceError("the harness named no head commit")
         try:
-            data = safe_read_bytes(out_dir, out_dir / "result.bundle", MAX_BUNDLE)
+            name = "checkpoint.bundle" if checkpoint else "result.bundle"
+            data = safe_read_bytes(out_dir, out_dir / name, MAX_BUNDLE)
         except (OSError, UnsafeFile) as e:
             raise WorkspaceError(f"no usable result bundle: {e}") from e
         vault = self.vault(repo)
@@ -243,15 +256,14 @@ class Workspace:
             self._git(
                 vault, "fetch", "--quiet", "--no-tags", str(mirror), "+refs/heads/*:refs/mirror/*"
             )
-            tmp = self.data_dir / "vault" / "incoming" / f"{task_id}.bundle"
+            tmp = self.data_dir / "vault" / "incoming" / f"{task_id}-{secrets.token_hex(4)}.bundle"
             tmp.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_bytes(data)
+            src = "refs/vigil/checkpoint" if checkpoint else f"refs/heads/{branch}"
+            ref = f"refs/vigil/{task_id}-ckpt" if checkpoint else f"refs/vigil/{task_id}"
             try:
                 self._git(vault, "bundle", "verify", "--quiet", str(tmp))
-                ref = f"refs/vigil/{task_id}"
-                self._git(
-                    vault, "fetch", "--quiet", "--no-tags", str(tmp), f"+refs/heads/{branch}:{ref}"
-                )
+                self._git(vault, "fetch", "--quiet", "--no-tags", str(tmp), f"+{src}:{ref}")
             finally:
                 tmp.unlink(missing_ok=True)
             tip = self._git(vault, "rev-parse", "--verify", f"{ref}^{{commit}}")

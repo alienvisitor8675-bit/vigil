@@ -271,7 +271,14 @@ uv run python -m vigild
     containers removed, reservations settled, mid-flight jobs blocked with a
     page in the inbox (retry, re-plan or abandon), a draft whose coord died
     paged (retry or cancel);
-  - starts approved builds that never began, once the gateway is listening.
+  - starts approved builds that never began, once the gateway is listening;
+  - **resumes** building jobs a restart cut off when that's safe: their
+    workers' image is unchanged, each has at least $0.05 of its cap left,
+    and none has crashed `scheduler.resume_attempts` (2) times in a row.
+    They pick up from their last checkpoint with their transcript.
+- **A worker container that dies or is killed** (OOM, `docker kill`)
+  resumes on its own the same way, up to two times; then its job blocks
+  with the usual retry, re-plan or abandon.
 - **When a worker fails**, its job is blocked after its wave with one inbox
   item: **Retry** runs the failed tasks again on what's left of each task's
   cap (offered only when there is at least $0.05 left), **Re-plan** sends

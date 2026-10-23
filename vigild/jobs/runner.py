@@ -177,6 +177,7 @@ class JobRunner:
         self._running_lock = threading.Lock()
         self.closers: list[Callable[[], None]] = []  # e.g. the docker client (item 0)
         self.ladder = Ladder(store, cfg)
+        self._sdk_seen: set[tuple[str, str]] = set()
         self.slots = Slots(cfg.vigild.scheduler.sessions)  # across every job (item 2)
 
     def close(self) -> None:
@@ -257,17 +258,29 @@ class JobRunner:
         if self.reaper is not None:
             out["containers"] = self.reaper()
         failed_coord: set[str] = set()
-        for s in self.store.list_sessions():
-            if s.status in LIVE_SESSION:
-                self.store.update_session(s.id, status="failed", ended_at=iso())
-                out["sessions"] += 1
-                if s.role is Role.COORD and s.job_id:
-                    failed_coord.add(s.job_id)
+        live = [s for s in self.store.list_sessions() if s.status in LIVE_SESSION]
         for rid in self.budget.open_reservation_ids():
-            self.budget.settle(rid)
+            self.budget.settle(rid)  # first: what's left of each task's cap is known
             out["reservations"] += 1
+        safe = {s.job_id for s in live if s.job_id and self._safe_to_resume(s)}
+        for s in live:
+            resumable = s.job_id in safe and s.role is Role.WORKER
+            self.store.update_session(
+                s.id, status="crashed" if resumable else "failed", ended_at=iso()
+            )
+            out["sessions"] += 1
+            if s.role is Role.COORD and s.job_id:
+                failed_coord.add(s.job_id)
+        out["requeued"] = 0
         for job in self.store.list_jobs():
-            if job.state in (JobState.PLANNING, JobState.BUILDING):
+            if job.state is JobState.BUILDING and job.id in safe:
+                # item 3: same image, budget left, under the cap: resume
+                for t in self.store.list_tasks(job.id):
+                    if t.state == "running":
+                        self.store.update_task(t.id, state="queued")
+                self.deferred.append(job.id)
+                out["requeued"] += 1
+            elif job.state in (JobState.PLANNING, JobState.BUILDING):
                 for t in self.store.list_tasks(job.id):
                     if t.state == "running":
                         self.store.update_task(t.id, state="failed")
@@ -292,6 +305,37 @@ class JobRunner:
                 out["rebuilt"] += 1
         self.store.add_event("reconcile", out, Provenance.HUMAN)
         return out
+
+    def _safe_to_resume(self, s: SessionRow) -> bool:
+        """A worker a restart cut off may resume (item 3) when its job was
+        building, its image key is unchanged, it has budget left and it's
+        under the resume cap; every live session of the job must be such a
+        worker."""
+        if s.job_id is None:
+            return False
+        try:
+            job = self.store.get_job(s.job_id)
+        except KeyError:
+            return False
+        if job.state is not JobState.BUILDING:
+            return False
+        for other in self.store.list_sessions(job.id):
+            if other.status not in LIVE_SESSION:
+                continue
+            if other.role is not Role.WORKER or not other.task_id:
+                return False
+            try:
+                base = self.workspace.base_sha(other.task_id)
+                same = other.detail.get("image") == self._expected_image(job.repo, base)
+            except Exception:
+                return False
+            crashes = self._crashes(other.task_id) + 1  # this one
+            left = self.remaining(other.task_id)[2]
+            if not same or left < MIN_RETRY_USD:
+                return False
+            if crashes > self.cfg.vigild.scheduler.resume_attempts:
+                return False
+        return True
 
     def dev_image_failed(self, repo: str, title: str, body: dict[str, Any]) -> None:
         """DevImages' pager: one open item per failed image key."""
@@ -338,7 +382,10 @@ class JobRunner:
         itself, building it when the lockfiles changed."""
         started, self.deferred = self.deferred, []
         for job_id in started:
-            self.on_approved(job_id)
+            if self.store.get_job(job_id).state is JobState.BUILDING:
+                self.on_resume(job_id)  # workers a restart cut off (item 3)
+            else:
+                self.on_approved(job_id)
         return len(started)
 
     # --- helpers ------------------------------------------------------------------------
@@ -365,6 +412,9 @@ class JobRunner:
             if e.get("type") == "transcript":
                 self._transcript(s, e.get("data") or {})
                 return
+            if e.get("type") == "checkpoint":
+                self._checkpoint(s, e.get("data") or {})
+                return
             self.store.add_event(
                 str(e.get("type", "state")),
                 redact(e.get("data") or {}),
@@ -387,6 +437,80 @@ class JobRunner:
         self.store.add_transcript(
             s.id, sdk[:100], str(sub)[:200] if sub else None, redact(entries)[:5000]
         )
+        if not sub and (s.id, sdk) not in self._sdk_seen:
+            self._sdk_seen.add((s.id, sdk))  # every session's SDK id is stored (item 3)
+            self.store.update_session(s.id, detail={"sdk_session_id": sdk[:100]})
+
+    def _checkpoint(self, s: SessionRow, data: dict[str, Any]) -> None:
+        """A running worker's checkpoint (item 3): imported into the vault at
+        once, bound to the commit its line names, and recorded as the
+        session's last bundled commit. One that doesn't match is refused."""
+        head, turns = data.get("head"), data.get("turns")
+        if s.role is not Role.WORKER or not s.task_id or not s.job_id or not isinstance(head, str):
+            return
+        try:
+            job = self.store.get_job(s.job_id)
+            got = self.workspace.import_result(
+                job.repo,
+                s.task_id,
+                self._session_dir(s.id) / "out",
+                str(s.branch),
+                self.workspace.base_sha(s.task_id),
+                head=head,
+                checkpoint=True,
+            )
+        except (WorkspaceError, KeyError, OSError) as e:
+            self.store.add_event(
+                "checkpoint_refused", {"error": str(e)[:500]}, Provenance.HUMAN,
+                job_id=s.job_id, session_id=s.id, task_id=s.task_id,
+            )  # fmt: skip
+            return
+        n = int(turns) if isinstance(turns, int) else 0
+        self.store.update_session(s.id, detail={"checkpoint": got, "turns": n})
+        self.store.add_event(
+            "checkpoint", {"head": got, "turns": n}, Provenance.HUMAN,
+            job_id=s.job_id, session_id=s.id, task_id=s.task_id,
+        )  # fmt: skip
+
+    def _turns_used(self, resume: Resume | None) -> int:
+        """Turns a worker has had, across the sessions its transcript carries:
+        its distinct assistant messages."""
+        if resume is None:
+            return 0
+        ids = {
+            str((e.get("message") or {}).get("id") or e.get("uuid"))
+            for e in resume.entries
+            if isinstance(e, dict) and e.get("type") == "assistant"
+        }
+        return len(ids)
+
+    def _crashes(self, task_id: str) -> int:
+        """Crashed or killed worker sessions in a row, latest first."""
+        rows = self.store.q(
+            "SELECT status FROM sessions WHERE task_id=? AND role='worker' ORDER BY rowid DESC",
+            (task_id,),
+        )
+        n = 0
+        for r in rows:
+            if r["status"] != "crashed":
+                break
+            n += 1
+        return n
+
+    def _resumable(self, task_id: str) -> bool:
+        """Under the resume cap, with budget left (item 3)."""
+        return (
+            self._crashes(task_id) <= self.cfg.vigild.scheduler.resume_attempts
+            and self.remaining(task_id)[2] >= MIN_RETRY_USD
+        )
+
+    def _expected_image(self, repo: str, base_sha: str) -> str:
+        """The image a session for this base would run in now, computed
+        without building anything (reconcile's "image key unchanged")."""
+        dev = self.dev_images.tag(repo, self.dev_images.key(repo, base_sha))
+        if self.session_images is None:
+            return dev
+        return self.session_images.tag(repo, self.session_images.key(dev))
 
     def _resume_from(self, session_id: str | None, *, fork: bool = True) -> Resume | None:
         """A Resume of a vigil session's stored transcript, if it has one."""
@@ -563,6 +687,23 @@ class JobRunner:
             untrusted["previous build failures"] = json.dumps(replan, indent=1)[:12000]
         self.workspace.write_task(clone, request)
         packet = assemble_coord(clone, request, untrusted=untrusted, gate_errors=gate_errors)
+        # Re-plan (item 3): the coord resumes its own last session, its whole
+        # context, with the failures in this packet. Phase 6's fix jobs reuse it.
+        resume = None
+        if replan:
+            prior = [
+                x
+                for x in self.store.list_sessions(job_id)
+                if x.role is Role.COORD and x.id != coord.id
+            ]
+            resume = self._resume_from(prior[-1].id) if prior else None
+            if resume is not None:
+                self.store.add_event(
+                    "fork",
+                    {"from_session": resume.from_session, "sdk_session_id": resume.session_id,
+                     "entries": len(resume.entries), "replan": True},
+                    Provenance.HUMAN, job_id=job_id, session_id=coord.id,
+                )  # fmt: skip
         self.store.add_event(
             "packet",
             {"role": "coord", "attempt": attempt, "dropped": packet.dropped},
@@ -586,6 +727,7 @@ class JobRunner:
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=session_image,  # the executor layer over the repo's dev image
+            resume=resume,
         )
         out = self._run_session(
             coord,
@@ -981,12 +1123,15 @@ class JobRunner:
         # the gateway sees this session's headroom through its reservation
         self.store.x("UPDATE reservations SET session_id=? WHERE id=?", (s.id, reservation))
         # a published task (a fix round, or a retry after one) goes on from its
-        # PR's head, on its own base (phase 2a, item 1)
+        # PR's head, on its own base (phase 2a, item 1); a crashed or killed
+        # worker from its last checkpoint (item 3)
         published = self._task_head(task_id)
         pr_url = self._task_pr(task_id) if published else None
-        if published:
+        crashed = prev is not None and prev.status == "crashed"
+        start = (prev.detail.get("checkpoint") if crashed and prev else None) or published
+        if start:
             clone = self.workspace.clone(
-                job.repo, task_id, branch=branch, base=job.base, start=published,
+                job.repo, task_id, branch=branch, base=job.base, start=start,
                 record_as=self.workspace.base_sha(task_id),
             )  # fmt: skip
         else:
@@ -1013,7 +1158,7 @@ class JobRunner:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(art.content)
                 paths.append(f".vigil/{job_id}/{name}")
-        if paths and not published:
+        if paths and not start:
             self.workspace.commit_before_session(clone, paths, f"vigil: {job_id} spec and plan")
         self.workspace.write_task(clone, {**contract, "base_sha": base_sha})
         approval = self.store.get_artifact(job_id, "approval.json")
@@ -1024,13 +1169,21 @@ class JobRunner:
         # The same worker goes on: a fix round (or a retry after one) forks its
         # last session's transcript, and so does an escalated attempt, from
         # the failed attempt's whole context, not a summary (item 2).
+        # A crashed worker resumes its own transcript, and its turn count
+        # carries on (item 3).
         escalated = str(t.tier_reason or "").startswith("rule5")
-        resume = self._resume_from(prev.id) if prev and (published or escalated) else None
+        resume = (
+            self._resume_from(prev.id) if prev and (published or escalated or crashed) else None
+        )
+        max_turns = int(contract.get("limits", {}).get("max_turns") or 60)
+        if crashed:
+            max_turns = max(1, max_turns - self._turns_used(resume))
         if resume is not None:
             self.store.add_event(
                 "fork",
                 {"from_session": resume.from_session, "sdk_session_id": resume.session_id,
-                 "entries": len(resume.entries), "escalated": escalated},
+                 "entries": len(resume.entries), "escalated": escalated, "crashed": crashed,
+                 "start": start},
                 Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
             )  # fmt: skip
         self.store.add_event(
@@ -1052,7 +1205,7 @@ class JobRunner:
             model=self.cfg.preset(preset).model or "",
             clone=clone,
             session_dir=self._session_dir(s.id),
-            max_turns=60,
+            max_turns=max_turns,
             max_minutes=WORKER_MINUTES,
             max_budget_usd=amount,  # what's left of the task's cap (N5)
             mounts=self.workspace.overlays(clone),
@@ -1070,7 +1223,30 @@ class JobRunner:
             "vigil.model": spec.model,
             "vigil.attempt": int(contract.get("attempt", 1)),
         }
+        self.store.update_session(s.id, detail={"image": session_image})
         out = self._run_session(s, spec, reservation, attrs)
+        if out.status in ("failed", "killed") and not out.result.get("status"):
+            # no result line: the container crashed or was killed (item 3)
+            self.store.update_session(s.id, status="crashed")
+            self.store.add_event(
+                "crashed", {"error": (out.error or "")[:500], "exit": out.exit_code},
+                Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
+            )  # fmt: skip
+            if self._resumable(task_id):
+                _, _, left = self.remaining(task_id)
+                try:
+                    rid = self.budget.reserve(
+                        session_id=None, task_id=task_id, amount=left, purpose="worker"
+                    )
+                except BudgetExceeded as e:
+                    return self._fail(
+                        job_id, None, task_id, f"{task_id}: crashed", {"error": str(e)}
+                    )
+                return self._worker(job_id, task_id, rid, left, held)
+            return self._fail(
+                job_id, None, task_id, f"{task_id}: worker crashed",
+                {"error": out.error or "", "resumes": self._crashes(task_id)},
+            )  # fmt: skip
         if out.status != "done":
             return self._fail(
                 job_id,

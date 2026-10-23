@@ -357,3 +357,23 @@ def test_a_resume_places_vigilds_transcript_where_the_cli_looks(
     monkeypatch.delenv("VIGIL_RESUME_SESSION")
     assert ep.place_resume() is None
     assert "resume" not in ep.agent_options("worker", TOKEN, print)
+
+
+def test_a_checkpoint_bundles_the_work_without_touching_the_branch(tmp_path: Path) -> None:
+    """Phase 2a, item 3: the work so far as a commit off the branch; the
+    branch, HEAD and the agent's index stay as they were."""
+    work, base = _work(tmp_path)
+    (work / "a.txt").write_text("changed\n")
+    (work / "b.txt").write_text("new, in scope\n")
+    (work / "junk.log").write_text("not the work\n")
+    _run(work, "add", "a.txt")  # the agent staged something itself
+    staged = _run(work, "diff", "--cached", "--name-only")
+    ep = _harness(tmp_path, work)
+    commit = ep.checkpoint(_task(base), 4)
+    assert _run(work, "rev-parse", BRANCH) == base  # the branch didn't move
+    assert _run(work, "diff", "--cached", "--name-only") == staged  # nor did the index
+    files = _run(work, "ls-tree", "-r", "--name-only", commit).split()
+    assert {"a.txt", "b.txt"} <= set(files) and "junk.log" not in files
+    assert _run(work, "show", f"{commit}:a.txt") == "changed"
+    heads = _run(work, "bundle", "list-heads", str(ep.OUT / "checkpoint.bundle"))
+    assert heads == f"{commit} refs/vigil/checkpoint"
