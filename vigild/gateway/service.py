@@ -215,6 +215,7 @@ class Gateway:
         self._inflight: dict[str, float] = {}
         self._fallback_pending: dict[str, float] = {}  # repo -> held for fallback calls
         self._inflight_lock = threading.Lock()
+        self._drained = threading.Condition(self._inflight_lock)  # a session's holds all gone
         # vigild's circuit breakers (plan 2a, item 4): every upstream answer
         # counts for or against the preset's backend breaker
         self.breakers: Any = None
@@ -406,6 +407,15 @@ class Gateway:
                 self._inflight[hold.session_id] = left
             else:
                 self._inflight.pop(hold.session_id, None)
+                self._drained.notify_all()
+
+    def drain(self, session_id: str, timeout: float = 60.0) -> bool:
+        """Wait until none of the session's calls is in flight (each is booked
+        before its hold goes), so settling sees every call's cost. A killed
+        worker's last streamed call can finish after its container is gone
+        (2a round 2, found by the done-when). False if the wait timed out."""
+        with self._drained:
+            return self._drained.wait_for(lambda: session_id not in self._inflight, timeout=timeout)
 
     def _key(self, preset: Preset) -> str:
         key = self.secrets.get(preset.key_ref)

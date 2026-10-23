@@ -636,3 +636,25 @@ def test_thinking_blocks_in_a_user_turn_are_refused(
         headers={"x-api-key": tok},
     )
     assert r.status_code == 403 and upstream.requests == []
+
+
+def test_settling_waits_for_the_sessions_calls_in_flight(
+    gw: Gateway, store: Store, budget: Budget
+) -> None:
+    """2a round 2 (found by the done-when): a killed worker's last streamed
+    call was booked after its reservation settled, so the ledger missed it
+    and its resume was given a little more than its cap's remainder.
+    `drain` waits for the session's holds before vigild settles."""
+    import threading
+    import time
+
+    from vigild.gateway.service import Hold
+
+    sid, _tok = _session(store, budget, gw)
+    hold = Hold(sid, gw._hold(sid, 0.01), gw.cfg.preset("claude-sonnet"), {})
+    assert gw.drain(sid, timeout=0.1) is False  # a call still in flight
+    threading.Timer(0.2, gw.release, args=(hold,)).start()
+    t = time.monotonic()
+    assert gw.drain(sid, timeout=5) is True
+    assert 0.1 < time.monotonic() - t < 5
+    assert gw.drain(sid, timeout=0.01) is True  # nothing in flight

@@ -746,6 +746,8 @@ class JobRunner:
                 return out
             finally:
                 self.gateway.revoke(s.id)
+                if not self.gateway.drain(s.id):  # its last calls booked first
+                    log.warning("%s: a call was still in flight at settling", s.id)
                 self.budget.settle(reservation)
                 self.store.update_session(s.id, ended_at=iso())
                 self._spend_check()
