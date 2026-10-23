@@ -199,6 +199,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         reaper=runtime.reap,
         session_images=sessions,
     )
+    runner.closers.append(client.close)
     images.on_failure = runner.dev_image_failed
     sessions.on_failure = runner.dev_image_failed
     runner.jobs = v.services.jobs

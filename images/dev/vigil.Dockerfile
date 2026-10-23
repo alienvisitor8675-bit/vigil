@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.28.0@sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b
 # Dev image for thomasbardhi01/vigil (owner direction, review round 2).
 # linux/arm64. vigild builds it from pyproject.toml and uv.lock at the base
 # commit and validates it by running the offline suite on a clean checkout,

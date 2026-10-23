@@ -124,33 +124,42 @@ def proxy_kwargs(cfg: Config, spec: SessionSpec) -> dict[str, Any]:
     }
 
 
-# The verifier's first step. The dev image's vigil-prepare copies the checkout
-# into /work with the dependencies it installed, and starts what the suites
-# need (a database on loopback); an image without one gets a plain copy.
-# Exit 125 means the tree couldn't be prepared: the outcome is `unknown`.
-# The verifier's container script (rounds 2-5). The per-run marker arrives on
-# stdin and stdin is closed before anything else runs, so it's in no argv,
-# environment or file. It isn't secret from the test, though: the script runs
-# as the same uid, so a test can read it from /proc/1/mem (the reviewer did).
-# It keeps accidental output from looking like a trailer; like an in-process
-# rewrite of the report, a deliberate forgery stays open (architecture B33),
-# with the draft PR and review as the backstop. The checkout is prepared (exit 125
-# means it couldn't be: `unknown`), test_cmd runs under pipefail and errexit,
-# and then one trailer: BEGIN, each expected report (pytest.xml, vitest-N.xml)
-# in base64, and END with the exit code. vigild accepts reports only from a
-# trailer that ends the stream.
-PREPARE = (
-    "read -r m || exit 125; exec </dev/null; "
-    "if [ -x /usr/local/bin/vigil-prepare ]; then /usr/local/bin/vigil-prepare || exit 125; "
-    "else cp -a /src/. /work/ || exit 125; fi; "
-    f"mkdir -p {REPORT_DIR}; cd /work; "
-    'bash -o pipefail -o errexit -c "$0"; rc=$?; '
-    'printf "\\n%s BEGIN\\n" "$m"; '
-    f"for f in {REPORT_DIR}/pytest.xml {REPORT_DIR}/vitest-*.xml; do "
-    '[ -f "$f" ] || continue; printf "%s %s\\n" "$m" "$(basename "$f")"; '
-    f'head -c {MAX_REPORT} "$f" | base64 -w0; printf "\\n"; done; '
-    'printf "%s END %s\\n" "$m" "$rc"; exit $rc'
-)
+# The verifier's container script (rounds 2-5; phase 2a, item 0). It runs as
+# root with only SETUID and SETGID. The per-run marker arrives on its stdin,
+# which is closed before anything else runs, so the marker is in no argv,
+# environment or file, and only in root's memory: the prepare hook and the
+# test run as the agent uid (setpriv, no capabilities), which can't open
+# /proc/1/mem. The dev image's vigil-prepare copies the checkout into /work
+# with the dependencies it installed and starts what the suites need (a
+# database on loopback); an image without one gets a plain copy. Exit 125
+# means the tree couldn't be prepared: the outcome is `unknown`. test_cmd runs
+# under pipefail and errexit, and then one trailer: BEGIN, each expected report
+# (pytest.xml, vitest-N.xml, regular files only: root never follows a link the
+# test planted) in base64, and END with the exit code. vigild accepts reports
+# only from a trailer that ends the stream. An in-process rewrite of a report
+# stays open (architecture B33), with the draft PR and review as the backstop.
+AGENT = "setpriv --reuid={uid} --regid={uid} --clear-groups --inh-caps=-all --"
+
+
+def prepare_script(uid: int) -> str:
+    a = AGENT.format(uid=uid)
+    return (
+        "read -r m || exit 125; exec </dev/null; "
+        f"{a} mkdir -p {REPORT_DIR} || exit 125; "
+        "if [ -x /usr/local/bin/vigil-prepare ]; "
+        f"then {a} /usr/local/bin/vigil-prepare || exit 125; "
+        f"else {a} cp -a /src/. /work/ || exit 125; fi; "
+        f'cd /work; {a} bash -o pipefail -o errexit -c "$0"; rc=$?; '
+        'printf "\\n%s BEGIN\\n" "$m"; '
+        f"for f in {REPORT_DIR}/pytest.xml {REPORT_DIR}/vitest-*.xml; do "
+        '[ -f "$f" ] && [ ! -L "$f" ] || continue; printf "%s %s\\n" "$m" "$(basename "$f")"; '
+        f'head -c {MAX_REPORT} "$f" | base64 -w0; printf "\\n"; done; '
+        'printf "%s END %s\\n" "$m" "$rc"; exit $rc'
+    )
+
+
+PREPARE = prepare_script(10001)
+VERIFIER_CAPS = ("SETUID", "SETGID")
 REPORT_NAME = re.compile(r"^(pytest|vitest-[0-9]{1,3})\.xml$")
 
 
@@ -186,8 +195,9 @@ def split_reports(text: str, marker: str) -> tuple[str, dict[str, bytes]]:
 
 def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict[str, Any]:
     """The verifier's container (owner direction, round 2): the repo's dev
-    image, vigild's checkout read-only at /src, no network at all, the agent
-    uid with no capabilities, and nothing else mounted. The suites write (build
+    image, vigild's checkout read-only at /src, no network at all, the script
+    as root with only SETUID and SETGID, the hook and the test as the agent uid
+    with no capabilities, and nothing else mounted. The suites write (build
     output, caches), so they run on a copy in the container's own tmpfs at
     /work; the checkout itself can't change."""
     uid = cfg.vigild.container.uid
@@ -195,8 +205,8 @@ def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict
     return {
         "image": image,
         "entrypoint": ["sh", "-c"],
-        "command": [PREPARE, command],
-        "user": f"{uid}:{uid}",
+        "command": [prepare_script(uid), command],
+        "user": "0:0",  # the script; the hook and the test run as `uid` (item 0)
         "network_mode": "none",
         "mounts": [_mount(str(source), "/src", read_only=True)],
         "tmpfs": {
@@ -216,6 +226,7 @@ def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict
         "stdin_open": True,  # the report marker, then closed
         "labels": {LABEL: f"verify-{source.parent.name}", "dev.vigil.role": "verifier"},
         **_hardening(cfg),
+        "cap_add": list(VERIFIER_CAPS),
         "mem_limit": cfg.vigild.container.verifier_memory,
         "pids_limit": max(cfg.vigild.container.pids_limit, 2048),
     }

@@ -35,10 +35,14 @@ def doctor(
             docker_client = docker.from_env()
         except Exception:
             docker_client = None
-    with httpx2.Client(timeout=30) as http:
-        checks = run_checks(
-            cfg, secrets, http=http, docker=docker_client, repos=list(repo) if repo else None
-        )
+    try:
+        with httpx2.Client(timeout=30) as http:
+            checks = run_checks(
+                cfg, secrets, http=http, docker=docker_client, repos=list(repo) if repo else None
+            )
+    finally:
+        if docker_client is not None:
+            docker_client.close()
     typer.echo(render(checks))
     raise typer.Exit(0 if all(c.ok is not False for c in checks) else 1)
 
@@ -59,9 +63,9 @@ def dev_image(
     v = build()
     runner = build_runner(v, _github_app(v))
     images = runner.dev_images
-    base = runner.workspace.head_sha(repo, "main")
     ok = True
     try:
+        base = runner.workspace.head_sha(repo, "main")
         tag = images.ensure_fresh(repo, base, force=rebuild)
         typer.echo(f"pass  {repo}  {tag}")
         if runner.session_images is not None:
@@ -70,6 +74,8 @@ def dev_image(
     except StaleDevImage as e:
         ok = False
         typer.echo(f"fail  {repo}  {e}")
+    finally:
+        runner.close()  # the docker client, or its pool's __del__ writes to a closed stderr
     last = images.latest(repo)
     if last:
         detail = json.loads(last["output"])

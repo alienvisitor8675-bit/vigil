@@ -286,3 +286,39 @@ def test_a_failed_session_image_blocks_and_pages(layered: Any) -> None:
     page = ctx["pages"][-1]
     assert page["kind"] == "dev_image" and page["stage"] == "session-validate"
     assert page["actions"] == ["rebuild", "dismiss"]
+
+
+def test_a_build_finds_dockers_credential_helper_off_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phase 2a, item 0: vigild may run with a PATH (launchd, a bare shell)
+    that lacks Docker Desktop's bin, where `docker-credential-desktop` lives
+    beside the real CLI. The build must still find it."""
+    import os
+
+    from vigild.devimage import DockerImages
+
+    real = tmp_path / "Docker.app" / "Resources" / "bin"
+    real.mkdir(parents=True)
+    helper = real / "docker-credential-desktop"
+    helper.write_text("#!/bin/sh\necho '{}'\n")
+    cli = real / "docker"
+    cli.write_text(
+        "#!/bin/sh\n"
+        "command -v docker-credential-desktop >/dev/null || {\n"
+        "  echo 'docker-credential-desktop: executable file not found in $PATH' >&2; exit 1; }\n"
+        "echo built\n"
+    )
+    for f in (helper, cli):
+        f.chmod(0o755)
+    link = tmp_path / "home" / ".docker" / "bin" / "docker"  # the CLI's usual symlink
+    link.parent.mkdir(parents=True)
+    os.symlink(cli, link)
+    ctx = tmp_path / "ctx"
+    ctx.mkdir()
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    ok, out = DockerImages(client=None, cli=str(link)).build(
+        ctx, ctx / "Dockerfile", "t:1", timeout_s=30
+    )
+    assert ok, out
+    assert "built" in out

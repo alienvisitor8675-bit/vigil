@@ -143,11 +143,19 @@ def test_the_verifier_container_has_no_network_and_a_read_only_checkout(
         {"Target": "/src", "Source": str(src), "Type": "bind", "ReadOnly": True}
     ]
     assert set(kw["tmpfs"]) == {"/tmp", "/work"} and kw["read_only"] is True
-    assert kw["user"] == "10001:10001" and kw["cap_drop"] == ["ALL"] and "cap_add" not in kw
+    # phase 2a, item 0: the script is root with only SETUID and SETGID, and
+    # the prepare hook and the test run as the agent uid, so the test can't
+    # read the marker from PID 1's memory
+    assert kw["user"] == "0:0" and kw["cap_drop"] == ["ALL"]
+    assert kw["cap_add"] == ["SETUID", "SETGID"]
     # test_cmd is an argument, never spliced; the report marker comes on stdin
     assert kw["command"] == [PREPARE, "pytest -q"] and kw["stdin_open"] is True
     assert PREPARE.startswith("read -r m || exit 125; exec </dev/null;")
-    assert "bash -o pipefail -o errexit" in PREPARE
+    drop = "setpriv --reuid=10001 --regid=10001 --clear-groups --inh-caps=-all --"
+    assert f'{drop} bash -o pipefail -o errexit -c "$0"' in PREPARE
+    assert f"{drop} /usr/local/bin/vigil-prepare" in PREPARE
+    assert f"{drop} cp -a /src/. /work/" in PREPARE
+    assert '[ -f "$f" ] && [ ! -L "$f" ]' in PREPARE  # root never follows a planted link
     assert kw["environment"]["PYTEST_ADDOPTS"].startswith("--junitxml=/tmp/vigil-report/")
     assert kw["mem_limit"] == cfg.vigild.container.verifier_memory
 

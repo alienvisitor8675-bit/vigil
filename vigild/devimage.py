@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -391,6 +392,21 @@ class SessionImages:
         )
 
 
+def docker_cli(cli: str | None = None) -> tuple[str, dict[str, str]]:
+    """The docker CLI and an environment it can run in (phase 2a, item 0).
+
+    Docker Desktop's CLI calls `docker-credential-desktop`, which lives beside
+    the real binary (`~/.docker/bin/docker` is a symlink to it). vigild under
+    launchd, or any bare shell, may not have that directory on PATH; the CLI
+    then fails with "executable file not found". So the CLI's own directory,
+    and the directory it resolves to, go first on PATH."""
+    path = cli or shutil.which("docker") or str(Path.home() / ".docker/bin/docker")
+    dirs = [str(Path(path).parent), str(Path(path).resolve().parent)]
+    rest = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+    env = {**os.environ, "PATH": os.pathsep.join(dict.fromkeys([*dirs, *rest]))}
+    return path, env
+
+
 class DockerImages:
     """The real DockerLike. Builds go through the docker CLI, so they get
     BuildKit (the dev Dockerfiles use heredocs and `COPY --chmod`); they have
@@ -399,7 +415,7 @@ class DockerImages:
 
     def __init__(self, client: Any, cli: str | None = None) -> None:
         self.client = client
-        self.cli = cli or shutil.which("docker") or str(Path.home() / ".docker/bin/docker")
+        self.cli, self.env = docker_cli(cli)
 
     def image_id_of(self, image: str) -> str | None:
         import docker.errors
@@ -437,6 +453,7 @@ class DockerImages:
                 text=True,
                 timeout=timeout_s,
                 check=False,
+                env=self.env,
             )
         except subprocess.TimeoutExpired:
             return False, f"the build took longer than {timeout_s} s"

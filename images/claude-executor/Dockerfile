@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.28.0@sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b
 # The executor layer (coord, worker, reviewer, auditor sessions). linux/arm64.
 #
 # One definition, applied over a base (owner direction, review round 3):

@@ -21,11 +21,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from vigild import config  # noqa: E402
+from vigild.devimage import docker_cli  # noqa: E402
+
+DOCKER, DOCKER_ENV = docker_cli()
 
 
 def run(*cmd: str) -> None:
+    """`docker …` through the CLI vigild uses, with its credential helper on PATH."""
+    if cmd and cmd[0] == "docker":
+        cmd = (DOCKER, *cmd[1:])
     print("+", " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env=DOCKER_ENV)
 
 
 def claude_mods_context(repo: Path, sha: str, dest: Path) -> Path:

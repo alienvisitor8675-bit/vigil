@@ -61,15 +61,47 @@ feature: vigild logs `config: <feature> is off`, `/api/health` lists it in
 | `ANTHROPIC_API_KEY` | The gateway's key for every Claude call: coord, workers, reviewer, auditor, the Haiku decider. | Console → org **vigil** → API keys. It already exists. | Org "vigil" only. Set a Console spend limit at or under the monthly credit; vigild's caps sit below it ($5/day, $2/task, $100/month, `configs/budgets.yaml`). | 1 | `GET /v1/models` → 200 |
 | `GITHUB_APP_ID` | The vigil-worker App's numeric App ID: the `iss` of its JWT. Not secret, but kept with its key. | GitHub → Settings → Developer settings → GitHub Apps → vigil-worker → **App ID**. | — | 1 | `GET /app` → slug `vigil-worker` |
 | `GITHUB_APP_KEY_PATH` | Path to the App's private key, normally `~/.config/vigil/vigil-worker.pem`. | Same page → **Generate a private key**. Save it beside the env file and `chmod 600` it. | Never mounted into any container. | 1 | one installation; mint + revoke a token per repo in `configs/repos.yaml`, and a `contents:read` one on claude-mods |
-| `PHOENIX_SECRET` | Phoenix signs its JWTs with it. | `printf 's%s' "$(openssl rand -hex 24)"` (at least 32 characters, with a digit and a lowercase letter). | Compose only. | 1 | — |
-| `PHOENIX_ADMIN_SECRET` | The collector's bearer token for Phoenix's OTLP endpoint. It acts as Phoenix's first system user. | `printf 'a%s' "$(openssl rand -hex 24)"`. It must differ from `PHOENIX_SECRET`. | Compose only: Phoenix and the collector. | 1 | Phoenix `healthz`, collector port |
+| `PHOENIX_SECRET` | Phoenix signs its JWTs with it. | **You generate it** (below), with the `a1` prefix. | Compose only. | 1 | — |
+| `PHOENIX_ADMIN_SECRET` | The collector's bearer token for Phoenix's OTLP endpoint. It acts as Phoenix's first system user. | **You generate it** (below), with the `a1` prefix. Two runs of the command never give the same value, so it differs from `PHOENIX_SECRET`, which Phoenix requires. | Compose only: Phoenix and the collector. | 1 | Phoenix `healthz`, collector port |
 | `PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD` | Your Phoenix login (user `admin`) on first start. | Choose it. Changing it later has no effect; change the password in Phoenix. | 127.0.0.1 / `tailscale serve` only. | 1 | — |
-| `VIGIL_API_TOKEN` | Admin bearer token for the REST API and the CLI; the one-time login for the web UI. | `openssl rand -hex 32`. | Full control of vigild. | 1 | `GET /api/health` → 200 |
-| `VIGIL_METRICS_TOKEN` | Read-only token: GET endpoints, `/metrics` (phase 3), and a read-only UI login. | `openssl rand -hex 32`. Hand it to Hearth yourself. | Read only. | 1 (reads), 3 (metering) | — |
-| `VIGIL_HEARTBEAT_TOKEN` | Lets an outside session post heartbeats for the UI's `/sessions` page. | `openssl rand -hex 32`. | Write heartbeats; nothing else. | 3 | — |
+| `VIGIL_API_TOKEN` | Admin bearer token for the REST API and the CLI; the one-time login for the web UI. | **You generate it** (below). | Full control of vigild. | 1 | `GET /api/health` → 200 |
+| `VIGIL_METRICS_TOKEN` | Read-only token: GET endpoints, `/metrics` (phase 3), and a read-only UI login. | **You generate it** (below). Hand it to Hearth yourself. | Read only. | 1 (reads), 3 (metering) | — |
+| `VIGIL_HEARTBEAT_TOKEN` | Lets an outside session post heartbeats for the UI's `/sessions` page. | **You generate it** (below). | Write heartbeats; nothing else. | 3 | — |
 | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | Jev on Workers AI (zero retention), the default decider. Without them, Haiku decides. | Cloudflare → My Profile → API Tokens → Custom token: **Account · Workers AI · Read** and **Edit**, that one account. | Workers AI only. | 1 (optional) | reported missing |
 | `OPENROUTER_API_KEY` | The OpenRouter preset and Jev's other route. | openrouter.ai → Keys, with a **credit limit**. | Never for a private repo: vigild refuses to start if `repos.yaml` lists it for one. | 4 | — |
-| `LLAMA_API_KEY` | llama-server's `--api-key`. In **both** the env file and the tower's `/etc/vigil/llama.env`. | `openssl rand -hex 32`. | Tower only, over Tailscale. | 5 | — |
+| `LLAMA_API_KEY` | llama-server's `--api-key`. In **both** the env file and the tower's `/etc/vigil/llama.env`. | **You generate it** (below), then copy the same line to the tower. | Tower only, over Tailscale. | 5 | — |
+
+### Secrets you generate (owner, 2026-10-23)
+
+**You create every self-generated secret yourself; an agent never does.** No
+Claude session (coord, worker, or a build session) generates, prints or
+stores one. One command per variable, which appends a fresh value to the env
+file without showing it:
+
+```sh
+printf 'VIGIL_API_TOKEN=%s\n' "$(openssl rand -hex 32)" >> ~/.config/vigil/env
+```
+
+Do the same for `VIGIL_METRICS_TOKEN`, `VIGIL_HEARTBEAT_TOKEN` and
+`LLAMA_API_KEY`. **Phoenix's two secrets keep a prefix.** Phoenix 20.19.0
+still requires each to be at least 32 characters with at least one digit and
+one lowercase letter (`phoenix.auth.REQUIREMENTS_FOR_PHOENIX_SECRET`, checked
+in the running container on 2026-10-22). 64 hex characters almost always have
+both, but not always, so the `a1` prefix guarantees it:
+
+```sh
+printf 'PHOENIX_SECRET=a1%s\n' "$(openssl rand -hex 32)" >> ~/.config/vigil/env
+printf 'PHOENIX_ADMIN_SECRET=a1%s\n' "$(openssl rand -hex 32)" >> ~/.config/vigil/env
+```
+
+**To rotate one:** delete its line from `~/.config/vigil/env`, run its
+command again, and restart vigild (it reads the file once, at start). For the
+Phoenix secrets, also restart the trace stack
+(`docker compose --env-file ~/.config/vigil/env up -d`); for `LLAMA_API_KEY`,
+copy the new line to the tower's `/etc/vigil/llama.env` and restart
+llama-server. Secrets someone else issues (`ANTHROPIC_API_KEY`, the GitHub
+App's key, the Cloudflare token) rotate where they were issued, then the same
+way: delete the line, add the new one, restart vigild.
 
 Non-secret settings (hosts, ports, image names, the data directory) live in
 `configs/*.yaml`, not here. Langfuse's variables are gone: Phoenix replaced
@@ -136,7 +168,10 @@ status issue (#1), and waits for you.
 - Even so, nothing vigil runs bind-mounts from the repo: the collector's
   config is baked into its image, and vigild's data (`~/vigil-data`: clones,
   session files) lives outside the checkout.
-- The CLI is at `~/.docker/bin/docker`. Put it on `PATH` for launchd jobs.
+- The CLI is at `~/.docker/bin/docker`. vigild and `scripts/build-images.py`
+  put its directory (and the one it links to, where
+  `docker-credential-desktop` lives) first on the docker CLI's `PATH`
+  themselves, so a launchd job or a bare shell needs nothing extra.
 
 ### Build the images
 

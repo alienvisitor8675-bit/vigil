@@ -55,6 +55,7 @@ When a phase adds or bumps a pin, it updates this file in the same PR.
 | Arize Phoenix (self-hosted) | 20.19.0, `arizephoenix/phoenix:version-20.19.0-nonroot@sha256:f2109e09…11c9` (amd64/arm64) | 2026-10-01 | 20.24.0 | trace store (owner decision 2026-10-22) | https://github.com/Arize-ai/phoenix/releases/tag/arize-phoenix-v20.19.0 · https://hub.docker.com/r/arizephoenix/phoenix |
 | OTel Collector Contrib | 0.162.0, `otel/opentelemetry-collector-contrib@sha256:39923a8e…74be6` (arm64) | 2026-09-29 | 0.163.2 | collector | https://github.com/open-telemetry/opentelemetry-collector-releases/releases |
 | smokescreen | v0.1.0 `linux_arm64` tarball, SHA-256 `f15ddd0d…b7c9` (checked by `ADD --checksum`) | 2026-09-21 | same | egress proxy | https://github.com/stripe/smokescreen/releases/tag/v0.1.0 |
+| Dockerfile frontend | `docker/dockerfile:1.28.0@sha256:bb22d981…7e5b` (the image index), the `# syntax=` line of every Dockerfile (phase 2a; `tests/test_pins.py` fails an unpinned one) | 2026-10-07 | same | every image build | https://hub.docker.com/r/docker/dockerfile/tags |
 | Docker Desktop | 4.94.0; the engine here reports 29.9.2 | 2026-10-05 | 4.96.2 | Mac runtime | https://docs.docker.com/desktop/release-notes/ |
 | Langfuse (option, not used) | v4.55.0, for a machine with ~16 GiB for the Docker VM | 2026-10-08 | v4.68.0 | — | https://github.com/langfuse/langfuse/releases |
 | actions/checkout | v7.0.1 `3d3c42e5aac5ba805825da76410c181273ba90b1` | 2026-07-20 | same | CI | https://github.com/actions/checkout/releases |

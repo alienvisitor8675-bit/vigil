@@ -156,6 +156,12 @@ class JobRunner:
         self.deferred: list[str] = []  # approved builds reconcile found, not yet started
         self._running: set[str] = set()
         self._running_lock = threading.Lock()
+        self.closers: list[Callable[[], None]] = []  # e.g. the docker client (item 0)
+
+    def close(self) -> None:
+        for close in self.closers:
+            close()
+        self.closers = []
 
     # --- triggers ---------------------------------------------------------------------
 
