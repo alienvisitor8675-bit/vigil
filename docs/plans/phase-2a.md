@@ -212,6 +212,45 @@ gets its own plan file and done-when.
 - **Verify level 1:** Hypothesis (including stateful tests for the FSM)
   and Schemathesis. SwiftCheck/swift-testing waits on the iOS image
   question.
+- **Per-attempt event sequence** (owner ruling on #14, line 1095): every
+  attempt gets its own event sequence, so the PR footer's event-log range
+  can point at one attempt. Until it exists, the footer shows `pending`.
+- **Context engineering** (owner, 2026-10-23):
+  - **Prefix order:** tools, then system, then the fixed packet, then
+    volatile content.
+    - A cache breakpoint goes after the fixed packet.
+    - Cached and uncached input are metered separately, and each session
+      records its cache-hit rate.
+  - **Research:** a sub-session that returns a summary of at most 2k
+    tokens. The coord plans from the summary. Workers start fresh, with
+    only the spec, the plan and their scoped files.
+  - **Compaction:** at 50% of the context window, the session writes
+    `progress.md` (done, next, decisions) and continues from it in a fresh
+    context. The event log records each compaction.
+  - **Packet budgets per role,** enforced by `packets`:
+    - worker: 30k tokens;
+    - coord: 60k tokens;
+    - reviewer: the diff, the spec and the issue.
+
+    Every packet's token count is logged.
+  - **After phase 5:** research sub-sessions route to the local model by
+    default.
+  - **Baseline: the coord on pa-0002** (ParkAgent #272, 2026-10-23), from
+    its metered calls:
+    - **Shape:** 2 coord sessions, 14 Opus calls, 1.24M input tokens and
+      18.7k output. Session 1 was the first draft, 10 calls. Session 2
+      followed a spec-gate failure, 4 calls.
+    - **Cost:** $1.48 as run. The CLI already caches with 5-minute writes,
+      and every call after the first in each session read the prefix from
+      cache. Uncached, the same calls would have cost $5.34.
+    - **Where the money went:**
+      - Each session's first call wrote a 74–79k-token prefix: $0.40 and
+        $0.38. That's 52% of the $1.48.
+      - A cache breakpoint shared across the two sessions would have
+        turned session 2's write into a read, saving about $0.36 (24%).
+      - A 60k coord budget would also cut both prefix writes.
+    - An earlier attempt of the same job (11 calls) went unmetered because
+      of the migration bug fixed in #16. It isn't in this baseline.
 - **Done-when:**
   - one task is dispatched from a Claude Code session through `vigil mcp`;
   - `vigil kill` works;
