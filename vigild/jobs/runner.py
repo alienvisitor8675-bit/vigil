@@ -43,6 +43,7 @@ from typing import Any, Protocol
 
 from pydantic import ValidationError
 
+from vigild.breakers import CAP_KIND, GLOBAL, Breaker, Breakers, Kind, escalations_today
 from vigild.budget import Budget, BudgetExceeded
 from vigild.config import Config
 from vigild.contract.models import (
@@ -69,7 +70,7 @@ from vigild.jobs.acceptance import check_worker, runner_config_changes
 from vigild.jobs.artifacts import parse_plan, render
 from vigild.jobs.deps import infer_deps, is_lockfile
 from vigild.jobs.fsm import Actor, TransitionError, transition
-from vigild.jobs.model import JobState, Role, SessionRow
+from vigild.jobs.model import FixDepthExceeded, Job, JobState, Role, SessionRow
 from vigild.metering.calls import session_cost
 from vigild.packets.assemble import (
     assemble_audit,
@@ -155,6 +156,7 @@ class JobRunner:
         session_images: SessionImages | None = None,
         background: bool = True,
         reaper: Callable[[], int] | None = None,
+        breakers: Breakers | None = None,
     ) -> None:
         self.cfg = cfg
         self.store = store
@@ -177,6 +179,9 @@ class JobRunner:
         self._running_lock = threading.Lock()
         self.closers: list[Callable[[], None]] = []  # e.g. the docker client (item 0)
         self.ladder = Ladder(store, cfg)
+        # one set of breakers, shared with the gateway (item 4)
+        self.breakers = breakers or Breakers(store, cfg)
+        self.breakers.pager = self._breaker_page
         self._sdk_seen: set[tuple[str, str]] = set()
         self.slots = Slots(cfg.vigild.scheduler.sessions)  # across every job (item 2)
 
@@ -390,6 +395,87 @@ class JobRunner:
 
     # --- helpers ------------------------------------------------------------------------
 
+    # --- circuit breakers (item 4) --------------------------------------------------------
+
+    def _breaker_page(self, job_id: str | None, title: str, body: dict[str, Any]) -> Any:
+        assert self.jobs is not None
+        return self.jobs.page(job_id, title, body)
+
+    def _tree_root(self, job: Job) -> str:
+        root = job
+        while root.parent_job_id:
+            root = self.store.get_job(root.parent_job_id)
+        return root.id
+
+    def _paused(
+        self, job: Job, task: str | None = None, *, building: bool = False
+    ) -> Breaker | None:
+        """An open breaker whose scope covers this job (or task): dispatch
+        pauses. The WIP breaker pauses only builds, which open PRs; a coord
+        drafting or a review goes on."""
+        return self.breakers.blocking(
+            repo=job.repo, task=task, tree=self._tree_root(job), wip=building
+        )
+
+    def _hold_for(self, job_id: str, b: Breaker) -> None:
+        """Pause a job for a breaker: blocked, with no page of its own (the
+        breaker paged once); resetting the breaker resumes it."""
+        self._block(job_id, f"breaker {b.kind.value} ({b.scope})")
+        self.breakers.hold(b, job_id)
+
+    def on_breaker_reset(self, breaker_id: int, item_id: int) -> list[str]:
+        """The owner reset a breaker from the inbox: every job it held goes
+        back to where it was and picks up its work."""
+        resumed = []
+        for job_id in self.breakers.reset(breaker_id):
+            try:
+                job = self.store.get_job(job_id)
+                if job.state is not JobState.BLOCKED or job.blocked_from is None:
+                    continue
+                transition(
+                    self.store, job_id, job.blocked_from, Actor.OWNER, channel="inbox",
+                    evidence={"inbox_item_id": item_id, "action": "resume", "breaker": breaker_id},
+                )  # fmt: skip
+            except TransitionError, KeyError:
+                log.warning("breaker %s: could not resume %s", breaker_id, job_id)
+                continue
+            resumed.append(job_id)
+            self.on_resume(job_id)
+        return resumed
+
+    def _budget_breaker(self, job_id: str, e: BudgetExceeded, task_id: str | None) -> Breaker:
+        """A reservation refused at a cap trips that cap's breaker (B14's hard
+        stops, one page however many jobs hit it)."""
+        kind = CAP_KIND.get(e.cap, Kind.DAILY)
+        if kind is Kind.PER_TASK and task_id:
+            return self.breakers.trip(
+                kind, f"task:{task_id}", {"detail": e.detail}, job_id=job_id,
+                actions=("reset", "replan", "abandon"),
+            )  # fmt: skip
+        return self.breakers.trip(kind, GLOBAL, {"detail": e.detail})
+
+    def _healthy(self, preset: str) -> str | None:
+        """The preset itself, or while its backend breaker is open the first
+        healthy fallback (routing.yaml `fallbacks`); None pauses dispatch."""
+        for p in [preset, *self.cfg.routing.fallbacks.get(preset, [])]:
+            if not self.breakers.is_open(Kind.BACKEND, f"backend:{p}"):
+                return p
+        return None
+
+    def child_job(self, parent_id: str, **kw: Any) -> Job | None:
+        """A child job (a deps job now, a fix job in phase 6). Past depth 3 the
+        job tree's fix-depth breaker trips and no job is made."""
+        parent = self.store.get_job(parent_id)
+        try:
+            return self.store.create_job(parent_job_id=parent_id, **kw)
+        except FixDepthExceeded as e:
+            b = self.breakers.trip(
+                Kind.FIX_DEPTH, f"tree:{self._tree_root(parent)}", {"detail": str(e)},
+                job_id=parent_id,
+            )  # fmt: skip
+            self._hold_for(parent_id, b)
+            return None
+
     def _page(
         self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
     ) -> None:
@@ -572,7 +658,14 @@ class JobRunner:
 
     def run_coord(self, job_id: str) -> None:
         job = self.store.get_job(job_id)
-        preset = self.cfg.routing.coord
+        b = self._paused(job)
+        if b is not None:
+            self._hold_for(job_id, b)
+            return
+        preset = self._healthy(self.cfg.routing.coord)
+        if preset is None:
+            self._hold_for(job_id, self._backend_breaker(self.cfg.routing.coord))
+            return
         try:
             # the repo's dev image must be fresh before any work starts on it;
             # a new lockfile builds one here (owner direction, round 2)
@@ -606,12 +699,7 @@ class JobRunner:
                 )
             except BudgetExceeded as e:
                 self.store.update_session(coord.id, status="refused")
-                self._page(
-                    job_id,
-                    f"{job_id}: {e.cap} cap reached; coord not started",
-                    {"error": str(e)},
-                    resumable=True,
-                )
+                self._hold_for(job_id, self._budget_breaker(job_id, e, None))
                 return
             try:
                 draft = self._coord_attempt(
@@ -864,6 +952,14 @@ class JobRunner:
         wip_held: set[str] = set()
 
         def launch(batch: list[str]) -> dict[str, Callable[[], bool]] | None:
+            for tid in batch:
+                b = self._paused(job, tid, building=True)
+                routed = self.store.get_task(tid).backend_preset or self.cfg.routing.fallback
+                if b is None and self._healthy(routed) is None:
+                    b = self._backend_breaker(routed)  # no healthy backend for it
+                if b is not None:
+                    self._hold_for(job_id, b)
+                    return None
             free = wip.room(self.store, job.repo, limit)
             admitted: list[str] = []
             for tid in batch:
@@ -918,22 +1014,51 @@ class JobRunner:
             self.review(job_id)
 
     def _wip_hold(self, job_id: str, repo: str, waiting: list[str]) -> None:
-        """The repo is at its WIP limit: the job waits, and the inbox shows the
-        stack (design "Intake", rule 2). Merge or close one, then retry."""
+        """The repo is at its WIP limit: its WIP breaker trips (one page, with
+        the stack; design "Intake", rule 2) and the job waits on it. Merge or
+        close one, then reset it from the inbox."""
         limit = self.cfg.budgets.wip_per_repo
-        self._block(job_id, f"WIP limit: {limit} open fleet PRs in {repo}")
-        self._page(
-            job_id,
-            f"{repo}: {limit} open fleet PRs (the WIP limit); {len(waiting)} task(s) wait",
-            {
-                "kind": "wip",
-                "repo": repo,
-                "stack": wip.stack(self.store, repo),
-                "waiting": waiting,
-                "actions": ["retry", "abandon"],
-            },
-            resumable=True,
-        )
+        b = self.breakers.trip(
+            Kind.WIP, f"repo:{repo}",
+            {"limit": limit, "stack": wip.stack(self.store, repo), "waiting": waiting},
+        )  # fmt: skip
+        self._hold_for(job_id, b)
+
+    def _verifier_verdict(self, repo: str, job_id: str, tests: dict[str, Any]) -> None:
+        """M `unknown` verdicts in a row trip the repo's breaker: a broken
+        image or runner, not the worker (item 4). Only runs that couldn't be
+        prepared or run count (exit 125-127, or a signal); a worker whose test
+        is missing or doesn't collect is the worker's failure, not the image's."""
+        runs = [tests.get(r) or {} for r in ("base", "before", "after")]
+        outcomes = [r.get("outcome") for r in runs]
+
+        def broken(r: dict[str, Any]) -> bool:
+            code = r.get("exit")
+            return (
+                r.get("outcome") == "unknown"
+                and isinstance(code, int)
+                and (code in (125, 126, 127) or code >= 128)
+            )
+
+        unknown = any(broken(r) for r in runs if r)
+        if unknown:
+            self.breakers.failure(
+                Kind.VERIFIER_UNKNOWNS, f"repo:{repo}", self.cfg.vigild.breakers.verifier_unknowns,
+                {"job": job_id, "outcomes": outcomes},
+            )  # fmt: skip
+        else:
+            self.breakers.success(Kind.VERIFIER_UNKNOWNS, f"repo:{repo}")
+
+    def _backend_breaker(self, preset: str) -> Breaker:
+        b = self.breakers._row(Kind.BACKEND, f"backend:{preset}")
+        return b or self.breakers.trip(Kind.BACKEND, f"backend:{preset}", {"preset": preset})
+
+    def job_failed(self, job: Job) -> None:
+        """K failed or abandoned jobs in a row trip the repo's breaker (item 4)."""
+        self.breakers.failure(
+            Kind.REPO_FAILURES, f"repo:{job.repo}", self.cfg.vigild.breakers.repo_failures,
+            {"job": job.id},
+        )  # fmt: skip
 
     def remaining(self, task_id: str) -> tuple[float, float, float]:
         """(cap, spent, left) for a task: a retry gets what's left, never a fresh cap."""
@@ -975,7 +1100,8 @@ class JobRunner:
 
     def _hold_failed(self, job_id: str, task_ids: list[str]) -> None:
         """Block the job with one item: retry (when every failed task has budget
-        left), re-plan, or abandon."""
+        left), re-plan, or abandon. It counts toward the repo's failures."""
+        self.job_failed(self.store.get_job(job_id))
         tasks: dict[str, dict[str, Any]] = {}
         can_retry = True
         for tid in task_ids:
@@ -1048,19 +1174,7 @@ class JobRunner:
                     self.budget.settle(rid, 0.0)
                 for t2 in task_ids:
                     self.store.update_task(t2, state="waiting")
-                per_task = e.cap == "per_task"
-                self._page(
-                    job_id,
-                    f"{job_id}: {e.cap} cap reached; dispatch halted",
-                    {
-                        "cap": e.cap,
-                        "detail": e.detail,
-                        "tasks": task_ids,
-                        "actions": ([] if per_task else ["retry"]) + ["replan", "abandon"],
-                    },
-                    resumable=not per_task,
-                )
-                self._block(job_id, f"budget: {e}")
+                self._hold_for(job_id, self._budget_breaker(job_id, e, tid))
                 raise Refused(str(e)) from e
         return held
 
@@ -1108,7 +1222,16 @@ class JobRunner:
         job = self.store.get_job(job_id)
         t = self.store.get_task(task_id)
         contract = t.contract
-        preset = t.backend_preset or self.cfg.routing.fallback
+        routed = t.backend_preset or self.cfg.routing.fallback
+        healthy = self._healthy(routed)
+        if healthy is None:
+            self.budget.settle(reservation, 0.0)
+            self._hold_for(job_id, self._backend_breaker(routed))
+            return self._fail(
+                job_id, None, task_id, f"{task_id}: no healthy backend", {"preset": routed},
+                state="waiting",
+            )  # fmt: skip
+        preset = healthy  # the route falls to the next preset while a backend's breaker is open
         branch = contract["branch"]
         prev = self._last_worker(task_id)
         s = self.store.create_session(
@@ -1340,6 +1463,7 @@ class JobRunner:
             self.store.add_artifact(
                 job_id, "tests.json", json.dumps(tests), Provenance.HUMAN, task_id=task_id
             )
+            self._verifier_verdict(job.repo, job_id, tests)
         # the report keeps its narrative; its test fields are the verifier's
         report = report.model_copy(
             update={
@@ -1454,6 +1578,10 @@ class JobRunner:
         job = self.store.get_job(job_id)
         if job.state is not JobState.IN_REVIEW:
             return
+        b = self._paused(job)
+        if b is not None:
+            self._hold_for(job_id, b)
+            return
         tasks = [t for t in self.store.list_tasks(job_id) if t.state == "pr_open"]
         with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as pool:
             outcomes = dict(zip(
@@ -1462,6 +1590,10 @@ class JobRunner:
                 strict=True,
             ))  # fmt: skip
         failed = {tid: why for tid, (kind, why) in outcomes.items() if kind == "failed"}
+        b = self._paused(job)
+        if failed and b is not None:
+            self._hold_for(job_id, b)  # a cap tripped mid-review: wait on its breaker
+            return
         if failed:
             self._block(job_id, f"review failed: {sorted(failed)}")
             self._page(
@@ -1501,6 +1633,7 @@ class JobRunner:
             self.dispatch(job_id)
             return
         transition(self.store, job_id, JobState.READY, Actor.VIGILD)
+        self.breakers.success(Kind.REPO_FAILURES, f"repo:{job.repo}")
         self._ready(job_id)
 
     def _ready(self, job_id: str) -> None:
@@ -1668,6 +1801,11 @@ class JobRunner:
                  "tier_reason": r.tier_reason},
                 Provenance.HUMAN, job_id=job_id, task_id=task_id,
             )  # fmt: skip
+            most = self.cfg.vigild.breakers.max_escalations_per_day
+            if escalations_today(self.store) > most:
+                self.breakers.trip(
+                    Kind.ESCALATIONS, GLOBAL, {"today": escalations_today(self.store), "max": most}
+                )
 
     def _ladder_page(self, change: LadderChange) -> None:
         """You see every promotion and demotion (design, trust ladder)."""
@@ -1708,6 +1846,8 @@ class JobRunner:
             )
         except (RepoPolicyError, BudgetExceeded) as e:
             self.store.update_session(s.id, status="refused")
+            if isinstance(e, BudgetExceeded):
+                self._budget_breaker(job.id, e, None)
             return None, str(e)
         clone_id = f"{t.id}-{role.value}{rnd}"
         try:

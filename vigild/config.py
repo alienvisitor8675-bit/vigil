@@ -92,6 +92,9 @@ class Routing(_M):
     xs_labels: list[str]
     escalate_attempt: int = 3
     escalate_review_rounds: int = 2
+    # Where a preset's work goes while its backend breaker is open (plan 2a,
+    # item 4), in order. A preset with no healthy fallback pauses dispatch.
+    fallbacks: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class Budgets(_M):
@@ -223,6 +226,16 @@ class Scheduler(_M):
     resume_attempts: int = Field(default=2, ge=0)  # crash resumes per task
 
 
+class BreakerLimits(_M):
+    """Circuit breakers (plan 2a, item 4; vigild/breakers.py)."""
+
+    backend_errors: int = Field(default=3, ge=1)  # 5xx or timeouts in a row
+    backend_cooldown_seconds: int = Field(default=300, ge=1)  # then one half-open probe
+    repo_failures: int = Field(default=3, ge=1)  # failed or abandoned jobs in a row
+    verifier_unknowns: int = Field(default=3, ge=1)  # `unknown` verdicts in a row
+    max_escalations_per_day: int = Field(default=5, ge=0)
+
+
 class Vigild(_M):
     data_dir: str
     api: Bind
@@ -233,6 +246,7 @@ class Vigild(_M):
     github: GitHub
     container: ContainerLimits
     scheduler: Scheduler = Field(default_factory=Scheduler)
+    breakers: BreakerLimits = Field(default_factory=BreakerLimits)
 
     @property
     def data_path(self) -> Path:
@@ -294,6 +308,10 @@ def validate(cfg: Config) -> None:
     for role in ("fallback", "coord", "reviewer", "auditor"):
         if getattr(cfg.routing, role) not in presets:
             raise ConfigError(f"routing.{role} names an unknown preset")
+    for preset, falls in cfg.routing.fallbacks.items():
+        for name in (preset, *falls):
+            if name not in presets:
+                raise ConfigError(f"routing.fallbacks names an unknown preset {name}")
     for name, route in cfg.backends.decider_routes.items():
         if route.preset and route.preset not in presets:
             raise ConfigError(f"decider route {name} names unknown preset {route.preset}")

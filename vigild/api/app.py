@@ -240,6 +240,18 @@ def rebuild(request: Request, item_id: int) -> dict[str, Any]:
     return {"item_id": item_id, "status": "rebuilding"}
 
 
+@router.post("/api/inbox/{item_id}/reset", dependencies=[ADMIN])
+def reset(request: Request, item_id: int) -> dict[str, Any]:
+    """Reset a tripped circuit breaker; the jobs it paused resume."""
+    try:
+        resumed = _svc(request).jobs.reset(item_id)
+    except NotFound as e:
+        raise HTTPException(404, "no such inbox item") from e
+    except Conflict as e:
+        raise HTTPException(409, str(e)) from e
+    return {"item_id": item_id, "status": "reset", "resumed": resumed}
+
+
 @router.post("/api/inbox/{item_id}/dismiss", dependencies=[ADMIN])
 def dismiss(request: Request, item_id: int) -> dict[str, Any]:
     try:

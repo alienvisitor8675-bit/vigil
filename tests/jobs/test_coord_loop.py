@@ -745,8 +745,11 @@ def test_resume_after_the_cap_redispatches(world: World) -> None:  # item 18
         for p in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
         if "cap" in p["title"]
     )
-    r = w.client.post(f"/api/inbox/{page['id']}/resume", headers=auth(w.tokens.admin))
+    # phase 2a, item 4: the cap is a breaker; resetting it resumes the jobs it held
+    assert page["body"]["kind"] == "breaker" and page["body"]["breaker_kind"] == "daily_cap"
+    r = w.client.post(f"/api/inbox/{page['id']}/reset", headers=auth(w.tokens.admin))
     assert r.status_code == 200, r.text
+    assert r.json()["resumed"] == [job]
     assert w.store.get_job(job).state.value == "ready"
     assert len(w.publisher.prs) == 2
 
@@ -844,7 +847,7 @@ def _spend(w: World, amount_out_tokens: int) -> Callable[[SessionSpec], None]:
     return spend
 
 
-def _failure_item(w: World, job: str, kind: str = "worker_failed") -> dict[str, Any]:
+def _failure_item(w: World, job: str | None, kind: str = "worker_failed") -> dict[str, Any]:
     items = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
     (item,) = [q for q in items if q["job_id"] == job and q["body"].get("kind") == kind]
     return item  # type: ignore[no-any-return]

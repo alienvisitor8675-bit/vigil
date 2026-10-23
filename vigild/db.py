@@ -54,6 +54,12 @@ TRANSCRIPT_DDL = f"""CREATE TABLE IF NOT EXISTS transcripts (
   subpath TEXT, entry TEXT NOT NULL, ts TEXT NOT NULL, {PROV});
 CREATE INDEX IF NOT EXISTS transcripts_session ON transcripts(session_id, id)"""
 
+BREAKER_DDL = """CREATE TABLE IF NOT EXISTS breakers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, scope TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('closed','open','half_open')), count INTEGER NOT NULL,
+  item_id INTEGER, held TEXT NOT NULL, detail TEXT NOT NULL, reopen_at TEXT,
+  updated_at TEXT NOT NULL, UNIQUE (kind, scope))"""
+
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY, repo TEXT NOT NULL, base TEXT NOT NULL, title TEXT NOT NULL,
@@ -117,6 +123,7 @@ CREATE TABLE IF NOT EXISTS ui_sessions (
 {LADDER_DDL};
 {INTAKE_DDL};
 {TRANSCRIPT_DDL};
+{BREAKER_DDL};
 CREATE INDEX IF NOT EXISTS events_job ON events(job_id, id);
 CREATE INDEX IF NOT EXISTS calls_session ON model_calls(session_id);
 CREATE INDEX IF NOT EXISTS res_day ON reservations(day, status);
@@ -174,6 +181,11 @@ def _m6_transcripts(conn: sqlite3.Connection) -> None:
     _create(conn, TRANSCRIPT_DDL)
 
 
+def _m7_breakers(conn: sqlite3.Connection) -> None:
+    """Phase 2a, item 4: one table for every circuit breaker."""
+    _create(conn, BREAKER_DDL)
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
@@ -181,6 +193,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m4_trust_ladder,
     _m5_label_intake,
     _m6_transcripts,
+    _m7_breakers,
 ]
 
 

@@ -89,6 +89,9 @@ def build(
     store = Store.open(data / "vigil.db")
     budget = Budget(store, cfg.budgets)
     gateway = Gateway(cfg, store, budget, secrets, **gateway_kwargs)
+    from vigild.breakers import Breakers
+
+    gateway.breakers = Breakers(store, cfg)  # shared with the runner (item 4)
     off = degraded(secrets)
     telemetry = Telemetry(None if "tracing" in off else cfg.vigild.collector.otlp_http)
     tokens = Tokens(
@@ -199,6 +202,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         Verifier(ws, tests),
         reaper=runtime.reap,
         session_images=sessions,
+        breakers=v.gateway.breakers,
     )
     runner.closers.append(client.close)
     images.on_failure = runner.dev_image_failed

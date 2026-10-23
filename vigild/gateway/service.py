@@ -210,6 +210,25 @@ class Gateway:
         self.async_client = httpx2.AsyncClient(transport=async_transport, timeout=UPSTREAM_TIMEOUT)
         self._inflight: dict[str, float] = {}
         self._inflight_lock = threading.Lock()
+        # vigild's circuit breakers (plan 2a, item 4): every upstream answer
+        # counts for or against the preset's backend breaker
+        self.breakers: Any = None
+
+    def _upstream(self, preset_name: str, ok: bool, detail: str = "") -> None:
+        """N 5xx or timeouts in a row trip the preset's backend breaker; any
+        other answer ends the run (and closes a half-open one)."""
+        if self.breakers is None:
+            return
+        from vigild.breakers import Kind
+
+        scope = f"backend:{preset_name}"
+        if ok:
+            self.breakers.success(Kind.BACKEND, scope)
+        else:
+            self.breakers.failure(
+                Kind.BACKEND, scope, self.cfg.vigild.breakers.backend_errors,
+                {"preset": preset_name, "error": detail[:300]},
+            )  # fmt: skip
 
     # --- tokens -------------------------------------------------------------------
 
@@ -447,9 +466,14 @@ class Gateway:
             )
             started = time.monotonic()
             resp = await self.async_client.send(req, stream=True)
+        except httpx2.TransportError as e:  # a timeout or a dropped connection
+            self.release(hold)
+            self._upstream(gs.preset, False, type(e).__name__)
+            raise
         except BaseException:
             self.release(hold)
             raise
+        self._upstream(gs.preset, resp.status_code < 500, f"HTTP {resp.status_code}")
         ctype = resp.headers.get("content-type", "")
         out_headers = {"content-type": ctype} if ctype else {}
         if path in FREE_PATHS:
@@ -582,11 +606,16 @@ class Gateway:
             raise GatewayError(403, "permission_error", str(e)) from e
         started = time.monotonic()
         try:
-            resp = self.sync_client.post(
-                p.base_url.rstrip("/") + "/v1/messages",
-                headers=self._headers({}, self._key(p)),
-                content=raw,
-            )
+            try:
+                resp = self.sync_client.post(
+                    p.base_url.rstrip("/") + "/v1/messages",
+                    headers=self._headers({}, self._key(p)),
+                    content=raw,
+                )
+            except httpx2.TransportError as e:
+                self._upstream(preset, False, type(e).__name__)
+                raise
+            self._upstream(preset, resp.status_code < 500, f"HTTP {resp.status_code}")
             payload: dict[str, Any] = resp.json()
             if resp.status_code != 200:
                 raise GatewayError(

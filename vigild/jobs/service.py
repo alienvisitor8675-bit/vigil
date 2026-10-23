@@ -480,7 +480,27 @@ class JobService:
             for other in self.store.list_inbox():
                 if other.job_id == job.id and other.queue == "questions":
                     self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
+        failed = getattr(self.runner, "job_failed", None)
+        if failed is not None:
+            failed(job)  # an abandoned job counts toward the repo's breaker (item 4)
         return job
+
+    def reset(self, item_id: int) -> list[str]:
+        """Reset a tripped circuit breaker (plan 2a, item 4): it closes, and
+        the jobs it paused resume. Returns their ids."""
+        with self.store.tx():
+            item = self._question(item_id)
+            if item.body.get("kind") != "breaker" or "reset" not in (
+                item.body.get("actions") or []
+            ):
+                raise Conflict(f"inbox item {item_id} doesn't offer reset")
+            self.store.add_event(
+                "reset", {"inbox_item_id": item_id, "breaker": item.body.get("breaker")},
+                Provenance.HUMAN, job_id=item.job_id,
+            )  # fmt: skip
+            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+        reset = getattr(self.runner, "on_breaker_reset", None)
+        return list(reset(int(item.body["breaker"]), item_id)) if reset else []
 
     def rebuild(self, item_id: int) -> None:
         """Build and validate a repo's failed dev image again (round 2)."""

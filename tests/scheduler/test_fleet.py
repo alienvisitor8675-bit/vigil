@@ -123,13 +123,15 @@ def test_a_fifth_pr_waits(world: World) -> None:
     assert len(w.publisher.prs) == 4
     waiting = [t.id for t in w.store.list_tasks(job) if t.state == "waiting"]
     assert len(waiting) == 1
-    item = _failure_item(w, job, "wip")
-    assert item["body"]["waiting"] == waiting
-    assert len(item["body"]["stack"]) == 4
-    assert all(x["pr_url"] for x in item["body"]["stack"])
-    # one merges (vigild sees it through its PR poll, item 5); retry runs the fifth
+    # the repo's WIP breaker (item 4) pages once, with the stack waiting on you
+    item = _failure_item(w, None, "breaker")
+    assert item["body"]["breaker_kind"] == "wip"
+    assert item["body"]["detail"]["waiting"] == waiting
+    assert len(item["body"]["detail"]["stack"]) == 4
+    assert all(x["pr_url"] for x in item["body"]["detail"]["stack"])
+    # one merges (vigild sees it through its PR poll, item 5); a reset runs the fifth
     merged = next(t.id for t in w.store.list_tasks(job) if t.state == "pr_open")
     w.store.update_task(merged, state="merged")
-    r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
+    r = w.client.post(f"/api/inbox/{item['id']}/reset", headers=auth(w.tokens.admin))
     assert r.status_code == 200, r.text
     assert len(w.publisher.prs) == 5

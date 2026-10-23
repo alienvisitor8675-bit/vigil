@@ -293,8 +293,16 @@ uv run python -m vigild
   that to the Mac's loopback.
 - **The fleet** (`scheduler` in `configs/vigild.yaml`): three sessions at
   once across every job; four open fleet PRs per repo (`wip_per_repo` in
-  `configs/budgets.yaml`). At the limit a job blocks with a page listing
-  the stack: merge or close one, then press **Retry**.
+  `configs/budgets.yaml`). At the limit the repo's WIP breaker pages
+  once, listing the stack: merge or close one, then press **Reset**.
+- **Circuit breakers** (`breakers` in `configs/vigild.yaml`). Each pages
+  once, as "breaker tripped: <kind> (<scope>)", and pauses dispatch for
+  its scope: the day's or month's cap, a task's cap, the WIP limit,
+  escalations per day, fix-job depth, a backend's errors, a repo's failed
+  jobs, the verifier's unknowns. Fix the cause, then press **Reset**: the
+  jobs it held resume. A backend breaker also closes itself after a
+  successful probe five minutes on; meanwhile its work goes to the
+  preset's fallback in `configs/routing.yaml`.
 - **Label intake** is off until a repo says `intake: true` in
   `configs/repos.yaml`. Then every five minutes vigild turns each open
   issue labelled `vigil:ready` into a job, once; `value:N` and `risk:N`
