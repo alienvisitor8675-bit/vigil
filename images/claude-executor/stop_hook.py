@@ -10,11 +10,12 @@ A worker may stop only when:
   file is trusted: the hook runs the test itself.
 
 A worker that asks its coord (`ask_coord.json`) or reports `needs_deps` may
-stop without a green test. The hook lets the stop through after the task's
-turn limit, or after three blocked stops, and says `stop_hook_exhausted`,
-which the harness puts on the result. It decides nothing about acceptance:
-the verifier stays the only source of test results (B33). Coords, reviewers
-and auditors are never held.
+stop without a green test. The hook lets the stop through on the task's last
+turn (a block there only ends in the max-turns error), or after three
+blocked stops, and says `stop_hook_exhausted`, which the harness puts on
+the result. It decides nothing about acceptance: the verifier stays the
+only source of test results (B33). Coords, reviewers and auditors are never
+held.
 """
 
 from __future__ import annotations
@@ -48,10 +49,15 @@ def block(reason: str, state: dict[str, Any]) -> int:
 
 
 def turns_used(transcript: str | None) -> int:
-    """The session's assistant turns so far, from its own transcript."""
+    """The session's turns so far, from its own transcript: its assistant
+    messages, or its model requests if that is more. CLI 2.1.306 writes the
+    turn's assistant entry only after the Stop hook runs, but its `api-request`
+    line before (seen live). A side request counted too only releases the
+    hook a turn early; the verifier decides acceptance either way."""
     if not transcript:
         return 0
     ids: set[str] = set()
+    requests = 0
     try:
         lines = Path(transcript).read_text(errors="replace").splitlines()
     except OSError:
@@ -61,10 +67,14 @@ def turns_used(transcript: str | None) -> int:
             e = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(e, dict) and e.get("type") == "assistant":
+        if not isinstance(e, dict):
+            continue
+        if e.get("type") == "assistant":
             msg = e.get("message") or {}
             ids.add(str(msg.get("id") or e.get("uuid")))
-    return len(ids)
+        elif e.get("type") == "api-request":
+            requests += 1
+    return max(len(ids), requests)
 
 
 TYPES: dict[str, Any] = {
@@ -142,8 +152,10 @@ def main() -> int:
     if int(state.get("blocks", 0)) >= MAX_BLOCKS:
         return allow(f"vigil: stop allowed after {MAX_BLOCKS} blocked stops (stop_hook_exhausted)")
     limit = int(os.environ.get("VIGIL_MAX_TURNS", "60"))
-    if turns_used(hook.get("transcript_path")) >= limit:
-        return allow(f"vigil: stop allowed at the turn limit, {limit} (stop_hook_exhausted)")
+    # a block buys one more turn; on the last one it only ends in the CLI's
+    # max-turns error, and the session's result is lost
+    if turns_used(hook.get("transcript_path")) + 1 >= limit:
+        return allow(f"vigil: stop allowed on the last turn of {limit} (stop_hook_exhausted)")
     try:
         task = json.loads((WORK / ".vigil" / "task.json").read_text())
     except OSError, json.JSONDecodeError:

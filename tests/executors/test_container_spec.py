@@ -286,3 +286,54 @@ def test_a_deps_container_reaches_the_registries_only(cfg: Config, tmp_path: Pat
     env = kw["environment"]
     assert not any("TOKEN" in k or "KEY" in k or "ANTHROPIC" in k for k in env)
     assert env["HTTPS_PROXY"].startswith("http://egress:")
+
+
+def test_a_finished_log_stream_is_closed(cfg: Config, tmp_path: Path) -> None:
+    """Phase 2a, item 0: an unclosed stream's response, or the attach
+    socket's, printed "I/O operation on closed file" when garbage-collected."""
+    from vigild.executors.runtime import DockerTestRunner
+
+    closed: list[bool] = []
+
+    class Stream:
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            yield b"ok\n"
+
+        def close(self) -> None:
+            closed.append(True)
+
+    class Response:
+        def close(self) -> None:
+            closed.append(True)
+
+    class Sock:
+        _response = Response()
+
+        def sendall(self, data: bytes) -> None: ...
+
+        def shutdown(self, how: int) -> None: ...
+
+        def close(self) -> None: ...
+
+    class Container:
+        def attach_socket(self, **kw: object) -> Sock:
+            return Sock()
+
+        def start(self) -> None: ...
+
+        def logs(self, **kw: object) -> Stream:
+            return Stream()
+
+        def wait(self) -> dict[str, int]:
+            return {"StatusCode": 0}
+
+        def remove(self, **kw: object) -> None: ...
+
+    class Client:
+        class containers:
+            @staticmethod
+            def create(**kw: object) -> Container:
+                return Container()
+
+    DockerTestRunner(cfg, Client()).run("img", tmp_path, "true", timeout_s=5, max_output=1000)
+    assert closed == [True, True]  # the attach response, then the log stream

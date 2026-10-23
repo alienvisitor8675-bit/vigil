@@ -46,6 +46,9 @@ def _run(v: Vigild, runtime: DockerRuntime, spec: SessionSpec) -> tuple[ExecOutc
         for r in v.store.q("SELECT cost_usd FROM model_calls WHERE session_id=?", (sess.id,))
     )
     print(f"{spec.role.value}: ${spend:.5f}; {json.dumps(out.result)[:600]}; err={out.error}")
+    for e in events:
+        if e["type"] == "stop_hook":
+            print("stop_hook:", json.dumps(e["data"])[:600])
     return out, events
 
 

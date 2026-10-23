@@ -324,13 +324,16 @@ class DockerTestRunner:
             raw.sendall((marker + "\n").encode())
             with suppress(OSError):
                 raw.shutdown(socket.SHUT_WR)
-            sock.close()
+            _close_attach(sock)
             timer.start()
-            for chunk in c.logs(stream=True, follow=True, stdout=True, stderr=True):
-                seen += len(chunk)
-                buf += chunk
-                if len(buf) > max_output:
-                    del buf[: len(buf) - max_output]  # keep the tail
+            # closed when done: an open stream's response is finalised at exit,
+            # after stderr closes ("I/O operation on closed file", item 0)
+            with _closed(c.logs(stream=True, follow=True, stdout=True, stderr=True)) as stream:
+                for chunk in stream:
+                    seen += len(chunk)
+                    buf += chunk
+                    if len(buf) > max_output:
+                        del buf[: len(buf) - max_output]  # keep the tail
             code = int(c.wait().get("StatusCode", -1))
         finally:
             timer.cancel()
@@ -362,6 +365,31 @@ def write_session_files(cfg: Config, spec: SessionSpec) -> None:
         p.chmod(0o755)
     for f in (sd / "packet.md", sd / "proxy" / "acl.yaml", sd / "proxy" / "config.yaml"):
         f.chmod(0o644)
+
+
+def _close_attach(sock: Any) -> None:
+    """Close an attach socket and the HTTP response docker-py keeps on it;
+    left to the garbage collector, the response flushes a closed file."""
+    response = getattr(sock, "_response", None)
+    with suppress(Exception):
+        sock.close()
+    if response is not None:
+        with suppress(Exception):
+            response.close()
+
+
+@contextmanager
+def _closed(stream: Any) -> Iterator[Any]:
+    """A docker log stream, closed when done: an open one's response is
+    finalised at exit, after stderr closes, and prints "I/O operation on
+    closed file" (phase 2a, item 0)."""
+    try:
+        yield stream
+    finally:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            with suppress(Exception):
+                close()
 
 
 def _docker_mounts(raw: list[dict[str, Any]]) -> list[Any]:
@@ -427,7 +455,7 @@ class DockerRuntime:
                 raw_sock.sendall((json.dumps({"gateway_token": gateway_token}) + "\n").encode())
                 with suppress(OSError):
                     raw_sock.shutdown(socket.SHUT_WR)
-                sock.close()
+                _close_attach(sock)
                 return self._follow(worker, spec, on_event)
             finally:
                 with suppress(docker.errors.APIError):
@@ -516,22 +544,25 @@ class DockerRuntime:
         result: dict[str, Any] = {}
         buf = b""
         try:
-            for chunk in worker.logs(stream=True, follow=True, stdout=True, stderr=False):
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if "vigil_event" in msg:
-                        on_event(msg["vigil_event"])
-                    elif "vigil_transcript" in msg:
-                        on_event({"type": "transcript", "data": msg["vigil_transcript"]})
-                    elif "vigil_checkpoint" in msg:
-                        on_event({"type": "checkpoint", "data": msg["vigil_checkpoint"]})
-                    elif "vigil_result" in msg:
-                        result = msg["vigil_result"]
+            with _closed(
+                worker.logs(stream=True, follow=True, stdout=True, stderr=False)
+            ) as stream:
+                for chunk in stream:
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        try:
+                            msg = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if "vigil_event" in msg:
+                            on_event(msg["vigil_event"])
+                        elif "vigil_transcript" in msg:
+                            on_event({"type": "transcript", "data": msg["vigil_transcript"]})
+                        elif "vigil_checkpoint" in msg:
+                            on_event({"type": "checkpoint", "data": msg["vigil_checkpoint"]})
+                        elif "vigil_result" in msg:
+                            result = msg["vigil_result"]
             code = int(worker.wait().get("StatusCode", -1))
         finally:
             timer.cancel()

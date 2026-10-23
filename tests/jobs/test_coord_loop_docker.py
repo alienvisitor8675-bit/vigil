@@ -55,9 +55,11 @@ def live(
     cfg.routing.coord = cfg.routing.fallback = "claude-haiku"
     cfg.budgets.coord_session_usd = 0.30
     cfg.budgets.per_task_usd = 0.30
+    cfg.budgets.review_session_usd = 0.50
+    cfg.budgets.audit_session_usd = 0.90
     cfg.repos.repos[REPO] = RepoPolicy(
         decider=["haiku"],
-        backends=["claude-haiku"],
+        backends=["claude-haiku", "claude-sonnet", "claude-opus"],  # review, audit
         dev_dockerfile="images/dev/fixture.Dockerfile",
         dev_lockfiles=["README.md"],
         dev_suites={"smoke": "python -m pytest --version"},
@@ -174,8 +176,11 @@ def test_two_workers_build_in_their_own_containers(
     print("workers:", [(w["id"], w["status"], w["pr_url"]) for w in workers])
     assert len(workers) == 2
     assert all(w["status"] == "pr_open" for w in workers)
-    assert tree["job"]["state"] == "in_review"
+    # phase 2a: each PR reviewed (Sonnet) and audited (Opus, rung 0), then ready
+    assert tree["job"]["state"] == "ready", inbox["questions"]
+    for w in workers:
+        assert v.store.get_artifact(tree["job"]["id"], "review.json", w["task_id"]) is not None
     for p in publisher.prs:
         files = git(fixture_repo["bare"], "ls-tree", "-r", "--name-only", p["head"])
         assert "worker_report.json" in files
-    assert spend() < 1.0
+    assert spend() < 1.5

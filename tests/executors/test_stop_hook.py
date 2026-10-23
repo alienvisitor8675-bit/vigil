@@ -102,6 +102,32 @@ def test_the_turn_limit_releases_it(work: Path) -> None:
     assert "decision" not in out and "stop_hook_exhausted" in out["systemMessage"]
 
 
+def test_the_last_turn_releases_it(work: Path) -> None:
+    """A block on the last turn only ends in the CLI's max-turns error, which
+    loses the session's result (found by the guard container test, which
+    runs with three turns)."""
+    out = _stop(work, turns=2, max_turns=3)
+    assert "decision" not in out and "stop_hook_exhausted" in out["systemMessage"]
+    assert _stop(work, turns=1, max_turns=3)["decision"] == "block"
+
+
+def test_turns_count_the_cli_s_model_requests(work: Path) -> None:
+    """CLI 2.1.306 writes the turn's assistant entry after the Stop hook runs;
+    at that point the transcript holds one `api-request` line per model call
+    (seen live, phase 2a). Two requests are the second of three turns."""
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location("stop_hook", HOOK)
+    assert spec is not None and spec.loader is not None
+    hook = module_from_spec(spec)
+    spec.loader.exec_module(hook)
+    t = work.parent / "cli.jsonl"
+    kinds = ["queue-operation", "user", "attachment", "api-request-shape", "api-request",
+             "last-prompt", "assistant", "user", "api-request-blob", "api-request"]  # fmt: skip
+    t.write_text("".join(json.dumps({"type": k, "message": {"id": "m0"}}) + "\n" for k in kinds))
+    assert hook.turns_used(str(t)) == 2
+
+
 def test_asking_the_coord_or_needing_a_dependency_may_stop(work: Path) -> None:
     (work / ".vigil" / JOB / TASK / "ask_coord.json").write_text('{"question": "?"}')
     assert _stop(work) == {}
