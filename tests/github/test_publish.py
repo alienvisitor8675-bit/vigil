@@ -150,3 +150,43 @@ def test_the_pr_poll_reads_only_the_repos_own_prs() -> None:
 
     with pytest.raises(PublishError):
         GitHubPRs(app=None).state("o/x", "https://github.com/o/other/pull/1")
+
+
+def test_closing_a_pr_patches_its_state_with_a_one_repo_write_token() -> None:
+    """Owner ruling 3: vigild closes a deps PR whose review failed."""
+    import json
+
+    import httpx2
+
+    from vigild.github.app import InstallationToken
+    from vigild.github.publish import PublishError
+    from vigild.jobs.runner import GitHubPublisher
+
+    seen: list[httpx2.Request] = []
+
+    def handler(req: httpx2.Request) -> httpx2.Response:
+        seen.append(req)
+        return httpx2.Response(200, json={"state": "closed"})
+
+    leased: list[tuple[str, dict[str, str]]] = []
+
+    class App:
+        from contextlib import contextmanager
+
+        @contextmanager
+        def lease(self, repo: str, perms: dict[str, str]):  # type: ignore[no-untyped-def]
+            leased.append((repo, perms))
+            yield InstallationToken(repo, perms, "z", "ghs_w")
+
+    pub = GitHubPublisher(App(), httpx2.Client(transport=httpx2.MockTransport(handler)), None)  # type: ignore[arg-type]
+    pub.close("o/fixture", "https://github.com/o/fixture/pull/7")
+    (req,) = seen
+    assert req.method == "PATCH" and req.url.path == "/repos/o/fixture/pulls/7"
+    assert json.loads(req.content) == {"state": "closed"}
+    assert leased == [("o/fixture", {"pull_requests": "write"})]
+    try:
+        pub.close("o/fixture", "https://github.com/other/repo/pull/7")
+    except PublishError:
+        pass
+    else:
+        raise AssertionError("a PR of another repo was closed")

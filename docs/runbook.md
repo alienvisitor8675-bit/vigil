@@ -74,15 +74,30 @@ feature: vigild logs `config: <feature> is off`, `/api/health` lists it in
 ### The decider: Jev (owner, 2026-10-23)
 
 - **Routes.** A repo's `decider:` lists `jev`: Jev on OpenRouter while the
-  repo is public, on Cloudflare while it's private (read live, every call;
-  unreadable means private). Haiku is the escalation where it's allowed.
+  repo is public, on Cloudflare while it's private (read live, once per
+  decision; unreadable, or anything but a plain true/false from GitHub,
+  means private). Haiku is the escalation where it's allowed.
+- **Answers.** A `choice` gives the option and every option's probability, a
+  `score` a number on 1-5, a `noul` yes/no with the probability of yes; the
+  thresholds (act at 0.85, escalate at 0.6) read that probability, so a sure
+  "no" waits for you. `GET /api/decider/report` shows, per question type, how
+  confident the answers are and how many went to Haiku; read it after the
+  first 50 real ParkAgent decisions before changing a threshold.
 - **Cloudflare credit.** Cloudflare bills Jev through AI Gateway credit:
   $0.042 per million input tokens, output free, plus a 5% fee when you buy
   credit (vigild meters $0.0441/M). When the credit runs out Cloudflare
   answers error 2021, "Insufficient balance": vigild trips the
-  `decider_credit` breaker and pages "breaker tripped: decider_credit
-  (route:jev-cloudflare)". Buy credit in the Cloudflare dashboard (AI
-  Gateway), then press **Reset**; until then that route is off.
+  `decider_credit` breaker and pages once, "Cloudflare Jev credit is empty
+  (2021); decisions now on Haiku fallback" (or "waiting for the owner"). Buy
+  credit in the Cloudflare dashboard (AI Gateway), then press **Reset**; until
+  then that route is off and Haiku's answers count as fallback.
+- **Fallback cap.** Haiku answers that stand in for Jev (drift, failure,
+  credit) are capped at $1 per repo per UTC day
+  (`decider_fallback_per_repo_usd` in `configs/budgets.yaml`). Jev costs
+  cents a day, so crossing a dollar means it has drifted or is failing: the
+  call is refused before it is sent, and "breaker tripped:
+  decider_fallback_cap (repo:<repo>)" holds that repo's dispatch. Look at
+  the Jev pages, then press **Reset**.
 - **Version pin.** Each Jev route has a `version_pin` in
   `configs/backends.yaml` (Cloudflare `jev-1.13.0`, OpenRouter
   `typesafe/jev-1.13-20260917`). A reply with another version, or none, pages
@@ -280,7 +295,10 @@ uv run python cli/vigil doctor
 ```
 
 It prints one `pass`, `fail` or `skip` line per check, never a value. Add
-`--repo <owner/name>` to limit the token checks to some repos.
+`--repo <owner/name>` to limit it to some repos: it then makes no call about
+any other repo (no token, no visibility read), and lists each of them as
+`decider: <repo> (not checked: not selected)`. A build session always passes
+`--repo thomasbardhi01/vigil`.
 
 ### Start vigild
 
@@ -326,12 +344,23 @@ uv run python -m vigild
   once, listing the stack: merge or close one, then press **Reset**.
 - **Circuit breakers** (`breakers` in `configs/vigild.yaml`). Each pages
   once, as "breaker tripped: <kind> (<scope>)", and pauses dispatch for
-  its scope: the day's or month's cap, a task's cap, the WIP limit,
-  escalations per day, fix-job depth, a backend's errors, a repo's failed
-  jobs, the verifier's unknowns. Fix the cause, then press **Reset**: the
-  jobs it held resume. A backend breaker also closes itself after a
-  successful probe five minutes on; meanwhile its work goes to the
-  preset's fallback in `configs/routing.yaml`.
+  its scope: the day's or month's cap (once metered spend reaches it), a
+  task's cap, the WIP limit, escalations per day, fix-job depth, a
+  backend's errors, a repo's failed jobs, the verifier's unknowns, the
+  Cloudflare credit, a repo's decider fallback. Fix the cause, then press
+  **Reset**: the jobs it held resume (`queued` if one's last run is still
+  finishing; it picks up right after). A backend breaker also closes itself
+  after a successful probe five minutes on, resolving its page; meanwhile
+  its work goes to the preset's fallback in `configs/routing.yaml`.
+- **Budget pages.** A job whose workers don't fit what the day has left gets
+  its own page, "the budget can't fit this work now": retry later, re-plan
+  with smaller `max_cost_usd`, or abandon. Each worker in a wave reserves its
+  cap or its share of what's left of the day, whichever is less.
+- **Deps PRs.** vigild opens them with no source builds (wheels and
+  tarballs only) and builds the new dev image only after you merge. A review
+  that fails closes the PR and makes it again once; a second failure closes
+  that one and pages you. Merging one by hand at any point resumes the job
+  that waits on it.
 - **Label intake** is off until a repo says `intake: true` in
   `configs/repos.yaml`. Then every five minutes vigild turns each open
   issue labelled `vigil:ready` into a job, once; `value:N` and `risk:N`
