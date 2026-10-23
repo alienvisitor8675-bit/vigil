@@ -132,7 +132,7 @@ class RungPolicy(_M):
     reviewer: str
     auditor: str
     audit: float = Field(ge=0, le=1)  # base share of reviews audited
-    promote_after: int | None = Field(default=None, ge=1)  # weighted PRs; None: top rung
+    promote_after: int | None = Field(default=None, ge=1)  # weighted PRs; None: never promotes
     min_match: float = Field(default=0.9, ge=0, le=1)
     max_false_per_pr: float | None = Field(default=None, ge=0)
 
@@ -144,6 +144,11 @@ class ReviewPolicy(_M):
     rungs: dict[int, RungPolicy]
     verify_weight: dict[int, float]
     level0_audit_factor: float = Field(default=1.0, ge=1)
+    # The passed local-reviewer eval (design: "a reviewer enters rung 1 only if
+    # it matches >= 80% of the auditor's findings on the eval set"), named by
+    # its results file. None until phase 7: no shape passes rung 1, and every
+    # rung keeps Sonnet reviewing and Opus auditing every review.
+    local_reviewer_eval: str | None = None
 
 
 class LongContext(_M):

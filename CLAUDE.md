@@ -67,6 +67,8 @@ exploring. `AGENTS.md` is a symlink to this file.
   - `intake/`: spec gate, scoring, globs;
   - `jobs/`: model, FSM, tree, artifacts, service, runner, acceptance;
   - `router/`, `decider/`, `gateway/`, `budget.py`, `metering/`, `packets/`;
+  - `review/`: the trust ladder; `scheduler/`: the graph and WIP;
+    `breakers.py`: circuit breakers;
   - `github/`: App tokens, publish;
   - `executors/`: runtime, egress;
   - `workspace.py`, `devimage.py`, `telemetry/`, `doctor.py`, `kpis.py`,

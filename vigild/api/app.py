@@ -274,6 +274,15 @@ def decider_report(request: Request) -> dict[str, Any]:
     return report(_svc(request).store)
 
 
+@router.get("/api/review/ladder", dependencies=[READ])
+def review_ladder(request: Request) -> dict[str, Any]:
+    """Each shape's live rung, its limit and its last change (owner ruling 1)."""
+    from vigild.review.ladder import Ladder
+
+    svc = _svc(request)
+    return Ladder(svc.store, svc.cfg).state()
+
+
 # --- sessions -----------------------------------------------------------------------
 
 

@@ -283,15 +283,19 @@ confidence bucket against your labels.
 ### 5. `/review`
 
 The trust ladder. For each task shape:
-- its rung;
+- its rung, its starting rung and its limit (and why it stops there);
+- who reviews and who audits at that rung, and the audit rate;
 - a sparkline of the audit match rate;
 - false findings per PR;
-- the promotions and demotions, with dates and the audit numbers behind
-  each.
+- its **last change**: old and new rung, the reason, the audit sample size
+  and match rate behind it, and when (owner, 2026-10-23); the full history
+  of promotions and demotions below it.
 
-Money, auth and consent shapes are marked `rung 0 · fixed`.
+Money, auth and consent shapes are marked `rung 0 · fixed`, deps
+`rung ≤ 1 · fixed`. Until a local reviewer passes its eval, the page says
+so: no shape passes rung 1.
 
-**API:** `GET /api/ladder`.
+**API:** `GET /api/review/ladder`.
 
 ### 6. `/new`
 

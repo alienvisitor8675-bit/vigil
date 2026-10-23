@@ -2108,7 +2108,8 @@ class JobRunner:
             None,
             f"review ladder: {change.shape.value} {verb} to rung {change.to}",
             {"kind": "ladder", "shape": change.shape.value, "from": change.frm, "to": change.to,
-             "reason": change.reason, "actions": ["dismiss"]},
+             "reason": change.reason, "sample_size": change.sample_size,
+             "match_rate": change.match_rate, "actions": ["dismiss"]},
         )  # fmt: skip
 
     def _read_only_session(

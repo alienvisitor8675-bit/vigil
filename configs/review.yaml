@@ -2,8 +2,16 @@
 #
 # Each shape starts at the rung named here. vigild moves a shape from its
 # audits (vigild/review/ladder.py) and keeps the live rung in its database,
-# with an event and an inbox page for every promotion and demotion; this file
-# is the starting point and the policy, changed only by PR.
+# with a ladder_changes row (its evidence), an event and an inbox page for
+# every promotion and demotion; this file is the starting point and the
+# policy, changed only by PR. Once a shape has a row in the database, an edit
+# to its starting rung here is ignored: the row is the live state.
+#
+# Rung 0 never graduates (the design's table: "n/a"). No shape passes rung 1
+# until `local_reviewer_eval` names a passed eval (design: "a reviewer enters
+# rung 1 only if it matches >= 80% of the auditor's findings on the eval
+# set"; phase 7). Until then every rung keeps Sonnet reviewing and Opus
+# auditing every review, so audits can only demote.
 #
 # Hard-coded in ladder.py, not configurable here: `money`, `auth` and
 # `consent` stay at rung 0 permanently, and `deps` is capped at rung 1 (owner,
@@ -19,11 +27,13 @@ shapes:
   auth: {rung: 0, max_rung: 0}
   consent: {rung: 0, max_rung: 0}
 
-# Per rung: who reviews, who audits, the base audit rate, and what promotes.
-# Rung 1's local reviewer arrives with the tower (phase 5); until then a
-# preset that isn't live falls back to the routing file's `reviewer`.
+local_reviewer_eval: null   # e.g. evals/results.csv@<sha>, once a local reviewer passes
+
+# Per rung: who reviews, who audits, the base audit rate, and what promotes
+# out of it. Rung 1's local reviewer arrives with the tower (phase 5); until
+# then a preset that isn't live falls back to the routing file's `reviewer`.
 rungs:
-  0: {reviewer: claude-sonnet, auditor: claude-opus, audit: 1.00, promote_after: 20, min_match: 0.90}
+  0: {reviewer: claude-sonnet, auditor: claude-opus, audit: 1.00}   # never graduates
   1: {reviewer: claude-sonnet, auditor: claude-opus, audit: 1.00, promote_after: 20, min_match: 0.90, max_false_per_pr: 1}
   2: {reviewer: tower-qwen, auditor: claude-sonnet, audit: 0.25, promote_after: 40, min_match: 1.00}
   3: {reviewer: tower-qwen, auditor: claude-sonnet, audit: 0.10}
