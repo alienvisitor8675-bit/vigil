@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from vigild.intake.paths import in_scope
+from vigild.redact import redact
 from vigild.shellwords import Command, parse
 from vigild.workspace import Workspace
 
@@ -325,23 +326,105 @@ def belongs(case: Case, files: Iterable[str]) -> bool:
     return False
 
 
-def compare_runs(base: list[Case], head: list[Case]) -> dict[str, Any]:
+# What a test.each title interpolates that changes on every run, and nothing else:
+# a PEM block, a uuid, a long hex run, a long base64-looking token (mixed case with
+# a digit, or with `+`/`/` and a digit, or ending in `=` with a digit; never a plain
+# `[a-z0-9_]` name), a number of 10 or more digits (a timestamp). A pytest id's
+# `[...]` is cut off whole. A random value that is none of these is not masked; the
+# two base runs then show it under different titles, and `compare_runs` requires
+# head to have as many leftover new ids in that file (fails closed on a deletion).
+_B64 = r"[A-Za-z0-9+/_-]"
+_PARAMS = re.compile(
+    r"-----BEGIN [A-Z ]+-----.*?(?:-----END [A-Z ]+-----|\Z)"
+    r"|\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+    r"|\b[0-9a-fA-F]{16,}\b"
+    rf"|(?<![A-Za-z0-9+/_=-])(?={_B64}*[A-Z])(?={_B64}*[a-z])(?={_B64}*\d){_B64}{{24,}}={{0,2}}"
+    rf"|(?<![A-Za-z0-9+/_=-])(?={_B64}*[+/])(?={_B64}*\d){_B64}{{24,}}={{0,2}}"
+    rf"|(?<![A-Za-z0-9+/_=-])(?={_B64}*\d){_B64}{{24,}}={{1,2}}"
+    r"|\b\d{10,}\b",
+    re.S,
+)
+
+
+def normalise_title(name: str) -> str:
+    """A test's title without its parameters, so the same test matches itself
+    across runs whose generated values differ."""
+    if name.endswith("]") and "[" in name:
+        name = name[: name.index("[")]
+    return " ".join(_PARAMS.sub("<>", name).split())
+
+
+def _title_counts(cases: Iterable[Case]) -> dict[tuple[str, str], int]:
+    out: dict[tuple[str, str], int] = {}
+    for c in cases:
+        name = c.id.split("::", 1)[1] if "::" in c.id else c.id
+        key = (c.file, normalise_title(name))
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
+def compare_runs(
+    base: list[Case], head: list[Case], base2: list[Case] | None = None
+) -> dict[str, Any]:
     """What ran at head against what ran at base, with the same command and the
     same runner config (owner direction, round 3): head may add tests; it may
-    never run fewer ids or files, or skip or xfail more."""
-    ids_b, ids_h = {c.id for c in base}, {c.id for c in head}
+    never run fewer ids or files, or skip or xfail more.
+
+    `base2` is a second run of the base. A test id in one base run and not the
+    other is *unstable* (its title carries a value generated per run). Stable ids
+    are matched exactly. Unstable ones are matched by (file, title without its
+    parameters) and by count: head needs at least as many of each as both base
+    runs had (the lower of the two counts), counting only head ids that are not
+    stable base ids. A drop in count fails."""
+    if not base2:  # no second base run, or one with no report: exact ids only
+        base2 = None
+    unstable = ({c.id for c in base} ^ {c.id for c in base2}) if base2 is not None else set()
+    ids_b = {c.id for c in base} - unstable
+    ids_h = {c.id for c in head}
     files_b, files_h = {c.file for c in base}, {c.file for c in head}
 
     def count(cases: list[Case], status: str) -> int:
         return sum(1 for c in cases if c.status == status)
 
+    missing = sorted(ids_b - ids_h)
+    rows: list[dict[str, Any]] = []
+    if unstable and base2 is not None:
+        in_a = _title_counts(c for c in base if c.id in unstable)
+        in_b = _title_counts(c for c in base2 if c.id in unstable)
+        at_head = _title_counts(c for c in head if c.id not in ids_b)
+        used: dict[str, int] = {}  # head ids spent on matched titles, per file
+        loose_a: dict[str, int] = {}  # unstable ids whose title didn't match across runs
+        loose_b: dict[str, int] = {}
+        for key in sorted(set(in_a) | set(in_b)):
+            na, nb = in_a.get(key, 0), in_b.get(key, 0)
+            need = min(na, nb)
+            loose_a[key[0]] = loose_a.get(key[0], 0) + na - need
+            loose_b[key[0]] = loose_b.get(key[0], 0) + nb - need
+            if not need:
+                continue
+            got = at_head.get(key, 0)
+            used[key[0]] = used.get(key[0], 0) + min(got, need)
+            rows.append({"file": key[0], "title": key[1], "base": need, "head": got})
+            if got < need:
+                missing.append(f"{key[0]}::{key[1]}: {need} at base, {got} at head")
+        spare: dict[str, int] = {}
+        for (f, _), n in at_head.items():
+            spare[f] = spare.get(f, 0) + n
+        for f in sorted(set(loose_a) | set(loose_b)):
+            need = min(loose_a.get(f, 0), loose_b.get(f, 0))
+            left = spare.get(f, 0) - used.get(f, 0)
+            if need:
+                rows.append({"file": f, "title": "<unmatched>", "base": need, "head": left})
+            if left < need:
+                missing.append(f"{f}: {need} unmatched unstable ids at base, {left} new at head")
     out: dict[str, Any] = {
         "checked": True,
-        "ids": {"base": len(ids_b), "head": len(ids_h)},
-        "missing_ids": sorted(ids_b - ids_h)[:50],
+        "ids": {"base": len({c.id for c in base}), "head": len(ids_h)},
+        "missing_ids": missing[:50],
         "missing_files": sorted(files_b - files_h)[:50],
         "skipped": {"base": count(base, "skipped"), "head": count(head, "skipped")},
         "xfail": {"base": count(base, "xfail"), "head": count(head, "xfail")},
+        "unstable": rows[:50],
     }
     out["ok"] = not (
         out["missing_ids"]
@@ -397,6 +480,18 @@ class Verifier:
         pin = (base_sha, pinned)
         base = self._run(repo, image, f"{task_id}-base", base_sha, test_cmd, command, [pin])
         record["base"] = base
+        base2: dict[str, Any] | None = None
+        if base["_report"]:
+            # A second base run finds ids that change per run (phase 1 run, finding
+            # #1). It costs one more run the length of the base's, and only when the
+            # base reported.
+            base2 = self._run(repo, image, f"{task_id}-base2", base_sha, test_cmd, command, [pin])
+            if base2["_report"] and base2["_cases"]:
+                record["base_repeat"] = {
+                    k: base2[k] for k in ("sha", "exit", "outcome", "tests") if k in base2
+                }
+            else:
+                record["base_repeat"] = "unavailable"  # exact ids only
         before: dict[str, Any] | None = None
         if must_fail_first:
             before = self._run(
@@ -415,7 +510,10 @@ class Verifier:
         if not after["_report"]:
             record["ran"] = {"checked": False, "note": "no report from the head run"}
         elif base["_report"]:
-            record["ran"] = {**compare_runs(base["_cases"], after["_cases"]), "against": "base"}
+            record["ran"] = {
+                **compare_runs(base["_cases"], after["_cases"], base2["_cases"] if base2 else None),
+                "against": "base",
+            }
         elif before is not None and before["_report"]:
             # round 4, item 4: base ran no runner (e.g. a check before it failed);
             # compare with "before" minus the tests the worker added
@@ -431,7 +529,7 @@ class Verifier:
             record["ids"] = self._ids(before, after, tests)
         record["provenance"] = "human"  # observed by vigild, not reported by the model
         record["source"] = "verifier"
-        for run in (base, before, after):
+        for run in (base, base2, before, after):
             if run is not None:
                 run.pop("_cases", None)
                 run.pop("_report", None)
@@ -475,7 +573,7 @@ class Verifier:
             "sha": sha,
             "exit": r.exit,
             "outcome": got,
-            "tail": r.output[-TAIL:],
+            "tail": redact(r.output[-TAIL:]),
             "tests": len(cases),
             "_cases": cases,
             "_report": bool(r.reports),

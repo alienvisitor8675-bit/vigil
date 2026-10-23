@@ -106,7 +106,7 @@ def test_must_fail_first_off_runs_base_and_after(ws: Workspace, tmp_path: Path) 
     base, head = _session(ws, tmp_path, _turn_on)
     runner = LocalTestRunner()
     rec = _verify(ws, base, head, mff=False, runner=runner)
-    assert "before" not in rec and len(runner.calls) == 2
+    assert "before" not in rec and len(runner.calls) == 3  # base twice, after
 
 
 def test_each_run_gets_a_fresh_checkout_with_no_hooks(ws: Workspace, tmp_path: Path) -> None:
@@ -114,7 +114,7 @@ def test_each_run_gets_a_fresh_checkout_with_no_hooks(ws: Workspace, tmp_path: P
     runner = LocalTestRunner()
     _verify(ws, base, head, runner=runner)
     sources = [call["source"] for call in runner.calls]
-    assert len(set(sources)) == 3
+    assert len(set(sources)) == 4  # base twice, before, after
     for seen in runner.calls:
         assert seen["hooksPath"] == "/dev/null"
         assert not seen["worker_files"], seen

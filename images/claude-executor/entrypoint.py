@@ -57,6 +57,10 @@ PLAIN_CLI = "/usr/local/bin/claude"
 BOT_NAME = "vigil-worker[bot]"
 BOT_EMAIL = "vigil-worker[bot]@users.noreply.github.com"
 SECRETISH = re.compile(r"(vgw_[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{8,})")
+PEM_KEY = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[^\"\\]|\\(?!\"))*?"
+    r"(?:-----END [A-Z ]*PRIVATE KEY-----|(?=\\?\")|\Z)"
+)
 # Paths in .git that send git somewhere else for its config, hooks or objects.
 ELSEWHERE = ("commondir", "gitdir", "objects/info/alternates", "objects/info/http-alternates")
 NO_SYMLINK = ("HEAD", "config", "objects", "refs", "hooks", "info", "packed-refs")
@@ -70,7 +74,7 @@ def redact(value: Any, token: str = "") -> Any:
     if isinstance(value, str):
         if token:
             value = value.replace(token, "[redacted]")
-        return SECRETISH.sub("[redacted]", value)
+        return PEM_KEY.sub("[redacted]", SECRETISH.sub("[redacted]", value))
     if isinstance(value, dict):
         return {k: redact(v, token) for k, v in value.items()}
     if isinstance(value, list):

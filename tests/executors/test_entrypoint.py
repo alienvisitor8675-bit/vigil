@@ -200,10 +200,11 @@ def test_the_harness_runs_no_test_and_names_the_head_on_its_result_line(
 def test_one_redactor_and_the_harness_matches_it() -> None:
     from vigild.gateway import service
     from vigild.jobs import runner
-    from vigild.redact import SECRETISH, redact
+    from vigild.redact import PEM_KEY, SECRETISH, redact
 
     assert runner.redact is redact and service.redact is redact
     assert _entrypoint().SECRETISH.pattern == SECRETISH.pattern
+    assert _entrypoint().PEM_KEY.pattern == PEM_KEY.pattern
 
 
 # --- round 3: a session image's prepare hook ------------------------------------------------

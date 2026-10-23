@@ -1183,7 +1183,7 @@ class JobRunner:
                     job_id, s, task_id, f"{task_id}: verifier error", {"error": str(e)[:1000]}
                 )
             self.store.add_artifact(
-                job_id, "tests.json", json.dumps(tests), Provenance.HUMAN, task_id=task_id
+                job_id, "tests.json", json.dumps(redact(tests)), Provenance.HUMAN, task_id=task_id
             )
         # the report keeps its narrative; its test fields are the verifier's
         report = report.model_copy(

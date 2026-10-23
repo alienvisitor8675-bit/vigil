@@ -31,6 +31,7 @@ from vigild.jobs.model import (
     TaskRow,
 )
 from vigild.provenance import Provenance, require
+from vigild.redact import redact
 
 PROV = "provenance TEXT NOT NULL CHECK (provenance IN ('claude','local','human'))"
 
@@ -134,11 +135,42 @@ def _m4_call_truncated(conn: sqlite3.Connection) -> None:
     _add_columns(conn, "model_calls", {"truncated": "INTEGER NOT NULL DEFAULT 0"})
 
 
+def _scrub(text: str) -> str:
+    """`text` with `redact` applied. JSON is redacted as a value and written back
+    the way `_j` writes it; text that isn't JSON is redacted as it stands. A text
+    that is already clean comes back byte-identical."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return str(redact(text))
+    clean = redact(value)
+    return text if clean == value else _j(clean)
+
+
+def _m5_scrub_private_keys(conn: sqlite3.Connection) -> None:
+    """Phase 1 run, finding #1: a PEM private key reached the inbox, the event log
+    and `tests.json` unredacted (`redact` had no PEM pattern). Re-apply it to what
+    is stored; rows it leaves alone are not rewritten, and a status is not touched."""
+    for table, col, where in (
+        ("inbox_items", "body", ""),
+        ("events", "data", ""),
+        ("artifacts", "content", " WHERE name='tests.json'"),
+    ):
+        for row in conn.execute(f"SELECT rowid, {col} FROM {table}{where}").fetchall():  # noqa: S608
+            clean = _scrub(row[1])
+            if clean == row[1]:
+                continue
+            extra = ", sha256=?" if table == "artifacts" else ""
+            args = [clean, hashlib.sha256(clean.encode()).hexdigest()] if extra else [clean]
+            conn.execute(f"UPDATE {table} SET {col}=?{extra} WHERE rowid=?", (*args, row[0]))  # noqa: S608
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
     _m3_job_blocked_on,
     _m4_call_truncated,
+    _m5_scrub_private_keys,
 ]
 
 
