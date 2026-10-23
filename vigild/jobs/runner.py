@@ -2156,29 +2156,39 @@ class JobRunner:
                     },
                 )
                 return False
-            transition(
-                self.store,
-                job_id,
-                JobState.BUILDING,
-                Actor.VIGILD,
+            return self._move_on(
+                job_id, JobState.BUILDING, sorted(outcomes),
                 evidence={"findings": {tid: outcomes[tid][1] for tid in fixes}},
-            )
-            return True
-        try:
-            transition(self.store, job_id, JobState.READY, Actor.VIGILD)
-        except TransitionError:
-            # 10: the PR poll merged it between the re-check and this move
-            now = self.store.get_job(job_id).state
-            if now is JobState.IN_REVIEW:
-                raise
-            self.store.add_event(
-                "review_dropped", {"state": now.value, "tasks": sorted(outcomes)},
-                Provenance.HUMAN, job_id=job_id,
             )  # fmt: skip
+        if not self._move_on(job_id, JobState.READY, sorted(outcomes)):
             return False
         self.breakers.success(Kind.REPO_FAILURES, f"repo:{job.repo}")
         self._ready(job_id)
         return False
+
+    def _move_on(
+        self,
+        job_id: str,
+        to: JobState,
+        tasks: list[str],
+        evidence: dict[str, Any] | None = None,
+    ) -> bool:
+        """The review's move out of `in_review` (to building for a fix round
+        or a regeneration, or to ready). If the PR poll merged the job since
+        the pass's re-check, the move is dropped quietly (`review_dropped`,
+        2a rounds 6-7); a refusal for any other reason still raises."""
+        try:
+            transition(self.store, job_id, to, Actor.VIGILD, evidence=evidence)
+        except TransitionError:
+            now = self.store.get_job(job_id).state
+            if now is JobState.IN_REVIEW:
+                raise
+            self.store.add_event(
+                "review_dropped", {"state": now.value, "to": to.value, "tasks": tasks},
+                Provenance.HUMAN, job_id=job_id,
+            )  # fmt: skip
+            return False
+        return True
 
     def _deps_review_failed(self, job_id: str, flagged: dict[str, Any]) -> bool:
         """Owner ruling 3: a deps PR has no worker to fix it. A failed review
@@ -2217,11 +2227,11 @@ class JobRunner:
             self.store.update_task(tid, contract=contract, state="queued")
             again.append(tid)
         if again and len(again) == len(flagged):
-            transition(
-                self.store, job_id, JobState.BUILDING, Actor.VIGILD,
+            # the caller dispatches, once the pass's stage is released
+            return self._move_on(
+                job_id, JobState.BUILDING, sorted(flagged),
                 evidence={"findings": flagged, "deps_regenerated": again},
             )  # fmt: skip
-            return True  # the caller dispatches, once the pass's stage is released
         self._block(job_id, f"deps review findings, twice: {sorted(flagged)}")
         self._page(
             job_id,

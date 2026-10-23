@@ -284,13 +284,29 @@ class Breakers:
         if held and self.on_close is not None:
             self.on_close(held, item_id)
 
-    def unhold(self, job_id: str) -> None:
+    def unhold(self, job_id: str) -> list[Breaker]:
         """The job no longer waits on any breaker: the owner abandoned it, or
-        its own page holds it now (2a round 3)."""
+        its own page holds it now (2a round 3). Returns the breakers that
+        then hold nothing."""
+        emptied = []
         with self.store.lock:
             for b in self.open_breakers():
                 if job_id in b.held:
-                    self._set(b, held=[j for j in b.held if j != job_id])
+                    rest = [j for j in b.held if j != job_id]
+                    self._set(b, held=rest)
+                    if not rest:
+                        emptied.append(b)
+        return emptied
+
+    def close_empty(self, b: Breaker, *, by: str) -> int | None:
+        """Close a breaker that holds nothing (2a round 7): it has no reason
+        to stay open. Returns its page, for the caller to resolve."""
+        with self.store.lock:
+            cur = self.get(b.id)
+            if cur.state == "closed" or cur.held:
+                return None
+            self._close(cur, by=by)
+            return cur.item_id
 
     def held_by(self, breaker_id: int) -> list[str]:
         try:

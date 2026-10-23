@@ -353,6 +353,9 @@ uv run python -m vigild
   page, naming one of the jobs it holds, to give that job up. A backend breaker also closes itself
   after a successful probe five minutes on, resolving its page; meanwhile
   its work goes to the preset's fallback in `configs/routing.yaml`.
+- **Midnight.** Work still running at UTC midnight counts against the new
+  day (and month) until it settles, since its whole cost books to the day it
+  settles; the new day's room is $5 less that.
 - **Budget pages.** A job whose workers don't fit what the day has left gets
   its own page, "the budget can't fit this work now": retry later, re-plan
   with smaller `max_cost_usd`, or abandon. Each worker in a wave reserves its
