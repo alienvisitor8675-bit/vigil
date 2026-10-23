@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS model_calls (
   tokens_in INTEGER NOT NULL, tokens_out INTEGER NOT NULL, tokens_cache_read INTEGER NOT NULL,
   tokens_cache_write_5m INTEGER NOT NULL, tokens_cache_write_1h INTEGER NOT NULL,
   cost_usd REAL NOT NULL, provider_cost_usd REAL, status INTEGER, latency_ms INTEGER,
-  timings TEXT, ts TEXT NOT NULL, {PROV});
+  timings TEXT, ts TEXT NOT NULL, truncated INTEGER NOT NULL DEFAULT 0, {PROV});
 CREATE TABLE IF NOT EXISTS reservations (
   id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, task_id TEXT, purpose TEXT NOT NULL,
   amount_usd REAL NOT NULL, status TEXT NOT NULL CHECK (status IN ('open','settled','released')),
@@ -129,10 +129,16 @@ def _m3_job_blocked_on(conn: sqlite3.Connection) -> None:
     _add_columns(conn, "jobs", {"blocked_on": "TEXT"})
 
 
+def _m4_call_truncated(conn: sqlite3.Connection) -> None:
+    """A call that stopped at max_tokens is recorded as truncated."""
+    _add_columns(conn, "model_calls", {"truncated": "INTEGER NOT NULL DEFAULT 0"})
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
     _m3_job_blocked_on,
+    _m4_call_truncated,
 ]
 
 

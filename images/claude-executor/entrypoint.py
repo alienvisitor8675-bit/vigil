@@ -6,7 +6,7 @@ Protocol with vigild:
 - /vigil/packet.md (read-only mount): the task packet, the whole prompt.
 - /work/.vigil/task.json: the contract (worker) or the job request (coord).
 - env: VIGIL_ROLE, VIGIL_MODEL, VIGIL_GATEWAY_URL, VIGIL_MAX_TURNS,
-  VIGIL_MAX_BUDGET_USD, VIGIL_REQUIRE_PLUGIN, VIGIL_AGENT_UID, plus OTEL_*.
+  VIGIL_MAX_BUDGET_USD, VIGIL_MAX_OUTPUT_TOKENS, VIGIL_REQUIRE_PLUGIN, VIGIL_AGENT_UID, plus OTEL_*.
 - stdout: event lines `{"vigil_event": {...}}` while running, and one final
   `{"vigil_result": {...}}` line naming the head commit.
 
@@ -283,6 +283,9 @@ async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-5-5",
         "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-5-5",
     }
+    if os.environ.get("VIGIL_MAX_OUTPUT_TOKENS", "").isdigit():
+        # each call's output cap: the gateway holds a call's worst case against the reservation
+        child_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = os.environ["VIGIL_MAX_OUTPUT_TOKENS"]
     stderr_tail: collections.deque[str] = collections.deque(maxlen=20)
     options = ClaudeAgentOptions(
         cwd=str(WORK),

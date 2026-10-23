@@ -26,6 +26,7 @@ class Upstream:
         self.requests: list[httpx2.Request] = []
         self.stream = False
         self.status = 200
+        self.stop_reason = "end_turn"
 
     def __call__(self, req: httpx2.Request) -> httpx2.Response:
         self.requests.append(req)
@@ -52,7 +53,7 @@ class Upstream:
                 {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "ok"}},
                 {
                     "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn"},
+                    "delta": {"stop_reason": self.stop_reason},
                     "usage": {"output_tokens": 300},
                 },
                 {"type": "message_stop"},
@@ -66,6 +67,7 @@ class Upstream:
             json={
                 "model": body["model"],
                 "content": [{"type": "text", "text": '{"answer": "S", "probability": 0.9}'}],
+                "stop_reason": self.stop_reason,
                 "usage": {"input_tokens": 200, "output_tokens": 50},
             },
         )
@@ -188,7 +190,7 @@ def test_api_tokens_do_not_work_on_the_gateway(client: TestClient) -> None:
 def test_call_that_would_cross_the_reservation_is_refused_before_it_is_sent(
     client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
 ) -> None:
-    sid, tok = _session(store, budget, gw, amount=0.05)
+    sid, tok = _session(store, budget, gw, amount=0.03)  # under the 4,096-token floor
     r = client.post("/v1/messages", json=_msg(max_tokens=64000), headers={"x-api-key": tok})
     assert r.status_code == 403 and "budget" in r.text
     assert upstream.requests == []
@@ -636,3 +638,138 @@ def test_thinking_blocks_in_a_user_turn_are_refused(
         headers={"x-api-key": tok},
     )
     assert r.status_code == 403 and upstream.requests == []
+
+
+# --- the output clamp, thinking and truncation (owner additions to the output-cap hotfix) ---
+
+
+def _sent(upstream: Upstream) -> dict[str, Any]:
+    body: dict[str, Any] = json.loads(upstream.requests[-1].content)
+    return body
+
+
+def test_max_tokens_above_the_session_cap_is_clamped_in_the_forwarded_body(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    _sid, tok = _session(store, budget, gw)
+    r = client.post("/v1/messages", json=_msg(max_tokens=128_000), headers={"x-api-key": tok})
+    assert r.status_code == 200
+    assert _sent(upstream)["max_tokens"] == gw.cfg.budgets.session_max_output_tokens == 16384
+
+
+def test_a_small_max_tokens_is_left_alone(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    _sid, tok = _session(store, budget, gw)
+    client.post("/v1/messages", json=_msg(max_tokens=64), headers={"x-api-key": tok})
+    assert _sent(upstream)["max_tokens"] == 64
+
+
+def test_max_tokens_is_clamped_to_what_the_reservation_affords(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    _sid, tok = _session(store, budget, gw, amount=0.10)  # Sonnet: ~9.9k output tokens left
+    r = client.post("/v1/messages", json=_msg(max_tokens=16384), headers={"x-api-key": tok})
+    assert r.status_code == 200
+    sent = _sent(upstream)["max_tokens"]
+    assert 4096 <= sent < 10_000
+
+
+def test_a_call_that_affords_under_the_floor_is_refused_naming_the_cap(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    _sid, tok = _session(store, budget, gw, amount=0.03)  # ~2.9k output tokens: under 4,096
+    r = client.post("/v1/messages", json=_msg(max_tokens=16384), headers={"x-api-key": tok})
+    assert r.status_code == 403
+    msg = r.json()["error"]["message"]
+    assert "budget" in msg and "16384" in msg and "4096" in msg
+    assert upstream.requests == []
+
+
+def test_a_thinking_budget_leaves_room_for_the_answer(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    _sid, tok = _session(store, budget, gw)
+    thinking = {"type": "enabled", "budget_tokens": 30_000}
+    client.post(
+        "/v1/messages",
+        json=_msg(max_tokens=128_000, thinking=thinking),
+        headers={"x-api-key": tok},
+    )
+    sent = _sent(upstream)
+    assert sent["max_tokens"] == 16384
+    assert sent["thinking"] == {"type": "enabled", "budget_tokens": 16384 - 4096}
+    # a budget that already leaves room is untouched
+    client.post(
+        "/v1/messages",
+        json=_msg(max_tokens=16384, thinking={"type": "enabled", "budget_tokens": 2000}),
+        headers={"x-api-key": tok},
+    )
+    assert _sent(upstream)["thinking"]["budget_tokens"] == 2000
+
+
+def test_thinking_that_cannot_keep_its_minimum_and_an_answer_is_refused(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    _sid, tok = _session(store, budget, gw, amount=0.05)  # ~4.9k output tokens: 4.9k-4096 < 1024
+    r = client.post(
+        "/v1/messages",
+        json=_msg(max_tokens=16384, thinking={"type": "enabled", "budget_tokens": 8000}),
+        headers={"x-api-key": tok},
+    )
+    assert r.status_code == 403
+    assert "thinking" in r.json()["error"]["message"]
+    assert upstream.requests == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_max_tokens_stop_is_recorded_as_truncated(
+    client: TestClient,
+    store: Store,
+    budget: Budget,
+    gw: Gateway,
+    upstream: Upstream,
+    stream: bool,
+) -> None:
+    upstream.stop_reason = "max_tokens"
+    sid, tok = _session(store, budget, gw)
+    r = client.post("/v1/messages", json=_msg(stream=stream), headers={"x-api-key": tok})
+    assert r.status_code == 200
+    assert store.q("SELECT truncated FROM model_calls")[0]["truncated"] == 1
+    ev = store.q("SELECT data FROM events WHERE type='call_truncated'")
+    assert ev and json.loads(ev[0]["data"])["session_id"] == sid
+    from vigild.metering.calls import last_call_truncated
+
+    assert last_call_truncated(store, sid)
+
+
+def test_a_normal_stop_is_not_truncated(
+    client: TestClient, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    _sid, tok = _session(store, budget, gw)
+    client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
+    assert store.q("SELECT truncated FROM model_calls")[0]["truncated"] == 0
+
+
+@pytest.mark.parametrize(("tokens", "ok"), [(5120, True), (5119, False)])
+def test_thinking_boundary_is_exactly_the_answer_room_plus_the_minimum_budget(
+    client: TestClient,
+    store: Store,
+    budget: Budget,
+    gw: Gateway,
+    upstream: Upstream,
+    tokens: int,
+    ok: bool,
+) -> None:
+    """out = 4,096 answer + 1,024 minimum thinking = 5,120 is allowed; 5,119 is not."""
+    _sid, tok = _session(store, budget, gw)
+    r = client.post(
+        "/v1/messages",
+        json=_msg(max_tokens=tokens, thinking={"type": "enabled", "budget_tokens": 4000}),
+        headers={"x-api-key": tok},
+    )
+    assert (r.status_code == 200) is ok
+    if ok:
+        assert _sent(upstream)["thinking"]["budget_tokens"] == 1024
+    else:
+        assert "thinking" in r.json()["error"]["message"]

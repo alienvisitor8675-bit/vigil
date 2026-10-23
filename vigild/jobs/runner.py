@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -63,7 +64,7 @@ from vigild.jobs.artifacts import parse_plan, render
 from vigild.jobs.deps import infer_deps, is_lockfile
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import JobState, Role, SessionRow
-from vigild.metering.calls import session_cost
+from vigild.metering.calls import last_call_truncated, session_cost
 from vigild.packets.assemble import assemble_coord, assemble_worker
 from vigild.packets.fence import fence
 from vigild.provenance import Provenance
@@ -80,6 +81,7 @@ COORD_MINUTES = 30
 WORKER_MINUTES = 40
 LIVE_SESSION = ("created", "running")
 DEAD_TASK = ("superseded", "abandoned")  # out of the job: re-planned away or given up
+QUEUE_POLL_SECONDS = 15.0  # how often a queued session looks for room in the day
 MIN_RETRY_USD = 0.05  # less than this left of a task's cap: no retry is offered
 
 
@@ -156,6 +158,55 @@ class JobRunner:
         self.deferred: list[str] = []  # approved builds reconcile found, not yet started
         self._running: set[str] = set()
         self._running_lock = threading.Lock()
+        self.sleep: Callable[[float], None] = time.sleep  # tests replace it
+
+    # --- queueing for the day's headroom ---------------------------------------------------
+
+    def _queueable(self, e: BudgetExceeded, amount: float) -> bool:
+        """Only a full day waits: its money frees up (a reservation settles, or
+        the UTC day rolls over). A task's cap, the month, or an amount larger
+        than the whole day never will."""
+        return e.cap == "daily" and amount <= self.cfg.budgets.daily_usd
+
+    def _queue_event(
+        self, kind: str, job_id: str, what: str, task_id: str | None, **data: Any
+    ) -> None:
+        self.store.add_event(
+            kind, {"for": what, **data}, Provenance.HUMAN, job_id=job_id, task_id=task_id
+        )
+
+    def _reserve_queued(
+        self,
+        job_id: str,
+        what: str,
+        *,
+        session_id: str | None,
+        task_id: str | None,
+        amount: float,
+        purpose: str,
+        queued: bool = False,
+    ) -> int:
+        """Reserve, waiting while the day is full: the one waiting mechanism.
+        Emits `queued` once and `dequeued` when it gets the money; not a
+        failure, no page, no attempt used. Any other refusal raises."""
+        while True:
+            try:
+                rid = self.budget.reserve(
+                    session_id=session_id, task_id=task_id, amount=amount, purpose=purpose
+                )
+            except BudgetExceeded as e:
+                if not self._queueable(e, amount):
+                    raise
+                if not queued:
+                    queued = True
+                    self._queue_event(
+                        "queued", job_id, what, task_id, amount_usd=amount, detail=e.detail
+                    )
+                self.sleep(QUEUE_POLL_SECONDS)
+                continue
+            if queued:
+                self._queue_event("dequeued", job_id, what, task_id, amount_usd=amount)
+            return rid
 
     # --- triggers ---------------------------------------------------------------------
 
@@ -361,6 +412,27 @@ class JobRunner:
                 with self.telemetry.span(tr, "vigil.spawn", {"vigil.image": spec.image or ""}):
                     out = self.executor.run(spec, token, self._event_sink(s))
                 tr.set("vigil.status", out.status)
+                if out.status == "done" and last_call_truncated(self.store, s.id):
+                    # never a finished turn: it was cut off at the output cap
+                    out.status = "failed"
+                    out.error = (
+                        "the final turn was truncated at the output cap "
+                        f"({self.cfg.budgets.session_max_output_tokens} tokens per call)"
+                    )
+                    tr.set("vigil.truncated", True)
+                    tr.set("vigil.status", out.status)
+                if out.status != "done":
+                    refused = self.store.q(
+                        "SELECT data FROM events WHERE session_id=? AND type='gateway_refused'"
+                        " ORDER BY id DESC",
+                        (s.id,),
+                    )
+                    for row in refused:
+                        reason = str(json.loads(row["data"]).get("reason", ""))
+                        if reason.startswith("budget:"):
+                            # name the cap and the shortfall on the page
+                            out.error = f"{out.error or ''} | {reason}".strip(" |")
+                            break
             return out
         finally:
             self.gateway.revoke(s.id)
@@ -411,7 +483,9 @@ class JobRunner:
             )
             self.store.set_coord_session(job_id, coord.id)
             try:
-                rid = self.budget.reserve(
+                rid = self._reserve_queued(
+                    job_id,
+                    "coord",
                     session_id=coord.id,
                     task_id=None,
                     amount=self.cfg.budgets.coord_session_usd,
@@ -520,6 +594,7 @@ class JobRunner:
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=session_image,  # the executor layer over the repo's dev image
+            max_output_tokens=self.cfg.budgets.session_max_output_tokens,
         )
         out = self._run_session(
             coord,
@@ -665,7 +740,12 @@ class JobRunner:
             except Refused:
                 return
             with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-                futures = [pool.submit(self._run_worker, job_id, t, *reservations[t]) for t in wave]
+                futures = [
+                    pool.submit(self._run_worker, job_id, t, *reservations[t])
+                    if t in reservations
+                    else pool.submit(self._run_queued_worker, job_id, t)
+                    for t in wave
+                ]
                 results = [f.result() for f in futures]
             done |= {t for t, ok in zip(wave, results, strict=True) if ok}
             failed = [t for t, ok in zip(wave, results, strict=True) if not ok]
@@ -766,10 +846,31 @@ class JobRunner:
             resumable=can_retry,
         )
 
+    def _run_queued_worker(self, job_id: str, task_id: str) -> bool:
+        """A worker the day had no room for: wait for it, then run as any other."""
+        _, _, amount = self.remaining(task_id)
+        try:
+            rid = self._reserve_queued(
+                job_id,
+                "worker",
+                session_id=None,
+                task_id=task_id,
+                amount=amount,
+                purpose="worker",
+                queued=True,  # `queued` was emitted when the wave was reserved
+            )
+        except BudgetExceeded as e:  # the month, say: it ran out while this waited
+            return self._fail(
+                job_id, None, task_id, f"{task_id}: {e.cap} cap reached", {"error": str(e)}
+            )
+        return self._run_worker(job_id, task_id, rid, amount)
+
     def _reserve_wave(self, job_id: str, task_ids: list[str]) -> dict[str, tuple[int, float]]:
         """Reserve every worker of a wave before any starts, each for what's
-        left of its own cap; on a refusal, release them, block the job and
-        page: dispatch halts."""
+        left of its own cap. A worker the day has no room for is left out of
+        the result and queued (it waits in its own thread, so the others run
+        and free the money); on any other refusal, release them, block the job
+        and page: dispatch halts."""
         held: dict[str, tuple[int, float]] = {}
         for tid in task_ids:
             _, _, amount = self.remaining(tid)
@@ -785,6 +886,11 @@ class JobRunner:
                     amount,
                 )
             except BudgetExceeded as e:
+                if self._queueable(e, amount):
+                    self._queue_event(
+                        "queued", job_id, "worker", tid, amount_usd=amount, detail=e.detail
+                    )
+                    continue
                 for rid, _amt in held.values():
                     self.budget.settle(rid, 0.0)
                 for t2 in task_ids:
@@ -916,6 +1022,7 @@ class JobRunner:
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=session_image,  # the verifier runs the plain dev image, `image`
+            max_output_tokens=self.cfg.budgets.session_max_output_tokens,
         )
         attrs = {
             "vigil.job_id": job_id,

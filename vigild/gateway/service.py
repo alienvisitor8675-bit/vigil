@@ -106,6 +106,23 @@ METERED_PATHS = ("/v1/messages",)
 FREE_PATHS = ("/v1/messages/count_tokens",)
 CHARS_PER_TOKEN = 3  # deliberately low, so the input estimate errs high
 DEFAULT_MAX_TOKENS = 4096
+# The gateway clamps a call's max_tokens to the session cap and to what the
+# session's remaining reservation affords; below this floor it refuses instead.
+MIN_OUTPUT_TOKENS = 4096
+# Thinking counts as output: its budget is clamped so this much of the
+# (clamped) max_tokens is left for the answer, and Anthropic's own minimum
+# thinking budget must still fit.
+THINKING_ANSWER_ROOM = 4096
+MIN_THINKING_BUDGET = 1024
+
+
+def worst_case_usd(prices: PriceTable, model: str, raw_len: int, max_out: int) -> float:
+    """The most a call could cost: every input token written to the 1-hour
+    cache (the dearest input rate), plus max_out tokens of output."""
+    est_in = math.ceil(raw_len / CHARS_PER_TOKEN)
+    return prices.cost(model, CallUsage(tokens_cache_write_1h=est_in, tokens_out=max_out))
+
+
 UPSTREAM_TIMEOUT = httpx2.Timeout(600.0, connect=10.0)
 
 
@@ -183,6 +200,7 @@ class Hold:
     amount: float
     preset: Preset
     body: dict[str, Any]
+    raw: bytes = b""  # what is forwarded: the request, with max_tokens clamped
     released: bool = False
 
 
@@ -309,9 +327,53 @@ class Gateway:
     def worst_case(self, model: str, body: dict[str, Any], raw_len: int) -> float:
         """The most a call could cost: every input token written to the 1-hour
         cache (the dearest input rate), plus max_tokens of output."""
-        est_in = math.ceil(raw_len / CHARS_PER_TOKEN)
         max_out = int(body.get("max_tokens") or DEFAULT_MAX_TOKENS)
-        return self.prices.cost(model, CallUsage(tokens_cache_write_1h=est_in, tokens_out=max_out))
+        return worst_case_usd(self.prices, model, raw_len, max_out)
+
+    def _hold_clamped(
+        self, session_id: str, model: str, body: dict[str, Any], raw: bytes
+    ) -> tuple[float, dict[str, Any], bytes]:
+        """Hold the call's worst case, clamping max_tokens (and a thinking
+        budget) to the session cap and to what the reservation affords. Refuses
+        below the floor, naming the cap. Returns the hold, the body and the
+        raw bytes to forward."""
+        cap = self.cfg.budgets.session_max_output_tokens
+        want = min(int(body.get("max_tokens") or DEFAULT_MAX_TOKENS), cap)
+        th = body.get("thinking")
+        thinking = isinstance(th, dict) and th.get("type") == "enabled" and "budget_tokens" in th
+        with self._inflight_lock:
+            held = self._inflight.get(session_id, 0.0)
+            headroom = self.budget.session_headroom(session_id) - held
+            out = want
+            # step down until the worst case fits (long-context rates make the
+            # price per token depend on the input, so search rather than divide)
+            while out > 0 and self.worst_case(model, {"max_tokens": out}, len(raw)) > headroom:
+                out = min(out - 1, int(out * 0.98))
+            if out < min(want, MIN_OUTPUT_TOKENS):
+                raise GatewayError(
+                    403,
+                    "permission_error",
+                    f"budget: this session's output cap is {cap} tokens per call; after "
+                    f"this call's input the session has ${headroom:.4f} of its reservation "
+                    f"left after calls in flight, enough for {max(out, 0)} output tokens, "
+                    f"under the {MIN_OUTPUT_TOKENS}-token floor",
+                )
+            if thinking and out - THINKING_ANSWER_ROOM < MIN_THINKING_BUDGET:
+                raise GatewayError(
+                    403,
+                    "permission_error",
+                    f"budget: thinking needs {MIN_THINKING_BUDGET} tokens plus "
+                    f"{THINKING_ANSWER_ROOM} for the answer, but this call may output only "
+                    f"{out} (session cap {cap})",
+                )
+            amount = self.worst_case(model, {"max_tokens": out}, len(raw))
+            self._inflight[session_id] = held + amount
+        changed = out != body.get("max_tokens")
+        body = {**body, "max_tokens": out}
+        if thinking and int(th["budget_tokens"]) > out - THINKING_ANSWER_ROOM:  # type: ignore[index]
+            body["thinking"] = {**th, "budget_tokens": out - THINKING_ANSWER_ROOM}  # type: ignore[dict-item]
+            changed = True
+        return amount, body, json.dumps(body).encode() if changed else raw
 
     def _check_body(self, body: dict[str, Any], headers: dict[str, str]) -> None:
         extra = sorted(set(body) - ALLOWED_BODY_KEYS)
@@ -329,21 +391,6 @@ class Gateway:
         refused = [b for b in betas if b not in ALLOWED_BETAS]
         if refused:
             raise GatewayError(403, "permission_error", f"betas not allowed: {refused}")
-
-    def _hold(self, session_id: str, amount: float) -> float:
-        """Reserve `amount` of the session's headroom for one in-flight call."""
-        with self._inflight_lock:
-            held = self._inflight.get(session_id, 0.0)
-            headroom = self.budget.session_headroom(session_id) - held
-            if amount > headroom:
-                raise GatewayError(
-                    403,
-                    "permission_error",
-                    f"budget: this call could cost ${amount:.4f}; the session has "
-                    f"${headroom:.4f} of its reservation left after calls in flight",
-                )
-            self._inflight[session_id] = held + amount
-            return amount
 
     def release(self, hold: Hold) -> None:
         if hold.released:
@@ -390,10 +437,10 @@ class Gateway:
             model = self._check_model(gs.repo, preset, body.get("model"), gs.model or None)
             amount = 0.0
             if path in METERED_PATHS:
-                amount = self._hold(gs.session_id, self.worst_case(model, body, len(raw)))
+                amount, body, raw = self._hold_clamped(gs.session_id, model, body, raw)
         except GatewayError as e:
             raise self._refuse(gs, e) from None
-        return Hold(gs.session_id, amount, preset, body)
+        return Hold(gs.session_id, amount, preset, body, raw)
 
     # --- forwarding ------------------------------------------------------------------
 
@@ -416,7 +463,23 @@ class Gateway:
         purpose: str,
         job_id: str | None = None,
         provider_cost: float | None = None,
+        stop_reason: str | None = None,
     ) -> float:
+        truncated = stop_reason == "max_tokens"
+        if truncated and gs:
+            self.store.add_event(
+                "call_truncated",
+                {
+                    "session_id": gs.session_id,
+                    "model": model,
+                    "tokens_out": usage.tokens_out,
+                    "note": "stop_reason max_tokens: the turn was cut off at the output cap",
+                },
+                Provenance.CLAUDE,
+                job_id=gs.job_id,
+                session_id=gs.session_id,
+                task_id=gs.task_id,
+            )
         return record_call(
             self.store,
             self.prices,
@@ -432,13 +495,14 @@ class Gateway:
             status=200,
             latency_ms=int((time.monotonic() - started) * 1000),
             provenance=Provenance.LOCAL if preset.locality == "local" else Provenance.CLAUDE,
+            truncated=truncated,
         )
 
     async def forward(
         self, gs: GatewaySession, path: str, headers: dict[str, str], raw: bytes
     ) -> tuple[int, dict[str, str], AsyncIterator[bytes] | bytes]:
         hold = self.preflight(gs, path, raw, headers)
-        preset, body = hold.preset, hold.body
+        preset, body, raw = hold.preset, hold.body, hold.raw
         try:
             key = self._key(preset)
             url = preset.base_url.rstrip("/") + path
@@ -479,6 +543,7 @@ class Gateway:
                             usage=tap.usage(),
                             started=started,
                             purpose="session",
+                            stop_reason=tap.stop_reason,
                         )
                     finally:
                         self.release(hold)
@@ -500,6 +565,7 @@ class Gateway:
                         started=started,
                         purpose="session",
                         provider_cost=usage.get("cost"),
+                        stop_reason=payload.get("stop_reason"),
                     )
                 except json.JSONDecodeError, AttributeError:
                     pass

@@ -31,6 +31,10 @@ class SessionSpec:
     traceparent: str | None = None
     packet: str = ""
     image: str | None = None  # the repo's pinned dev image; None means the default executor
+    # A cap on each model call's output (the CLI's CLAUDE_CODE_MAX_OUTPUT_TOKENS).
+    # The gateway holds every call's worst case against the reservation, so a
+    # review's small answers keep its reservation small.
+    max_output_tokens: int | None = None
 
 
 @dataclass

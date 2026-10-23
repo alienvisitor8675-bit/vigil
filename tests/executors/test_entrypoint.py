@@ -266,3 +266,50 @@ def test_left_out_files_are_named_on_the_result_line(
     assert ep.main() == 0
     result = json.loads(capsys.readouterr().out.splitlines()[-1])["vigil_result"]
     assert result["not_committed"] == ["junk.log"]
+
+
+def _agent_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """Run run_agent against a stand-in SDK and return the env it gave the CLI."""
+    import asyncio
+    import types
+
+    seen: dict[str, Any] = {}
+
+    class Msg:  # every message type the harness isinstance-checks
+        pass
+
+    async def query(prompt: str, options: Any) -> Any:
+        seen.update(options.kwargs)
+        return
+        yield
+
+    class Options:
+        def __init__(self, **kw: Any) -> None:
+            self.kwargs = kw
+
+    sdk = types.ModuleType("claude_agent_sdk")
+    for name in (
+        "AssistantMessage",
+        "ResultMessage",
+        "SystemMessage",
+        "ToolResultBlock",
+        "ToolUseBlock",
+        "UserMessage",
+    ):
+        setattr(sdk, name, type(name, (Msg,), {}))
+    sdk.ClaudeAgentOptions = Options  # type: ignore[attr-defined]
+    sdk.query = query  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
+    monkeypatch.setenv("VIGIL_GATEWAY_URL", "http://gw")
+    asyncio.run(_entrypoint().run_agent("packet", "coord", TOKEN))
+    env: dict[str, str] = seen["env"]
+    return env
+
+
+def test_the_entrypoint_maps_the_output_cap_to_the_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VIGIL_MAX_OUTPUT_TOKENS", "16384")
+    assert _agent_env(monkeypatch)["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "16384"
+    monkeypatch.delenv("VIGIL_MAX_OUTPUT_TOKENS")
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in _agent_env(monkeypatch)
+    monkeypatch.setenv("VIGIL_MAX_OUTPUT_TOKENS", "lots")  # not a number: ignored
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in _agent_env(monkeypatch)

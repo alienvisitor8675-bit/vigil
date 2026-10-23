@@ -236,3 +236,10 @@ def test_verifier_containers_run_one_at_a_time(cfg: Config, tmp_path: Path) -> N
     for t in threads:
         t.join()
     assert peak[0] == 1
+
+
+def test_the_output_cap_reaches_the_container_env(cfg: Config, spec: SessionSpec) -> None:
+    assert "VIGIL_MAX_OUTPUT_TOKENS" not in worker_kwargs(cfg, spec, network="n")["environment"]
+    spec.max_output_tokens = 16384
+    env = worker_kwargs(cfg, spec, network="n")["environment"]
+    assert env["VIGIL_MAX_OUTPUT_TOKENS"] == "16384"

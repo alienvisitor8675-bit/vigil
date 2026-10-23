@@ -76,6 +76,8 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
     }
     if spec.traceparent:
         env["TRACEPARENT"] = spec.traceparent
+    if spec.max_output_tokens:
+        env["VIGIL_MAX_OUTPUT_TOKENS"] = str(spec.max_output_tokens)
     mounts = [
         _mount(str(spec.clone), "/work", read_only=False),
         _mount(str(spec.session_dir / "packet.md"), "/vigil/packet.md", read_only=True),

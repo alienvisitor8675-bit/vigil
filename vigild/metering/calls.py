@@ -46,6 +46,7 @@ class SSEUsageTap:
         self.model: str | None = None
         self._start: dict[str, Any] = {}
         self._out: int | None = None
+        self.stop_reason: str | None = None
 
     def feed(self, chunk: bytes) -> None:
         self._buf += chunk
@@ -63,6 +64,9 @@ class SSEUsageTap:
                     self.model = msg.get("model", self.model)
                     self._start = dict(msg.get("usage") or {})
                 elif ev.get("type") == "message_delta" and ev.get("usage"):
+                    self.stop_reason = (ev.get("delta") or {}).get(
+                        "stop_reason"
+                    ) or self.stop_reason
                     usage = ev["usage"]
                     if "output_tokens" in usage:
                         self._out = int(usage["output_tokens"])
@@ -98,13 +102,14 @@ def record_call(
     latency_ms: int | None = None,
     timings: dict[str, Any] | None = None,
     provenance: Provenance = Provenance.CLAUDE,
+    truncated: bool = False,
 ) -> float:
     cost = prices.cost(model, usage)
     store.x(
         "INSERT INTO model_calls (session_id, task_id, job_id, purpose, provider, backend_preset,"
         " model, tokens_in, tokens_out, tokens_cache_read, tokens_cache_write_5m,"
         " tokens_cache_write_1h, cost_usd, provider_cost_usd, status, latency_ms, timings, ts,"
-        " provenance) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " provenance, truncated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             session_id,
             task_id,
@@ -125,6 +130,7 @@ def record_call(
             json.dumps(timings) if timings else None,
             iso(),
             provenance.value,
+            int(truncated),
         ),
     )
     if session_id:
@@ -139,3 +145,13 @@ def session_cost(store: Store, session_id: str) -> float:
         "SELECT COALESCE(SUM(cost_usd), 0) c FROM model_calls WHERE session_id=?", (session_id,)
     )
     return float(row[0]["c"])
+
+
+def last_call_truncated(store: Store, session_id: str) -> bool:
+    """Did the session's final model call stop at max_tokens? Then its last
+    turn was cut off at the output cap and the session is not done."""
+    rows = store.q(
+        "SELECT truncated FROM model_calls WHERE session_id=? ORDER BY id DESC LIMIT 1",
+        (session_id,),
+    )
+    return bool(rows and rows[0]["truncated"])

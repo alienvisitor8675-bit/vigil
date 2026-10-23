@@ -210,6 +210,21 @@ image, with no network. There is no timer and no launchd job.
 - Builds take Debian packages from `snapshot.debian.org` as of 2026-10-08
   (the pin rule), which is slow, not broken.
 
+### The output cap
+
+Every coord and worker session caps each model call's output at
+`session_max_output_tokens` in `configs/budgets.yaml` (16,384). The gateway
+holds a call's worst case (input at the 1-hour cache-write rate plus the
+output cap, at the model's price) against the session's reservation, so an
+uncapped Opus call ($20 per million output tokens) could cost more than the
+$2 coord reservation (it was $1 until PR 15) before it began. To raise the cap, edit the number
+(minimum 1,024) and restart vigild; vigild refuses a job with a 422 and the
+numbers if a role's worst-case first call no longer fits its reservation, and
+`tests/gateway/test_first_call.py` fails the same way, so raise
+`coord_session_usd` with it and keep a job's reservations under the $5 day. With the coord at $2, an Opus coord is refused only when its request reaches about 600k characters with ~$0.30 spent (at $1 it was 230-270k). A session whose reservation does not fit what is left of the day waits (events `queued`, `dequeued`) rather than failing; a wave of three workers at $2 runs two and the third waits for one to settle. A call refused mid-run (output below the floor, or out of reservation) ends that session with a page naming the cap and the shortfall; main has no checkpoint resume.
+A session whose final model call stopped at the cap is marked failed
+("truncated at the output cap"), not done.
+
 ### Check everything
 
 ```sh

@@ -22,6 +22,7 @@ from vigild.config import Config, ConfigError
 from vigild.contract.models import Score, Source, Task
 from vigild.db import Store
 from vigild.devimage import missing_tools
+from vigild.gateway.firstcall import refusals as first_call_refusals
 from vigild.intake.paths import matches_any
 from vigild.intake.scoring import IntakeOutcome, score
 from vigild.intake.spec_gate import check_job_spec, check_task, runner_files_named
@@ -182,6 +183,14 @@ class JobService:
             read=self.files(repo, base) if self.files is not None else None,
         )
 
+    def _first_call_fits(self, repo: str) -> None:
+        """Preflight: refuse, with the numbers, a job whose roles' first calls
+        could not fit their reservations. Nothing exists yet: no job, no
+        session, no container, no attempt used."""
+        errors = first_call_refusals(self.cfg, repo)
+        if errors:
+            raise SubmitError(errors)
+
     def submit_task(self, raw: dict[str, Any]) -> SubmitOutcome:
         raw = dict(raw)
         # vigild assigns task ids (review r1, item 16); a caller's id is ignored.
@@ -190,6 +199,7 @@ class JobService:
             task = Task.model_validate(raw)
             self.cfg.repo(task.repo)
             route(task, self.cfg)  # refuse what can't be routed (rule 2 overrides, policy)
+            self._first_call_fits(task.repo)
         except RoutingError as e:
             raise SubmitError([str(e)]) from e
         except ValidationError as e:
@@ -255,6 +265,7 @@ class JobService:
     def submit_request(self, req: JobRequest) -> Job:
         try:
             self.cfg.repo(req.repo)
+            self._first_call_fits(req.repo)
         except ConfigError as e:
             raise SubmitError([str(e)]) from e
         self._intake(req.model_dump(mode="json"), [])

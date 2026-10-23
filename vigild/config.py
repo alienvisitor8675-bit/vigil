@@ -98,6 +98,8 @@ class Budgets(_M):
     wip_per_repo: int = Field(ge=1)
     coord_session_usd: float = Field(gt=0)
     decider_call_usd: float = Field(gt=0)
+    # Each model call's output cap for every coord and worker session.
+    session_max_output_tokens: int = Field(ge=1024)
 
 
 class LongContext(_M):

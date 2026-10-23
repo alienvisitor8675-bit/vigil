@@ -432,21 +432,50 @@ def _approve(w: World) -> str:
     return job
 
 
-def test_daily_cap_halts_dispatch(world: World) -> None:
+def _events(w: World, kind: str) -> list[dict[str, Any]]:
+    rows = w.store.q("SELECT data, task_id FROM events WHERE type=? ORDER BY id", (kind,))
+    return [{**json.loads(r["data"]), "task_id": r["task_id"]} for r in rows]
+
+
+def _no_failure_pages(w: World) -> bool:
+    qs = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    return not any("cap reached" in p["title"] or "failed" in p["title"] for p in qs)
+
+
+def test_a_day_that_is_full_queues_the_coord_then_runs_it(world: World) -> None:
+    """A reservation that doesn't fit the day's headroom waits; it neither
+    fails nor pages nor uses a draft. It runs when money frees up."""
     w = world
+    held = [
+        w.budget.reserve(session_id=None, task_id=f"other-{i}", amount=a, purpose="worker")
+        for i, a in enumerate((2.0, 2.0, 1.0))
+    ]
+    polls: list[float] = []
+
+    def sleep(s: float) -> None:
+        polls.append(s)
+        for rid in held:  # another job finishes: the day has room
+            w.budget.settle(rid, 0.0)
+
+    w.runner.sleep = sleep  # type: ignore[method-assign]
     job = _request(w)
-    # spend the day elsewhere: $4.50 of $5 is held, so no $1 worker fits
-    w.budget.reserve(session_id=None, task_id="other-1", amount=2.0, purpose="worker")
-    w.budget.reserve(session_id=None, task_id="other-2", amount=2.0, purpose="worker")
-    w.budget.reserve(session_id=None, task_id="other-3", amount=0.5, purpose="worker")
-    item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
-    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
-    assert [c[0] for c in w.standin.calls] == ["coord"]  # no worker started
-    assert w.publisher.prs == []
-    jobrow = w.store.get_job(job)
-    assert jobrow.state.value == "blocked" and jobrow.blocked_from is not None
+    assert polls, "the coord should have waited"
+    assert [e["task_id"] for e in _events(w, "queued")] == [None]
+    assert len(_events(w, "dequeued")) == 1
+    assert _no_failure_pages(w)
+    assert w.store.get_job(job).state.value == "spec_pending"  # coord ran: spec awaits approval
+    assert [c[0] for c in w.standin.calls] == ["coord"]  # one draft: no attempt used
+
+
+def test_a_reservation_over_the_daily_cap_itself_is_refused_not_queued(world: World) -> None:
+    w = world
+    w.runner.cfg.budgets.daily_usd = 1.0  # a $2 coord can never fit this day
+    w.runner.sleep = lambda s: pytest.fail("must not wait for money that can't exist")  # type: ignore[method-assign]
+    _request(w)
+    assert w.standin.calls == []
     pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
     assert any("daily" in p["title"] for p in pages)
+    assert _events(w, "queued") == []
 
 
 def test_a_dev_image_that_fails_refuses_dispatch_and_offers_rebuild(world: World) -> None:
@@ -680,27 +709,25 @@ def test_dependents_of_a_failed_worker_wait_and_the_job_blocks(world: World) -> 
     assert w.store.get_task(f"{job}-w2").state == "queued"
 
 
-def test_resume_after_the_cap_redispatches(world: World) -> None:  # item 18
+def test_a_full_day_queues_the_workers_and_they_run_when_it_frees(world: World) -> None:  # item 18
     w = world
     job = _request(w)
     held = [
         w.budget.reserve(session_id=None, task_id=f"other-{i}", amount=a, purpose="worker")
         for i, a in enumerate((2.0, 2.0, 0.5))
     ]
+
+    def sleep(s: float) -> None:
+        for rid in held:  # the other work finished
+            w.budget.settle(rid, 0.0)
+
+    w.runner.sleep = sleep  # type: ignore[method-assign]
     item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
     w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
-    assert w.store.get_job(job).state.value == "blocked"
-    for rid in held:
-        w.budget.settle(rid, 0.0)  # the other work finished
-    page = next(
-        p
-        for p in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
-        if "cap" in p["title"]
-    )
-    r = w.client.post(f"/api/inbox/{page['id']}/resume", headers=auth(w.tokens.admin))
-    assert r.status_code == 200, r.text
     assert w.store.get_job(job).state.value == "in_review"
     assert len(w.publisher.prs) == 2
+    assert len(_events(w, "queued")) == 2 and len(_events(w, "dequeued")) == 2
+    assert _no_failure_pages(w)
 
 
 def test_a_failure_before_the_session_never_leaks_the_reservation(  # item 7
@@ -1197,3 +1224,179 @@ def test_a_scripts_edit_is_runner_config_not_needs_deps(world: World) -> None:  
     assert w.store.get_task(f"{job}-w1").state == "failed"  # not needs_deps
     item = _failure_item(w, job)
     assert "changes how tests run" in json.dumps(item["body"])
+
+
+def test_coord_and_worker_sessions_cap_each_calls_output(world: World) -> None:
+    """The gateway holds max_tokens of output against the reservation, so every
+    coord and worker session carries the cap from configs/budgets.yaml."""
+    w = world
+    seen: list[tuple[Role, int | None]] = []
+    w.standin.on_session = lambda spec: seen.append((spec.role, spec.max_output_tokens))
+    _approve(w)
+    cap = 16384  # session_max_output_tokens in configs/budgets.yaml
+    roles = {r for r, _ in seen}
+    assert {Role.COORD, Role.WORKER} <= roles
+    assert all(n == cap for _, n in seen)
+
+
+def test_a_mid_run_budget_refusal_names_the_cap_and_the_shortfall_on_the_page(
+    world: World,
+) -> None:
+    """On main a refused call returns 403 to the CLI and the session ends; it
+    does not pause (checkpoint resume is 2a). The page it raises must say why."""
+    w = world
+    real = w.standin.run
+
+    def run(spec: SessionSpec, token: str, sink: EventSink) -> ExecOutcome:
+        if spec.role is Role.WORKER:
+            w.store.add_event(
+                "gateway_refused",
+                {
+                    "status": 403,
+                    "reason": "budget: this session's output cap is 16384 tokens per call; the "
+                    "session has $0.0100 of its reservation left, enough for 500 output tokens",
+                },
+                "human",
+                job_id=spec.job_id,
+                session_id=spec.session_id,
+                task_id=spec.task_id,
+            )
+            return ExecOutcome("failed", 1, error="API Error: 403")
+        return real(spec, token, sink)
+
+    w.standin.run = run  # type: ignore[method-assign]
+    job = _approve(w)
+    item = _failure_item(w, job)
+    err = json.dumps(item["body"])
+    assert "output cap is 16384" in err and "$0.0100" in err
+
+
+def test_a_session_whose_last_turn_hit_the_cap_is_not_done(world: World) -> None:
+    """stop_reason max_tokens on the final model call: the session failed, and
+    its page says the turn was truncated at the cap."""
+    w = world
+
+    def truncate(spec: SessionSpec) -> None:
+        if spec.role is Role.COORD:
+            from vigild.metering.calls import CallUsage, record_call
+            from vigild.metering.prices import PriceTable
+
+            record_call(
+                w.store,
+                PriceTable(w.runner.cfg.prices),
+                session_id=spec.session_id,
+                task_id=None,
+                job_id=spec.job_id,
+                purpose="session",
+                provider="anthropic",
+                backend_preset="claude-opus",
+                model="claude-opus-5-5",
+                usage=CallUsage(tokens_out=16384),
+                truncated=True,
+            )
+
+    w.standin.on_session = truncate
+    _request(w)
+    pages = json.dumps(w.client.get("/api/inbox", headers=auth(w.tokens.read)).json())
+    assert "truncated at the output cap" in pages
+
+
+def test_a_job_whose_first_call_cannot_fit_is_refused_before_any_session(world: World) -> None:
+    """Preflight at submission: a 422 with the numbers, no job, no session, no attempt."""
+    w = world
+    w.runner.cfg.budgets.coord_session_usd = 0.50
+    before = (len(w.store.list_jobs()), w.store.q("SELECT COUNT(*) n FROM sessions")[0]["n"])
+    r = w.client.post(
+        "/api/jobs",
+        headers=auth(w.tokens.admin),
+        json={"repo": REPO, "title": "t", "request": "r", "why": "w", "value": 3, "risk": 1},
+    )
+    assert r.status_code == 422
+    assert "$0.50" in json.dumps(r.json()) and "claude-opus-5-5" in json.dumps(r.json())
+    after = (len(w.store.list_jobs()), w.store.q("SELECT COUNT(*) n FROM sessions")[0]["n"])
+    assert after == before
+    assert w.standin.calls == []  # no container, so no attempt
+    assert w.store.q("SELECT COUNT(*) n FROM reservations")[0]["n"] == 0
+    assert w.store.q("SELECT COUNT(*) n FROM events")[0]["n"] == 0
+    # the same refusal for a task
+    r = w.client.post("/api/tasks", headers=auth(w.tokens.admin), json={"repo": REPO})
+    assert r.status_code == 422
+
+
+def _work_for(spec: SessionSpec, task: dict[str, Any]) -> None:
+    """A worker's honest change to the one doc its task owns."""
+    f = task["spec"]["files_in_scope"][0]
+    if f in EDITS:
+        _work(spec.clone, f)
+        return
+    (spec.clone / "tests").mkdir(exist_ok=True)
+    (spec.clone / "tests" / "test_extra.py").write_text(
+        "from pathlib import Path\n\n\ndef test_extra():\n"
+        "    assert 'extra' in Path('docs/extra.md').read_text()\n"
+    )
+    (spec.clone / "docs").mkdir(exist_ok=True)
+    (spec.clone / "docs" / "extra.md").write_text("extra\n")
+
+
+def _peak_open(w: World) -> list[float]:
+    """Open reservations (today) seen as each session starts."""
+    seen: list[float] = []
+    w.standin.on_session = lambda spec: seen.append(w.budget.open_today())
+    return seen
+
+
+def test_one_jobs_peak_reservation_fits_the_daily_cap(world: World) -> None:
+    """On main the coord settles before workers start, so a job's peak is
+    max(coord reservation, the first wave's workers). Two independent workers
+    reserve per_task_usd each; the peak must fit under the daily cap."""
+    w = world
+    seen = _peak_open(w)
+    job = _approve(w)
+    cfg = w.runner.cfg.budgets
+    wave = len([t for t in w.store.list_tasks(job) if not t.contract.get("depends_on")])
+    assert wave == 2
+    assert max(seen) == pytest.approx(max(cfg.coord_session_usd, wave * cfg.per_task_usd))
+    assert max(seen) <= cfg.daily_usd
+    assert w.budget.open_today() == 0
+
+
+def test_a_third_worker_waits_for_the_day_then_runs(world: World) -> None:
+    """Three workers at $2 against a $5 day: two run, the third queues, and it
+    runs once one of them settles. Nothing fails, nothing pages, no attempt is
+    used, and the open reservations never pass the daily cap."""
+    w = world
+    cfg = w.runner.cfg.budgets
+    assert 3 * cfg.per_task_usd > cfg.daily_usd  # the premise, from the real config
+
+    def three(job: str) -> tuple[str, str]:
+        doc = json.loads(plan(job).split("```json\n")[1].split("\n```")[0])
+        w3 = {
+            **doc["workers"][1],
+            "task_id": f"{job}-w3",
+            "goal": "third",
+            "test_cmd": "pytest -q tests/test_extra.py",
+            "files_in_scope": ["docs/extra.md", "tests/test_extra.py"],
+        }
+        doc["workers"].append(w3)
+        text = plan(job).split("```json\n")[0] + "```json\n" + json.dumps(doc) + "\n```\n"
+        spec = SPEC.replace(
+            "- `tests/test_runbook.py`\n",
+            "- `tests/test_runbook.py`\n- `docs/extra.md`\n- `tests/test_extra.py`\n",
+        )
+        return spec, text
+
+    w.standin.coord_drafts = [three]
+    w.runner.sleep = lambda s: time.sleep(0.01)  # type: ignore[method-assign]
+    seen = _peak_open(w)
+    w.standin.worker_edit = _work_for
+    job = _approve(w)
+    workers = [c for c in w.standin.calls if c[0] == "worker"]
+    assert len(workers) == 3
+    assert w.standin.max_running <= 2
+    assert max(seen) <= cfg.daily_usd
+    queued = _events(w, "queued")
+    assert [e["task_id"] for e in queued] == [f"{job}-w3"]
+    assert [e["task_id"] for e in _events(w, "dequeued")] == [f"{job}-w3"]
+    assert _no_failure_pages(w)
+    assert w.store.get_job(job).state.value == "in_review"
+    assert w.budget.open_today() == 0
