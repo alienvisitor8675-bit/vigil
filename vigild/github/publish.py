@@ -66,6 +66,24 @@ class RestPulls:
         url: str = r.json()["html_url"]
         return url
 
+    def state(self, repo: str, number: int) -> str:
+        """A PR's state: open, merged or closed (vigild's PR poll, plan 2a item 5)."""
+        r = self.http.get(
+            f"{self.api}/repos/{repo}/pulls/{number}",
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=30.0,
+        )
+        if r.status_code != 200:
+            raise PublishError(f"reading {repo}#{number} failed (HTTP {r.status_code})")
+        doc = r.json()
+        if doc.get("merged"):
+            return "merged"
+        return "closed" if doc.get("state") == "closed" else "open"
+
 
 def out_of_scope(changed: Sequence[str], scope: Sequence[str]) -> list[str]:
     """Changed files that are neither in scope nor vigil's own artifacts."""

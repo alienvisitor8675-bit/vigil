@@ -161,11 +161,14 @@ def _github_app(v: Vigild) -> Any:
 def build_runner(v: Vigild, app: Any) -> JobRunner:
     """The real executor, workspace and publisher behind the job service."""
     import docker
+    import httpx2
 
+    from vigild.db import utcnow
     from vigild.devimage import DockerImages, SessionImages
     from vigild.executors.runtime import DockerRuntime, DockerTestRunner
     from vigild.github.app import READ_ONLY
-    from vigild.jobs.runner import GitHubPublisher, NoPublisher, Publisher
+    from vigild.jobs.deps import DepsExecutor, HttpRegistry
+    from vigild.jobs.runner import GitHubPRs, GitHubPublisher, NoPublisher, Publisher
     from vigild.verifier import Verifier
     from vigild.workspace import Workspace
 
@@ -203,6 +206,14 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         reaper=runtime.reap,
         session_images=sessions,
         breakers=v.gateway.breakers,
+        deps=DepsExecutor(
+            ws,
+            runtime.run_deps,
+            HttpRegistry(httpx2.Client(timeout=30)),
+            utcnow,
+            v.cfg.vigild.data_path / "deps",
+        ),
+        pr_state=GitHubPRs(app).state if app else None,
     )
     runner.closers.append(client.close)
     images.on_failure = runner.dev_image_failed
@@ -237,6 +248,12 @@ def start_pollers(v: Vigild, app: Any, runner: JobRunner) -> threading.Event:
 
     stop = threading.Event()
     sched = v.cfg.vigild.scheduler
+    if runner.pr_state is not None:
+        # merged and closed fleet PRs: a deps job's merge resumes its parent (item 5)
+        threading.Thread(
+            target=every, args=(sched.pr_poll_seconds, runner.poll_prs, stop),
+            name="vigil-prs", daemon=True,
+        ).start()  # fmt: skip
     if app is not None and any(p.intake for p in v.cfg.repos.repos.values()):
         import httpx2
 

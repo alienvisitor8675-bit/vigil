@@ -211,7 +211,13 @@ def transition(
                     f"no transition {frm.value} -> {to.value}; it can only resume "
                     f"{job.blocked_from.value if job.blocked_from else '?'}, re-plan or abandon"
                 )
-            if not owner_inbox:
+            deps_merged = (
+                actor is Actor.VIGILD
+                and evidence.get("action") == "deps_merged"
+                and job.blocked_on is not None
+                and to == job.blocked_from
+            )
+            if not owner_inbox and not deps_merged:
                 raise TransitionError("only the owner, from the inbox, moves a held job")
             if to == job.blocked_from and job.blocked_on:
                 # round 3: back to work only once the deps job it waits for has merged

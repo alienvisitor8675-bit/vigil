@@ -245,6 +245,39 @@ def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict
     }
 
 
+def deps_kwargs(cfg: Config, image: str, work: Path, *, network: str) -> dict[str, Any]:
+    """A deps job's build container (B39): the repo's dev image, its
+    manifests and lockfiles at /work (nothing else of the repo, no .git), the
+    agent uid with no capabilities, its own internal network whose proxy
+    allows the registries only. No secret, no gateway token, no model."""
+    uid = cfg.vigild.container.uid
+    proxy = f"http://{cfg.egress.proxy.alias}:{cfg.egress.proxy.port}"
+    return {
+        "image": image,
+        "entrypoint": ["sh", "-c"],
+        "user": f"{uid}:{uid}",
+        "network": network,
+        "environment": {
+            "HTTP_PROXY": proxy,
+            "HTTPS_PROXY": proxy,
+            "HOME": "/tmp/home",  # noqa: S108
+            # a dev image installs offline and frozen; this one resolves
+            "UV_OFFLINE": "false",
+            "UV_FROZEN": "false",
+            "UV_NO_CACHE": "false",
+            "UV_CACHE_DIR": "/tmp/uv-cache",  # noqa: S108
+            "UV_PYTHON_DOWNLOADS": "never",
+            "npm_config_cache": "/tmp/npm-cache",  # noqa: S108
+            "pnpm_config_store_dir": "/tmp/pnpm-store",  # noqa: S108
+        },
+        "mounts": [_mount(str(work), "/work", read_only=False)],
+        "tmpfs": {"/tmp": f"rw,exec,size=2g,uid={uid},gid={uid},mode=1777"},  # noqa: S108
+        "working_dir": "/work",
+        "labels": {LABEL: f"deps-{work.name}", "dev.vigil.role": "deps"},
+        **_hardening(cfg),
+    }
+
+
 class DockerTestRunner:
     """Runs one test_cmd in a fresh verifier container and reads its output
     stream itself: at most `max_output` bytes are kept, and the container is
@@ -420,6 +453,40 @@ class DockerRuntime:
             finally:
                 with suppress(docker.errors.APIError):
                     worker.remove(force=True)
+
+    def run_deps(
+        self, image: str, work: Path, command: str, timeout_s: int = 900
+    ) -> tuple[int, str]:
+        """A deps job's package-manager run (B39): `deps_kwargs` on its own
+        internal network behind a registry-only proxy. Returns the exit code
+        and the output's tail."""
+        import docker.errors
+
+        from vigild.jobs.model import Role
+
+        sid = f"deps-{secrets.token_hex(5)}"
+        spec = SessionSpec(
+            session_id=sid, role=Role.DEPS, job_id="", task_id=None, repo="", preset="none",
+            model="", clone=work, session_dir=self.cfg.vigild.data_path / "sessions" / sid,
+            max_turns=0, max_minutes=timeout_s // 60, max_budget_usd=0.0,
+        )  # fmt: skip
+        with self._network(spec, lambda e: None) as net_name:
+            kw = deps_kwargs(self.cfg, image, work, network=net_name)
+            kw["mounts"] = _docker_mounts(kw["mounts"])
+            c = self.client.containers.create(command=[command], **kw)
+            try:
+                c.start()
+                try:
+                    code = int(c.wait(timeout=timeout_s).get("StatusCode", -1))
+                except Exception:
+                    with suppress(docker.errors.APIError):
+                        c.kill()
+                    return -1, f"the package manager took over {timeout_s} s"
+                out = c.logs(stdout=True, stderr=True).decode(errors="replace")
+                return code, out[-20000:]
+            finally:
+                with suppress(docker.errors.APIError):
+                    c.remove(force=True)
 
     def reap(self) -> int:
         """At startup: remove every container and network a session left behind."""

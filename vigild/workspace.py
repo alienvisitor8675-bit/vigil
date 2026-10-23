@@ -380,10 +380,17 @@ class Workspace:
         mirror = self.mirror(repo)
         return self._git(mirror, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
 
-    def _tree_entries(self, repo: str, sha: str, paths: list[str]) -> dict[str, tuple[str, str]]:
+    def _origin(self, repo: str, source: str) -> Path:
+        if source not in ("vault", "mirror"):
+            raise WorkspaceError(f"bad source {source!r}")
+        return self.vault(repo) if source == "vault" else self._mirror_path(repo)
+
+    def _tree_entries(
+        self, repo: str, sha: str, paths: list[str], source: str = "mirror"
+    ) -> dict[str, tuple[str, str]]:
         if not SHA.match(sha):
             raise WorkspaceError("bad sha")
-        out = self._git(self._mirror_path(repo), "ls-tree", "-z", sha, "--", *paths)
+        out = self._git(self._origin(repo, source), "ls-tree", "-z", sha, "--", *paths)
         entries: dict[str, tuple[str, str]] = {}
         for entry in filter(None, out.split("\0")):
             meta, _, name = entry.partition("\t")
@@ -392,16 +399,22 @@ class Workspace:
                 entries[name] = (mode, blob)
         return entries
 
-    def blob_ids(self, repo: str, sha: str, paths: list[str]) -> dict[str, str | None]:
-        """Each path's blob id at `sha` in the mirror; None if absent or not a regular file."""
-        entries = self._tree_entries(repo, sha, paths)
+    def blob_ids(
+        self, repo: str, sha: str, paths: list[str], source: str = "mirror"
+    ) -> dict[str, str | None]:
+        """Each path's blob id at `sha` (in the mirror, or the vault for a deps
+        job's head); None if absent or not a regular file."""
+        entries = self._tree_entries(repo, sha, paths, source)
         return {p: (entries[p][1] if p in entries else None) for p in paths}
 
-    def export_files(self, repo: str, sha: str, paths: list[str], dest: Path) -> None:
+    def export_files(
+        self, repo: str, sha: str, paths: list[str], dest: Path, source: str = "mirror"
+    ) -> None:
         """Write the regular files among `paths` at `sha` under `dest` (a dev
-        image's build context: lockfiles only, never the source)."""
-        mirror = self._mirror_path(repo)
-        for path, (mode, blob) in self._tree_entries(repo, sha, paths).items():
+        image's build context, or a deps job's work dir: lockfiles and
+        manifests only, never the source)."""
+        mirror = self._origin(repo, source)
+        for path, (mode, blob) in self._tree_entries(repo, sha, paths, source).items():
             if path.startswith("/") or ".." in Path(path).parts:
                 raise WorkspaceError(f"bad path {path!r}")
             size = int(self._git(mirror, "cat-file", "-s", blob))
@@ -430,6 +443,58 @@ class Workspace:
             self.vault(repo), "diff", "--no-renames", "--no-ext-diff", "--no-textconv",
             base_sha, head, "--", path,
         )  # fmt: skip
+
+    def commit_files(self, clone: Path, task_id: str, files: dict[str, bytes], message: str) -> str:
+        """vigild's own commit in a clone no session has touched (a deps job's
+        manifests and lockfiles, plan 2a item 5), taken into the vault as
+        `refs/vigil/<task>`. Returns the head."""
+        for path in files:
+            if path.startswith("/") or ".." in Path(path).parts:
+                raise WorkspaceError(f"bad path {path!r}")
+        for path, data in files.items():
+            target = clone / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        self.commit_before_session(clone, sorted(files), message)
+        branch = self._git(clone, "symbolic-ref", "--short", "HEAD")
+        head = self._git(clone, "rev-parse", "HEAD")
+        repo = json.loads((self.data_dir / "clones" / f"{task_id}.base").read_text())["repo"]
+        vault = self.vault(repo)
+        with self._repo_lock(f"vault:{repo}"):
+            self._git(
+                vault, "fetch", "--quiet", "--no-tags", str(self._mirror_path(repo)),
+                "+refs/heads/*:refs/mirror/*",
+            )  # fmt: skip
+            self._git(
+                vault, "fetch", "--quiet", "--no-tags", str(clone),
+                f"+refs/heads/{branch}:refs/vigil/{task_id}",
+            )  # fmt: skip
+        return head
+
+    def overlay(
+        self, clone: Path, repo: str, base_sha: str, head: str, *, skip: set[str]
+    ) -> list[str]:
+        """Lay a worker's changes from the vault (base to head) over a fresh
+        clone, uncommitted: regular files written, deletions made; paths in
+        `skip` (manifests and lockfiles) and under `.vigil/` left as the clone
+        has them. A
+        committed symlink reads as nothing and isn't laid. Returns the paths."""
+        laid = []
+        for status, path in self.changed(repo, base_sha, head):
+            if path in skip or path.startswith(("/", ".vigil/")) or ".." in Path(path).parts:
+                continue  # vigild's artifacts and the old report aren't the work
+            target = clone / path
+            if status == "D":
+                target.unlink(missing_ok=True)
+                laid.append(path)
+                continue
+            text = self.read_blob(repo, head, path)
+            if text is None:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+            laid.append(path)
+        return laid
 
     def full_diff(self, repo: str, base_sha: str, head: str) -> str:
         """The whole change, base to head, from the vault (what a reviewer reads)."""

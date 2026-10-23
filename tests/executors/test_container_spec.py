@@ -267,3 +267,22 @@ def test_a_resumed_session_gets_its_transcript_read_only(cfg: Config, spec: Sess
     kw = worker_kwargs(cfg, spec, network="vigil-s-abc123")
     assert "VIGIL_RESUME_SESSION" not in kw["environment"]
     assert not [m for m in kw["mounts"] if m["Target"] == "/vigil/resume.jsonl"]
+
+
+def test_a_deps_container_reaches_the_registries_only(cfg: Config, tmp_path: Path) -> None:
+    """Plan 2a, item 5 (B39): no gateway, no secret, no token, the work dir
+    (manifests and lockfiles) the only mount."""
+    from vigild.executors.runtime import deps_kwargs
+
+    assert allowlist(cfg, Role.DEPS) == ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]
+    assert cfg.egress.gateway.host not in allowlist(cfg, Role.DEPS)
+    work = tmp_path / "deps-abc"
+    kw = deps_kwargs(cfg, "vigil-dev/x:1", work, network="vigil-deps-abc")
+    assert kw["mounts"] == [
+        {"Target": "/work", "Source": str(work), "Type": "bind", "ReadOnly": False}
+    ]
+    assert kw["user"] == "10001:10001" and kw["cap_drop"] == ["ALL"] and "cap_add" not in kw
+    assert kw["read_only"] is True and kw["network"] == "vigil-deps-abc"
+    env = kw["environment"]
+    assert not any("TOKEN" in k or "KEY" in k or "ANTHROPIC" in k for k in env)
+    assert env["HTTPS_PROXY"].startswith("http://egress:")

@@ -30,6 +30,7 @@ class Role(StrEnum):
     REVIEWER = "reviewer"
     AUDITOR = "auditor"
     SUBAGENT = "subagent"
+    DEPS = "deps"  # a deps job's build container: no model, registry egress only (B39)
 
 
 class FixDepthExceeded(ValueError):

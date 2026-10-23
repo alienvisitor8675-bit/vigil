@@ -336,6 +336,76 @@ class JobService:
         )
         return []
 
+    def file_deps(
+        self, job_id: str, deps: list[Any], parent_id: str, parent_tasks: list[str]
+    ) -> list[str]:
+        """A deps job's spec (plan 2a, item 5; B39), rendered by vigild from
+        the requests: the deps gate, then Specs to approve. Approving it is the
+        owner's go-ahead for the package manager to run."""
+        from vigild.jobs.deps import check_requests
+
+        job = self.store.get_job(job_id)
+        pol = self.cfg.repo(job.repo)
+        reqs = [d.model_dump() for d in deps]
+        names = ", ".join(f"{d['package']}=={d['version']} ({d['ecosystem']})" for d in reqs)
+        errors = check_requests(list(pol.dev_lockfiles), list(deps))
+        why = "; ".join(str(d.get("why") or "") for d in reqs if d.get("why"))[:500]
+        self.store.add_artifact(
+            job_id, "intake.json",
+            json.dumps({"why": f"{parent_id} needs {names}", "value": 3, "risk": 2,
+                        "source": "self", "labels": ["deps"]}),
+            Provenance.HUMAN,
+        )  # fmt: skip
+        self.store.add_artifact(
+            job_id, "deps.json",
+            json.dumps({"deps": reqs, "parent_job": parent_id, "parent_tasks": parent_tasks}),
+            Provenance.CLAUDE,  # the requests came from a worker
+        )  # fmt: skip
+        files = "\n".join(f"- `{f}`" for f in pol.dev_lockfiles)
+        spec = (
+            f"# Spec: deps: {names}\n\n## Goal\nAdd {names}, which {', '.join(parent_tasks)} "
+            f"(job `{parent_id}`) needs.\n\n## Non-goals\n- Any change outside the manifests' "
+            "dependency fields and the lockfiles.\n\n## Acceptance criteria\n- AC1: the lockfiles "
+            "hold the requested versions, and every package they newly pull in is at least 14 days "
+            "old by its registry. test: vigild's deps checks\n- AC2: the dev image rebuilds from "
+            "them and every suite passes offline. test: the dev image validation\n\n"
+            f"## Files in scope\n{files}\n\n## Files out of scope\n- everything else\n\n"
+            "## Money paths\nnone\n\n## Risks\n- A supply-chain change: the owner reviews the PR.\n"
+            f"- The worker's reason (untrusted): {why or '(none given)'}\n\n"
+            "## Rollback\nRevert the PR.\n"
+        )
+        plan = (
+            "# Plan\n\nOne deps task, no model (B39): the package manager's lockfile-only update "
+            "in a build container with registry egress only, the checks, the dev image rebuilt "
+            "and validated, and its own PR at rung 1.\n\n```json\n"
+            + json.dumps({"deps": reqs, "lockfiles": pol.dev_lockfiles}, indent=1)
+            + "\n```\n"
+        )
+        self.store.add_artifact(job_id, "spec.md", spec, Provenance.HUMAN)
+        self.store.add_artifact(job_id, "plan.md", plan, Provenance.HUMAN)
+        self.store.add_artifact(
+            job_id, "spec_gate.json", json.dumps({"ok": not errors, "errors": errors}),
+            Provenance.HUMAN,
+        )  # fmt: skip
+        if errors:
+            self.page(job_id, f"{job_id}: the deps gate refused", {"errors": errors,
+                      "actions": ["abandon"]})  # fmt: skip
+            return errors
+        self.store.create_inbox_item(
+            "specs", "spec", job_id, f"Approve deps job: {names}"[:200],
+            {
+                "repo": job.repo, "deps": reqs, "parent_job": parent_id,
+                "parent_tasks": parent_tasks, "shape": "deps", "money_paths": [],
+                "workers": [{
+                    "task_id": f"{job_id}-w1", "goal": f"deps: {names}",
+                    "test_cmd": "(no model; the dev image's suites, offline)",
+                    "must_fail_first": False, "changes_how_tests_run": list(pol.dev_lockfiles),
+                    "size": "S", "files_in_scope": list(pol.dev_lockfiles), "depends_on": [],
+                }],
+            },
+        )  # fmt: skip
+        return []
+
     def page(
         self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
     ) -> InboxItem:

@@ -123,3 +123,30 @@ def test_vigil_artifacts_are_always_in_scope(tmp_path: Path, fixture_repo: dict[
     r = finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
     head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base, head=r["head"])
     assert _pub(ws, base, head, FakePulls(fixture_repo["bare"])).endswith("/pull/1")
+
+
+def test_the_pr_poll_reads_a_prs_state() -> None:
+    """Plan 2a, item 5: merged, closed or open, from GitHub's pulls API."""
+    import httpx2
+
+    from vigild.github.publish import RestPulls
+
+    answers = {"1": {"merged": True, "state": "closed"}, "2": {"merged": False, "state": "closed"},
+               "3": {"merged": False, "state": "open"}}  # fmt: skip
+
+    def handler(req: httpx2.Request) -> httpx2.Response:
+        assert req.headers["authorization"] == "Bearer ghs_read"
+        return httpx2.Response(200, json=answers[req.url.path.rsplit("/", 1)[1]])
+
+    pulls = RestPulls(httpx2.Client(transport=httpx2.MockTransport(handler)), "ghs_read")
+    assert [pulls.state("o/x", n) for n in (1, 2, 3)] == ["merged", "closed", "open"]
+
+
+def test_the_pr_poll_reads_only_the_repos_own_prs() -> None:
+    import pytest
+
+    from vigild.github.publish import PublishError
+    from vigild.jobs.runner import GitHubPRs
+
+    with pytest.raises(PublishError):
+        GitHubPRs(app=None).state("o/x", "https://github.com/o/other/pull/1")

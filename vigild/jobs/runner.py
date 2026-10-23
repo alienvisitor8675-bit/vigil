@@ -157,6 +157,8 @@ class JobRunner:
         background: bool = True,
         reaper: Callable[[], int] | None = None,
         breakers: Breakers | None = None,
+        deps: Any = None,
+        pr_state: Callable[[str, str], str] | None = None,
     ) -> None:
         self.cfg = cfg
         self.store = store
@@ -179,6 +181,8 @@ class JobRunner:
         self._running_lock = threading.Lock()
         self.closers: list[Callable[[], None]] = []  # e.g. the docker client (item 0)
         self.ladder = Ladder(store, cfg)
+        self.deps = deps  # the deps executor (item 5); None: deps jobs fail
+        self.pr_state = pr_state  # (repo, pr url) -> open | merged | closed
         # one set of breakers, shared with the gateway (item 4)
         self.breakers = breakers or Breakers(store, cfg)
         self.breakers.pager = self._breaker_page
@@ -482,14 +486,15 @@ class JobRunner:
         assert self.jobs is not None
         self.jobs.page(job_id, title, body, resumable=resumable)
 
-    def _block(self, job_id: str, reason: str) -> None:
+    def _block(self, job_id: str, reason: str, blocked_on: str | None = None) -> None:
         try:
             job = self.store.get_job(job_id)
             if job.state in (JobState.BLOCKED, JobState.ESCALATED, JobState.DONE):
                 return
-            transition(
-                self.store, job_id, JobState.BLOCKED, Actor.VIGILD, evidence={"reason": reason}
-            )
+            evidence: dict[str, Any] = {"reason": reason}
+            if blocked_on is not None:
+                evidence["blocked_on"] = blocked_on
+            transition(self.store, job_id, JobState.BLOCKED, Actor.VIGILD, evidence=evidence)
         except TransitionError, KeyError:
             log.warning("could not block %s", job_id)
 
@@ -897,6 +902,9 @@ class JobRunner:
 
     def _plan_and_dispatch(self, job_id: str) -> None:
         job = self.store.get_job(job_id)
+        if self.store.get_artifact(job_id, "deps.json") is not None:
+            self._plan_deps(job)
+            return
         art = self.store.get_artifact(job_id, "plan.md")
         assert art is not None
         workers = parse_plan(art.content).workers
@@ -1100,8 +1108,8 @@ class JobRunner:
 
     def _hold_failed(self, job_id: str, task_ids: list[str]) -> None:
         """Block the job with one item: retry (when every failed task has budget
-        left), re-plan, or abandon. It counts toward the repo's failures."""
-        self.job_failed(self.store.get_job(job_id))
+        left), re-plan, or abandon. It counts toward the repo's failures. A task
+        that needs a dependency instead gets a child deps job (item 5)."""
         tasks: dict[str, dict[str, Any]] = {}
         can_retry = True
         for tid in task_ids:
@@ -1118,29 +1126,30 @@ class JobRunner:
             can_retry = can_retry and left >= MIN_RETRY_USD
         deps = any("needs_deps" in t for t in tasks.values())
         if deps:
-            # retry once the deps PR has merged: the base moves, so the dev image
-            # key changes and vigild builds the new image first
-            actions = (["retry"] if can_retry else []) + ["abandon"]
-            self._block(job_id, "needs_deps")
+            # item 5: a child deps job; this job resumes on its own when it merges
+            wanted = [d for t in tasks.values() for d in t.get("needs_deps", [])]
+            child = self._spawn_deps(
+                job_id, [tid for tid, t in tasks.items() if "needs_deps" in t], wanted
+            )
+            if child is None:
+                return  # the job tree's fix-depth breaker paged and holds it
+            self._block(job_id, "needs_deps", blocked_on=child)
             self._page(
                 job_id,
                 f"{job_id}: needs dependencies: "
-                + ", ".join(
-                    f"{d['package']}@{d['version']}"
-                    for t in tasks.values()
-                    for d in t.get("needs_deps", [])
-                )[:250],
+                + ", ".join(f"{d['package']}@{d['version']}" for d in wanted)[:250],
                 {
                     "kind": "needs_deps",
                     "tasks": tasks,
-                    "actions": actions,
-                    "next": "a deps job changes only the manifest and lockfile, rebuilds the dev "
-                    "image and lands as its own PR (phase 2 builds it; until then, by hand). "
-                    "Retry this job after that PR merges.",
+                    "deps_job": child,
+                    "actions": ["abandon"],
+                    "next": f"deps job {child} waits in Specs to approve. It changes only the "
+                    "manifests and lockfiles, rebuilds the dev image, runs the suites and opens "
+                    "its own PR; when that merges, this job resumes on its own.",
                 },
-                resumable=can_retry,
             )
             return
+        self.job_failed(self.store.get_job(job_id))
         actions = (["retry"] if can_retry else []) + ["replan", "abandon"]
         self._block(job_id, f"workers failed: {sorted(task_ids)}")
         titles = "; ".join(str(t.get("title") or tid) for tid, t in tasks.items())
@@ -1157,6 +1166,9 @@ class JobRunner:
         page: dispatch halts."""
         held: dict[str, tuple[int, float]] = {}
         for tid in task_ids:
+            if self.store.get_task(tid).contract.get("shape") == "deps":
+                held[tid] = (0, 0.0)  # a deps job runs no model: nothing to reserve
+                continue
             _, _, amount = self.remaining(tid)
             try:
                 if amount < MIN_RETRY_USD:
@@ -1199,6 +1211,8 @@ class JobRunner:
     def _run_worker(self, job_id: str, task_id: str, reservation: int, amount: float) -> bool:
         held: dict[str, SessionRow] = {}
         try:
+            if self.store.get_task(task_id).contract.get("shape") == "deps":
+                return self._deps_worker(job_id, task_id, held)
             return self._worker(job_id, task_id, reservation, amount, held)
         except Exception as e:  # the reservation never leaks (item 7)
             log.exception("worker %s failed", task_id)
@@ -1283,6 +1297,15 @@ class JobRunner:
                 paths.append(f".vigil/{job_id}/{name}")
         if paths and not start:
             self.workspace.commit_before_session(clone, paths, f"vigil: {job_id} spec and plan")
+        after_deps: list[str] = []
+        if prev is not None and not start and prev.detail.get("needs_deps_head"):
+            # item 5: its dependency has landed; it goes on from the new base, its
+            # earlier changes laid over (manifests and lockfiles as main has them)
+            locks = set(self.cfg.repo(job.repo).dev_lockfiles)
+            after_deps = self.workspace.overlay(
+                clone, job.repo, str(prev.detail.get("base_sha")),
+                str(prev.detail["needs_deps_head"]), skip=locks,
+            )  # fmt: skip
         self.workspace.write_task(clone, {**contract, "base_sha": base_sha})
         approval = self.store.get_artifact(job_id, "approval.json")
         edits = json.loads(approval.content).get("edits") if approval else None
@@ -1296,8 +1319,18 @@ class JobRunner:
         # carries on (item 3).
         escalated = str(t.tier_reason or "").startswith("rule5")
         resume = (
-            self._resume_from(prev.id) if prev and (published or escalated or crashed) else None
+            self._resume_from(prev.id)
+            if prev and (published or escalated or crashed or after_deps)
+            else None
         )
+        if after_deps:
+            packet.parts["contract"] += (
+                "\n**Your dependency has landed on the base.** Your earlier changes are in "
+                "the work tree, uncommitted: "
+                + ", ".join(f"`{p}`" for p in after_deps[:30])
+                + ". Finish the task with the dependency available; don't change manifests "
+                "or lockfiles.\n"
+            )
         max_turns = int(contract.get("limits", {}).get("max_turns") or 60)
         if crashed:
             max_turns = max(1, max_turns - self._turns_used(resume))
@@ -1433,7 +1466,9 @@ class JobRunner:
             # owner direction, round 3: a dependency change is its own (deps) job;
             # this task waits for it instead of being verified against the base
             if s is not None:
-                self.store.update_session(s.id, status="waiting")
+                self.store.update_session(
+                    s.id, status="waiting", detail={"needs_deps_head": head, "base_sha": base_sha}
+                )
             self.store.update_task(task_id, state="needs_deps")
             with self._why_lock:
                 self._why[task_id] = {"title": f"{task_id} needs dependencies", **needs}
@@ -1540,6 +1575,220 @@ class JobRunner:
             task_id=task_id,
         )
         return True
+
+    # --- deps jobs (phase 2a, item 5; B39) ------------------------------------------------
+
+    def _spawn_deps(
+        self, parent_id: str, tasks: list[str], wanted: list[dict[str, Any]]
+    ) -> str | None:
+        """A child deps job for what a job's tasks need, filed for the owner's
+        approval like any spec. Past the fix depth, its breaker trips instead."""
+        from vigild.contract.models import DepRequest
+
+        parent = self.store.get_job(parent_id)
+        reqs: list[DepRequest] = []
+        for d in wanted:
+            try:
+                r = DepRequest.model_validate(d)
+            except ValidationError:
+                continue
+            if all((r.ecosystem, r.package) != (x.ecosystem, x.package) for x in reqs):
+                reqs.append(r)
+        names = ", ".join(f"{r.package}=={r.version}" for r in reqs)[:150]
+        child = self.child_job(
+            parent_id, repo=parent.repo, base=parent.base, title=f"deps: {names}",
+            request=f"Add {names} for {', '.join(tasks)} (from {parent_id}).", notes=[],
+            source="self", provenance=Provenance.CLAUDE,
+        )  # fmt: skip
+        if child is None:
+            return None
+        assert self.jobs is not None
+        self.jobs.file_deps(child.id, reqs, parent_id, tasks)  # type: ignore[attr-defined]
+        self.store.add_event(
+            "deps_job", {"child": child.id, "deps": [r.model_dump() for r in reqs]},
+            Provenance.HUMAN, job_id=parent_id,
+        )  # fmt: skip
+        return child.id
+
+    def _plan_deps(self, job: Job) -> None:
+        """Planning for a deps job: one task, shape deps, no model."""
+        doc = json.loads(self.store.get_artifact(job.id, "deps.json").content)  # type: ignore[union-attr]
+        tid = f"{job.id}-w1"
+        lockfiles = list(self.cfg.repo(job.repo).dev_lockfiles)
+        task = Task(
+            task_id=tid,
+            repo=job.repo,
+            base=job.base,
+            branch=f"vigil/{tid}",
+            why=job.request,
+            value=3,
+            risk=2,
+            job_id=job.id,
+            source="self",  # type: ignore[arg-type]
+            spec=Spec(
+                goal=job.title,
+                files_in_scope=lockfiles,
+                done_when="the manifests and lockfiles hold the requested versions; the dev "
+                "image rebuilds and its suites pass offline",
+            ),
+            limits=Limits(max_cost_usd=0.01),
+            labels=["deps"],
+            shape="deps",  # type: ignore[arg-type]
+            parent_task=",".join(doc.get("parent_tasks") or []) or None,
+        )
+        contract = task.model_dump(mode="json")
+        try:
+            self.store.get_task(tid)
+            self.store.update_task(tid, contract=contract)
+        except KeyError:
+            self.store.create_task(job.id, contract, Provenance.HUMAN)
+        self.store.route_task(
+            tid, tier="deps", tier_reason="shape:deps (no model; B39)", backend_preset="none"
+        )
+        transition(self.store, job.id, JobState.BUILDING, Actor.VIGILD)
+        self.dispatch(job.id)
+
+    def _deps_worker(self, job_id: str, task_id: str, held: dict[str, SessionRow]) -> bool:
+        """The deps executor (B39): no model. The lockfile-only update in a
+        registry-only build container, the checks, vigild's own commit, the
+        dev image rebuilt and validated on the new lockfiles, and the PR."""
+        from vigild.contract.models import DepRequest
+
+        if self.deps is None:
+            return self._fail(job_id, None, task_id, f"{task_id}: no deps executor", {})
+        job = self.store.get_job(job_id)
+        t = self.store.get_task(task_id)
+        doc = json.loads(self.store.get_artifact(job_id, "deps.json").content)  # type: ignore[union-attr]
+        reqs = [DepRequest.model_validate(d) for d in doc["deps"]]
+        branch = str(t.contract["branch"])
+        s = self.store.create_session(
+            job_id, Role.WORKER, task_id=task_id, backend_preset="none", branch=branch,
+            provenance=Provenance.HUMAN,
+        )  # fmt: skip
+        held["s"] = s
+        self.store.update_session(s.id, status="running", started_at=iso(), detail={"deps": True})
+        self.store.update_task(task_id, state="running")
+        clone = self.workspace.clone(job.repo, task_id, branch=branch, base=job.base)
+        base_sha = self.workspace.base_sha(task_id)
+        lockfiles = list(self.cfg.repo(job.repo).dev_lockfiles)
+        try:
+            image = self.dev_images.ensure_fresh(job.repo, base_sha)
+        except StaleDevImage as e:
+            return self._fail(
+                job_id, s, task_id, f"{task_id}: dev image not fresh", {"error": str(e)}
+            )
+        res = self.deps.run(job.repo, base_sha, lockfiles, reqs, image)
+        self.store.add_artifact(
+            job_id, "deps_report.json",
+            json.dumps({"added": res.added, "errors": res.errors, "output": res.output}),
+            Provenance.HUMAN, task_id=task_id,
+        )  # fmt: skip
+        if res.errors:
+            return self._fail(
+                job_id, s, task_id, f"{task_id}: deps job refused",
+                {"errors": res.errors, "added": res.added},
+            )  # fmt: skip
+        names = ", ".join(f"{r.package}=={r.version}" for r in reqs)
+        head = self.workspace.commit_files(clone, task_id, res.files, f"deps: {names}")
+        try:
+            # the full suite, offline, on the base plus the new lockfiles
+            new_image = self.dev_images.ensure_fresh(job.repo, head, source="vault")
+        except StaleDevImage as e:
+            return self._fail(
+                job_id, s, task_id, f"{task_id}: the new lockfiles fail the suites",
+                {"error": str(e)},
+            )  # fmt: skip
+        report = WorkerReport.model_validate({
+            "task_id": task_id, "job_id": job_id, "files_changed": sorted(res.files),
+            "summary": f"Adds {names}. New in the lockfiles: {', '.join(res.added) or 'none'}.",
+            "self_check": {"test_failed_first": False, "outside_scope": [], "not_done": "nothing",
+                           "reviewer_would_flag": "the new packages", "could_delete": "nothing"},
+            "provenance": "human",
+        })  # fmt: skip
+        self.store.add_artifact(
+            job_id, "worker_report.json", report.model_dump_json(), Provenance.HUMAN,
+            task_id=task_id,
+        )  # fmt: skip
+        body = (
+            f"Deps job `{job_id}` (no model; B39). Adds {names} for `{job.parent_job_id}`.\n\n"
+            f"New in the lockfiles, each at least 14 days old by its registry: "
+            f"{', '.join(res.added) or 'none'}.\n\nThe dev image `{new_image}` was rebuilt from "
+            "these lockfiles and every suite passed offline. Shape `deps`, rung 1: **the owner "
+            "reviews every deps PR.** Opened by vigild; a human merges."
+        )
+        try:
+            url = self.publisher.publish(
+                repo=job.repo, head=head, base_sha=base_sha, branch=branch, base=job.base,
+                title=f"[vigil {job_id}] deps: {names}"[:200], body=body, scope=lockfiles,
+            )  # fmt: skip
+        except PublishError as e:
+            return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})
+        self.store.update_session(
+            s.id, status="pr_open", pr_url=url, ended_at=iso(), detail={"head": head}
+        )
+        self.store.update_task(task_id, state="pr_open")
+        self.store.add_event(
+            "pr_open", {"pr_url": url, "branch": branch, "head": head, "image": new_image},
+            Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
+        )  # fmt: skip
+        return True
+
+    def poll_prs(self) -> list[str]:
+        """Merged and closed fleet PRs (vigild's PR poll, item 5): a ready job
+        whose PRs have all merged moves to merged, and every job waiting on it
+        (a deps job's parent) resumes on its own. Returns the jobs merged."""
+        if self.pr_state is None:
+            return []
+        merged_jobs: list[str] = []
+        for job in self.store.list_jobs():
+            if job.state in (JobState.ABANDONED, JobState.DONE, JobState.MERGED):
+                continue
+            states: dict[str, str] = {}
+            for t in self.store.list_tasks(job.id):
+                url = self._task_pr(t.id)
+                if not url or t.state in ("merged", "closed", *DEAD_TASK):
+                    if t.state == "merged":
+                        states[t.id] = "merged"
+                    continue
+                try:
+                    st = self.pr_state(job.repo, url)
+                except Exception:
+                    log.warning("pr poll: %s failed", url)
+                    continue
+                states[t.id] = st
+                if st in ("merged", "closed"):
+                    self.store.update_task(t.id, state=st)
+                    self.store.add_event(
+                        f"pr_{st}", {"pr_url": url}, Provenance.HUMAN, job_id=job.id, task_id=t.id
+                    )
+            live = [t for t in self.store.list_tasks(job.id) if t.state not in DEAD_TASK]
+            if job.state is JobState.READY and live and all(t.state == "merged" for t in live):
+                transition(
+                    self.store, job.id, JobState.MERGED, Actor.VIGILD,
+                    evidence={"merge_commits": [self._task_head(t.id) for t in live]},
+                )  # fmt: skip
+                merged_jobs.append(job.id)
+                self._resume_dependents(job.id)
+        return merged_jobs
+
+    def _resume_dependents(self, dep_id: str) -> None:
+        """Every job blocked on this (deps) job goes back to work (B39)."""
+        for job in self.store.list_jobs():
+            if job.state is not JobState.BLOCKED or job.blocked_on != dep_id:
+                continue
+            assert job.blocked_from is not None
+            try:
+                transition(
+                    self.store, job.id, job.blocked_from, Actor.VIGILD,
+                    evidence={"action": "deps_merged", "deps_job": dep_id},
+                )  # fmt: skip
+            except TransitionError as e:
+                log.warning("could not resume %s after %s merged: %s", job.id, dep_id, e)
+                continue
+            for item in self.store.list_inbox():
+                if item.job_id == job.id and item.body.get("kind") == "needs_deps":
+                    self.store.resolve_inbox_item(item.id, "vigild")
+            self.on_resume(job.id)
 
     # --- stages 5-6: review and audit (phase 2a, item 1) ---------------------------------
 
@@ -1943,6 +2192,23 @@ class GitHubPublisher:
                 token=tok.token,
                 existing=existing,
             )
+
+
+class GitHubPRs:
+    """vigild's PR poll (item 5): a PR's state, read with a one-repo,
+    `pull_requests: read` token, revoked after."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    def state(self, repo: str, url: str) -> str:
+        from vigild.github.publish import RestPulls
+
+        prefix = f"https://github.com/{repo}/pull/"
+        if not url.startswith(prefix) or not url[len(prefix) :].isdigit():
+            raise PublishError(f"{url} isn't a PR of {repo}")
+        with self.app.lease(repo, {"pull_requests": "read"}) as tok:
+            return RestPulls(self.app.http, tok.token).state(repo, int(url[len(prefix) :]))
 
 
 class NoPublisher:

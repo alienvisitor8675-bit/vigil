@@ -235,10 +235,15 @@ image, with no network. There is no timer and no launchd job.
   (`container.verifier_concurrency` in `configs/vigild.yaml`); raise it only
   if the Docker VM has the memory (6 GiB each, plus tmpfs).
 - **A task that needs a dependency** blocks with an inbox item listing the
-  packages and the worker's manifest and lockfile diff. Until phase 2's deps
-  job exists, make the dependency change yourself in its own PR (manifest and
-  lockfile only), let it merge, then press **Retry** on the item: the new
-  base changes the dev image key, so vigild builds the new image first.
+  packages and the worker's manifest and lockfile diff, and vigild files a
+  **deps job** in *Specs to approve*. Approving it lets the package manager
+  run: no model, a lockfile-only update in a container that reaches the
+  registries and nothing else. It fails, with the list, if anything new in
+  the lockfile is under 14 days old, or if a manifest changed outside its
+  dependency fields. Then vigild rebuilds the dev image on the new lockfiles,
+  runs every suite offline, and opens the PR. **Review it yourself** (deps
+  PRs always need you) and merge it: within two minutes vigild's PR poll sees
+  the merge, and the blocked job resumes on its own, on the new image.
 - `dev_image_tools` is what a `test_cmd` may use; the spec gate refuses a
   test that needs anything else. `dev_excluded` says which suites can't run
   in a Linux container and why: for ParkAgent, the iOS app (Xcode).

@@ -1135,7 +1135,11 @@ def test_a_worker_that_reports_needs_deps_blocks_its_job(world: World) -> None:
     deps = item["body"]["tasks"][f"{job}-w1"]["needs_deps"]
     assert deps == [{"ecosystem": "pypi", "package": "tomlkit", "version": "0.13.2",
                      "why": "round-trip TOML"}]  # fmt: skip
-    assert item["body"]["actions"] == ["retry", "abandon"]
+    # phase 2a, item 5: a child deps job, waiting for approval; the job resumes on its own
+    assert item["body"]["actions"] == ["abandon"]
+    child = item["body"]["deps_job"]
+    assert w.store.get_job(job).blocked_on == child
+    assert w.store.get_job(child).state.value == "spec_pending"
     assert w.tests.calls == [c for c in w.tests.calls if f"{job}-w1" not in c["source"]]
 
 

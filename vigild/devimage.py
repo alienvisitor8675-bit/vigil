@@ -87,8 +87,12 @@ class Sources(Protocol):
     """What DevImages needs from the Workspace: blob ids and files at a commit
     in vigild's mirror, and a clean checkout of it."""
 
-    def blob_ids(self, repo: str, sha: str, paths: list[str]) -> dict[str, str | None]: ...
-    def export_files(self, repo: str, sha: str, paths: list[str], dest: Path) -> None: ...
+    def blob_ids(
+        self, repo: str, sha: str, paths: list[str], source: str = "mirror"
+    ) -> dict[str, str | None]: ...
+    def export_files(
+        self, repo: str, sha: str, paths: list[str], dest: Path, source: str = "mirror"
+    ) -> None: ...
     def verify_checkout(
         self,
         repo: str,
@@ -143,9 +147,9 @@ class DevImages:
     def dockerfile(self, repo: str) -> Path:
         return ROOT / self.cfg.repo(repo).dev_dockerfile
 
-    def key(self, repo: str, base_sha: str) -> str:
+    def key(self, repo: str, base_sha: str, source: str = "mirror") -> str:
         pol = self.cfg.repo(repo)
-        blobs = self.sources.blob_ids(repo, base_sha, list(pol.dev_lockfiles))
+        blobs = self.sources.blob_ids(repo, base_sha, list(pol.dev_lockfiles), source)
         h = hashlib.sha256()
         h.update(self.dockerfile(repo).read_bytes())
         for path in sorted(blobs):
@@ -183,10 +187,14 @@ class DevImages:
             return False, f"{tag} changed since it was validated"
         return True, tag
 
-    def ensure_fresh(self, repo: str, base_sha: str, *, force: bool = False) -> str:
-        """The validated image for this base, built now if its key is new."""
+    def ensure_fresh(
+        self, repo: str, base_sha: str, *, force: bool = False, source: str = "mirror"
+    ) -> str:
+        """The validated image for this base, built now if its key is new.
+        `source="vault"`: a commit only vigild's vault has (a deps job's head,
+        plan 2a item 5): built from its lockfiles, its suites run on it."""
         with self._lock(repo):
-            key = self.key(repo, base_sha)
+            key = self.key(repo, base_sha, source)
             tag = self.tag(repo, key)
             last = self.latest(repo, key)
             if last is not None and not force:
@@ -198,18 +206,20 @@ class DevImages:
                 current = self.docker.image_id_of(tag)
                 if current is not None and current == last["image_id"]:
                     return tag
-            v = self.build_and_validate(repo, base_sha, key)
+            v = self.build_and_validate(repo, base_sha, key, source)
             if not v.ok:
                 self._page(v)
                 raise StaleDevImage(f"{repo}: dev image {tag} failed its {v.stage}")
             return tag
 
-    def build_and_validate(self, repo: str, base_sha: str, key: str) -> Validation:
+    def build_and_validate(
+        self, repo: str, base_sha: str, key: str, source: str = "mirror"
+    ) -> Validation:
         pol = self.cfg.repo(repo)
         tag = self.tag(repo, key)
         ctx = Path(tempfile.mkdtemp(prefix="vigil-devctx-"))
         try:
-            self.sources.export_files(repo, base_sha, list(pol.dev_lockfiles), ctx)
+            self.sources.export_files(repo, base_sha, list(pol.dev_lockfiles), ctx, source)
             ok, out = self.docker.build(ctx, self.dockerfile(repo), tag, timeout_s=BUILD_SECONDS)
         finally:
             shutil.rmtree(ctx, ignore_errors=True)
@@ -217,7 +227,7 @@ class DevImages:
         if not ok or image_id is None:
             failed: dict[str, Any] = {"build": out[-TAIL:]}
             return self._record(repo, key, tag, None, False, "build", failed, base_sha)
-        src = self.sources.verify_checkout(repo, f"devimage-{key[:16]}", base_sha, source="mirror")
+        src = self.sources.verify_checkout(repo, f"devimage-{key[:16]}", base_sha, source=source)
         suites: dict[str, dict[str, Any]] = {}
         try:
             for name, cmd in pol.dev_suites.items():

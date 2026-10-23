@@ -24,3 +24,6 @@ roles:
   worker:   [pypi.org, files.pythonhosted.org]
   reviewer: []
   auditor:  []
+  # a deps job's build container (B39): the registries and nothing else, not
+  # even the gateway; it holds no token and runs no model
+  deps:     [pypi.org, files.pythonhosted.org, registry.npmjs.org]

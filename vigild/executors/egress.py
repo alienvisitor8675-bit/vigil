@@ -12,6 +12,8 @@ from vigild.jobs.model import Role
 
 def allowlist(cfg: Config, role: Role) -> list[str]:
     hosts = list(cfg.egress.roles.get(role.value, []))
+    if role is Role.DEPS:
+        return hosts  # registries only: no gateway, no model (B39)
     return [*hosts, cfg.egress.gateway.host]
 
 
