@@ -85,8 +85,11 @@ def publish(
     pulls: Pulls,
     scope: Sequence[str],
     token: str | None = None,
+    existing: str | None = None,
 ) -> str:
-    """Check, push `head` to `branch`, and open a draft PR into `base`."""
+    """Check, push `head` to `branch`, and open a draft PR into `base`. With
+    `existing` (a fix round on a published branch, phase 2a), the same checks
+    and the push, and the PR that's already open stands."""
     from vigild.workspace import WorkspaceError
 
     if branch in PROTECTED or branch == base or not BRANCH.match(branch) or ".." in branch:
@@ -104,4 +107,6 @@ def publish(
         ws.push(repo, head, branch, token)
     except WorkspaceError as e:
         raise PublishError(str(e)) from e
+    if existing:
+        return existing
     return pulls.create_pull(repo, head=branch, base=base, title=title, body=body, draft=True)

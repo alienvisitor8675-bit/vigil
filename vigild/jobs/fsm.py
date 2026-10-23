@@ -100,18 +100,38 @@ def _findings(c: Ctx) -> list[str]:
 
 
 def _reviews_clean(c: Ctx) -> list[str]:
+    """Stage 5 and 6 acceptance: every live task has a valid, clean review.json
+    (an empty or invalid one fails), and where the review was sampled for
+    audit, an audit.json of the same head that missed nothing medium or higher."""
+    from pydantic import ValidationError
+
+    from vigild.contract.models import BLOCKING, Audit, Review
+
     errs: list[str] = []
     for t in c.store.list_tasks(c.job.id):
+        if t.state in ("superseded", "abandoned"):
+            continue
         art = c.store.get_artifact(c.job.id, "review.json", t.id)
         if art is None:
             errs.append(f"worker {t.id} has no review.json")
             continue
-        review = json.loads(art.content)
-        blocking = [
-            f for f in review.get("findings", []) if f.get("severity") in ("medium", "high")
-        ]
-        if review.get("verdict") != "clean" or blocking:
+        try:
+            review = Review.model_validate_json(art.content)
+        except ValidationError:
+            errs.append(f"worker {t.id} review.json is invalid")
+            continue
+        if review.verdict != "clean" or review.blocking():
             errs.append(f"worker {t.id} review is not clean")
+        if review.audit_required:
+            au = c.store.get_artifact(c.job.id, "audit.json", t.id)
+            try:
+                audit = Audit.model_validate_json(au.content) if au else None
+            except ValidationError:
+                audit = None
+            if audit is None or audit.head != review.head:
+                errs.append(f"worker {t.id} has no audit.json for {review.head[:12]}")
+            elif any(f.severity in BLOCKING for f in audit.missed()):
+                errs.append(f"worker {t.id} audit found what the review missed")
     return errs
 
 

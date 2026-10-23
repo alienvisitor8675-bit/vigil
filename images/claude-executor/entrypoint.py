@@ -60,6 +60,11 @@ SECRETISH = re.compile(r"(vgw_[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[
 # Paths in .git that send git somewhere else for its config, hooks or objects.
 ELSEWHERE = ("commondir", "gitdir", "objects/info/alternates", "objects/info/http-alternates")
 NO_SYMLINK = ("HEAD", "config", "objects", "refs", "hooks", "info", "packed-refs")
+# Reviewers and auditors read and answer; they never write (phase 2a, item 1).
+READ_ONLY_ROLES = ("reviewer", "auditor")
+READ_ONLY_TOOLS = ["Read", "Grep", "Glob"]
+WRITE_TOOLS = ["Bash", "Edit", "Write", "NotebookEdit", "Task", "WebFetch", "WebSearch"]
+MAX_STRUCTURED = 256 << 10
 
 
 class HarnessRefused(Exception):
@@ -264,6 +269,39 @@ def prepare_session() -> None:
         raise HarnessRefused(f"the session-prepare hook failed: {(p.stdout + p.stderr)[-500:]}")
 
 
+def agent_options(role: str, token: str, stderr: Any) -> dict[str, Any]:
+    """The SDK's options for this session, as keyword arguments (pure, so
+    tested without the SDK)."""
+    child_env = {
+        "ANTHROPIC_BASE_URL": os.environ["VIGIL_GATEWAY_URL"],
+        "ANTHROPIC_AUTH_TOKEN": token,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-5-5",
+        "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-5-5",
+    }
+    opts: dict[str, Any] = {
+        "cwd": str(WORK),
+        # as root, the CLI goes through setpriv to the agent uid with no capabilities
+        "cli_path": AGENT_CLI if os.getuid() == 0 else PLAIN_CLI,
+        "permission_mode": "bypassPermissions",
+        "model": os.environ.get("VIGIL_MODEL"),
+        "max_turns": int(os.environ.get("VIGIL_MAX_TURNS", "60")),
+        "max_budget_usd": float(os.environ.get("VIGIL_MAX_BUDGET_USD", "1.0")),
+        "setting_sources": [],  # isolation: managed settings only; the packet carries CLAUDE.md
+        "env": child_env,
+        "stderr": stderr,  # piped to the harness, never the container's streams
+    }
+    if role in READ_ONLY_ROLES:
+        opts["tools"] = READ_ONLY_TOOLS
+        opts["disallowed_tools"] = WRITE_TOOLS
+    schema_path = os.environ.get("VIGIL_OUTPUT_SCHEMA")
+    if schema_path:
+        opts["output_format"] = {
+            "type": "json_schema",
+            "schema": json.loads(Path(schema_path).read_text()),
+        }
+    return opts
+
+
 async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
     from claude_agent_sdk import (
         AssistantMessage,
@@ -277,25 +315,8 @@ async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
     )
 
     required = os.environ.get("VIGIL_REQUIRE_PLUGIN", "guard")
-    child_env = {
-        "ANTHROPIC_BASE_URL": os.environ["VIGIL_GATEWAY_URL"],
-        "ANTHROPIC_AUTH_TOKEN": token,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-5-5",
-        "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-5-5",
-    }
     stderr_tail: collections.deque[str] = collections.deque(maxlen=20)
-    options = ClaudeAgentOptions(
-        cwd=str(WORK),
-        # as root, the CLI goes through setpriv to the agent uid with no capabilities
-        cli_path=AGENT_CLI if os.getuid() == 0 else PLAIN_CLI,
-        permission_mode="bypassPermissions",
-        model=os.environ.get("VIGIL_MODEL"),
-        max_turns=int(os.environ.get("VIGIL_MAX_TURNS", "60")),
-        max_budget_usd=float(os.environ.get("VIGIL_MAX_BUDGET_USD", "1.0")),
-        setting_sources=[],  # isolation: managed settings only; the packet carries CLAUDE.md
-        env=child_env,
-        stderr=stderr_tail.append,  # piped to the harness, never the container's streams
-    )
+    options = ClaudeAgentOptions(**agent_options(role, token, stderr_tail.append))
     result: dict[str, Any] = {"plugins": [], "denials": [], "tool_calls": 0}
     async for msg in query(prompt=packet, options=options):
         if isinstance(msg, SystemMessage) and msg.subtype == "init":
@@ -356,6 +377,10 @@ async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
                     "result_text": (msg.result or "")[:4000],
                 }
             )
+            if msg.structured_output is not None:
+                text = json.dumps(msg.structured_output)
+                if len(text) <= MAX_STRUCTURED:
+                    result["structured_output"] = msg.structured_output
     result["cli_stderr_tail"] = "".join(stderr_tail)[-2000:]
     return result
 
@@ -387,6 +412,21 @@ def main() -> int:
         return 4
 
     kill_strays()  # nothing the agent started survives to touch what follows
+    if role in READ_ONLY_ROLES:
+        # a review's answer is its structured output; nothing to commit or bundle
+        emit(
+            "vigil_result",
+            redact(
+                {
+                    **agent,
+                    "status": "done",
+                    "role": role,
+                    "seconds": round(time.monotonic() - started, 1),
+                },
+                token,
+            ),
+        )
+        return 0
     try:
         head, left_out = snapshot(task, role)
     except HarnessRefused as e:

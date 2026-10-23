@@ -45,7 +45,12 @@ from pydantic import ValidationError
 from vigild.budget import Budget, BudgetExceeded
 from vigild.config import Config
 from vigild.contract.models import (
+    BLOCKING,
+    Audit,
+    AuditOutput,
     Limits,
+    Review,
+    ReviewOutput,
     Spec,
     Task,
     TestOutcome,
@@ -64,11 +69,17 @@ from vigild.jobs.deps import infer_deps, is_lockfile
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import JobState, Role, SessionRow
 from vigild.metering.calls import session_cost
-from vigild.packets.assemble import assemble_coord, assemble_worker
+from vigild.packets.assemble import (
+    assemble_audit,
+    assemble_coord,
+    assemble_review,
+    assemble_worker,
+)
 from vigild.packets.fence import fence
 from vigild.provenance import Provenance
 from vigild.redact import redact
 from vigild.repos import RepoPolicyError, check_backend
+from vigild.review.ladder import Ladder, LadderChange, classify_shape
 from vigild.router.rules import RoutingError, route
 from vigild.telemetry.spans import Telemetry
 from vigild.verifier import Verifier
@@ -78,8 +89,11 @@ log = logging.getLogger("vigild.runner")
 COORD_DRAFTS = 3
 COORD_MINUTES = 30
 WORKER_MINUTES = 40
+REVIEW_MINUTES = 20
+REVIEW_TURNS = 30
 LIVE_SESSION = ("created", "running")
 DEAD_TASK = ("superseded", "abandoned")  # out of the job: re-planned away or given up
+PUBLISHED = ("pr_open", "reviewed")  # a task whose draft PR is open (reviewed: clean at its head)
 MIN_RETRY_USD = 0.05  # less than this left of a task's cap: no retry is offered
 
 
@@ -95,6 +109,7 @@ class Publisher(Protocol):
         title: str,
         body: str,
         scope: list[str],
+        existing: str | None = None,
     ) -> str: ...
 
 
@@ -157,6 +172,7 @@ class JobRunner:
         self._running: set[str] = set()
         self._running_lock = threading.Lock()
         self.closers: list[Callable[[], None]] = []  # e.g. the docker client (item 0)
+        self.ladder = Ladder(store, cfg)
 
     def close(self) -> None:
         for close in self.closers:
@@ -212,6 +228,8 @@ class JobRunner:
             self._spawn(self._plan_and_dispatch, job_id)
         elif state is JobState.BUILDING:
             self._spawn(self.dispatch, job_id)
+        elif state is JobState.IN_REVIEW:
+            self._spawn(self.review, job_id)
 
     # --- startup reconcile (item 7) ------------------------------------------------------
 
@@ -612,7 +630,7 @@ class JobRunner:
         workers = parse_plan(art.content).workers
         planned = {w.task_id for w in workers}
         for old in self.store.list_tasks(job_id):
-            if old.id not in planned and old.state not in ("pr_open", *DEAD_TASK):
+            if old.id not in planned and old.state not in (*PUBLISHED, *DEAD_TASK):
                 self.store.update_task(old.id, state="superseded")  # re-planned away (N5)
         for w in workers:
             if not w.task_id.startswith(f"{job_id}-w"):
@@ -636,7 +654,7 @@ class JobRunner:
                 existing = self.store.get_task(w.task_id)
                 if existing.job_id != job_id:
                     raise RuntimeError(f"task {w.task_id} belongs to {existing.job_id}")
-                if existing.state == "pr_open":
+                if existing.state in PUBLISHED:
                     continue  # after a re-plan, a published task's PR stands as it is
                 self.store.update_task(w.task_id, contract=contract)
             except KeyError:
@@ -651,7 +669,7 @@ class JobRunner:
         """Run every live task not yet published, in dependency waves. After a
         wave with a failure, the job blocks and the owner chooses (N5)."""
         tasks = {t.id: t for t in self.store.list_tasks(job_id) if t.state not in DEAD_TASK}
-        done = {t for t, row in tasks.items() if row.state == "pr_open"}
+        done = {t for t, row in tasks.items() if row.state in PUBLISHED}
         pending = [t for t in tasks if t not in done]
         while pending:
             wave = [t for t in pending if set(tasks[t].contract.get("depends_on", [])) <= done]
@@ -679,8 +697,9 @@ class JobRunner:
                 self._hold_failed(job_id, failed)
                 return
         live = [t for t in self.store.list_tasks(job_id) if t.state not in DEAD_TASK]
-        if all(t.state == "pr_open" for t in live):
+        if all(t.state in PUBLISHED for t in live):
             transition(self.store, job_id, JobState.IN_REVIEW, Actor.VIGILD)
+            self.review(job_id)
 
     def remaining(self, task_id: str) -> tuple[float, float, float]:
         """(cap, spent, left) for a task: a retry gets what's left, never a fresh cap."""
@@ -868,7 +887,17 @@ class JobRunner:
         held["s"] = s
         # the gateway sees this session's headroom through its reservation
         self.store.x("UPDATE reservations SET session_id=? WHERE id=?", (s.id, reservation))
-        clone = self.workspace.clone(job.repo, task_id, branch=branch, base=job.base)
+        # a published task (a fix round, or a retry after one) goes on from its
+        # PR's head, on its own base (phase 2a, item 1)
+        published = self._task_head(task_id)
+        pr_url = self._task_pr(task_id) if published else None
+        if published:
+            clone = self.workspace.clone(
+                job.repo, task_id, branch=branch, base=job.base, start=published,
+                record_as=self.workspace.base_sha(task_id),
+            )  # fmt: skip
+        else:
+            clone = self.workspace.clone(job.repo, task_id, branch=branch, base=job.base)
         base_sha = self.workspace.base_sha(task_id)
         try:
             image = self.dev_images.ensure_fresh(job.repo, base_sha)  # what the verifier runs
@@ -891,12 +920,14 @@ class JobRunner:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(art.content)
                 paths.append(f".vigil/{job_id}/{name}")
-        if paths:
+        if paths and not published:
             self.workspace.commit_before_session(clone, paths, f"vigil: {job_id} spec and plan")
         self.workspace.write_task(clone, {**contract, "base_sha": base_sha})
         approval = self.store.get_artifact(job_id, "approval.json")
         edits = json.loads(approval.content).get("edits") if approval else None
-        packet = assemble_worker(clone, contract, untrusted={}, approval_edits=edits)
+        packet = assemble_worker(
+            clone, contract, untrusted={}, approval_edits=edits, fix_round=self._fix_round(t)
+        )
         self.store.add_event(
             "packet",
             {"role": "worker", "dropped": packet.dropped},
@@ -1088,10 +1119,11 @@ class JobRunner:
                 title=f"[vigil {job_id}] {contract['spec']['goal']}",
                 body=body,
                 scope=list(contract["spec"]["files_in_scope"]),
+                existing=pr_url,
             )
         except PublishError as e:
             return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})
-        self.store.update_session(s.id, status="pr_open", pr_url=url)
+        self.store.update_session(s.id, status="pr_open", pr_url=url, detail={"head": head})
         self.store.update_task(task_id, state="pr_open")
         self.store.add_event(
             "pr_open",
@@ -1102,6 +1134,344 @@ class JobRunner:
             task_id=task_id,
         )
         return True
+
+    # --- stages 5-6: review and audit (phase 2a, item 1) ---------------------------------
+
+    def _task_head(self, task_id: str) -> str | None:
+        """The head a task's draft PR last published, from vigild's own record."""
+        rows = self.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='pr_open' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+        return str(json.loads(rows[0]["data"])["head"]) if rows else None
+
+    def _task_pr(self, task_id: str) -> str | None:
+        rows = self.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='pr_open' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+        return str(json.loads(rows[0]["data"])["pr_url"]) if rows else None
+
+    def _fix_round(self, t: Any) -> dict[str, Any] | None:
+        """The findings a task's latest review round sent back, if any are open."""
+        rounds = int(t.contract.get("review_rounds") or 0)
+        art = self.store.get_artifact(t.job_id, "findings.json", t.id)
+        if not rounds or art is None:
+            return None
+        doc = json.loads(art.content)
+        if int(doc.get("round", 0)) != rounds:
+            return None
+        return {"round": rounds, "findings": doc.get("findings") or []}
+
+    def review(self, job_id: str) -> None:
+        """Review every published task at its head (a Sonnet reviewer, fresh
+        context, read-only tools), audit where the ladder samples (Opus), and
+        move the job: all clean is `ready`; a finding of medium or higher goes
+        back to the same worker as a fix round; a third round with findings,
+        after rule 5 escalated the second, pages the owner."""
+        job = self.store.get_job(job_id)
+        if job.state is not JobState.IN_REVIEW:
+            return
+        tasks = [t for t in self.store.list_tasks(job_id) if t.state == "pr_open"]
+        with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as pool:
+            outcomes = dict(zip(
+                [t.id for t in tasks],
+                [f.result() for f in [pool.submit(self._review_task, job, t) for t in tasks]],
+                strict=True,
+            ))  # fmt: skip
+        failed = {tid: why for tid, (kind, why) in outcomes.items() if kind == "failed"}
+        if failed:
+            self._block(job_id, f"review failed: {sorted(failed)}")
+            self._page(
+                job_id,
+                f"{job_id}: the review stage failed for {', '.join(sorted(failed))}",
+                {"kind": "review_failed", "tasks": failed, "actions": ["retry", "abandon"]},
+                resumable=True,
+            )
+            return
+        fixes = sorted(tid for tid, (kind, _) in outcomes.items() if kind == "fix")
+        if fixes:
+            limit = self.cfg.routing.escalate_review_rounds
+            over = [
+                tid
+                for tid in fixes
+                if int(self.store.get_task(tid).contract.get("review_rounds") or 0) > limit
+            ]
+            if over:
+                self._block(job_id, f"review findings after escalation: {over}")
+                self._page(
+                    job_id,
+                    f"{job_id}: findings remain after {limit} review rounds and an escalation",
+                    {
+                        "kind": "review_rounds",
+                        "tasks": {tid: outcomes[tid][1] for tid in over},
+                        "actions": ["replan", "abandon"],
+                    },
+                )
+                return
+            transition(
+                self.store,
+                job_id,
+                JobState.BUILDING,
+                Actor.VIGILD,
+                evidence={"findings": {tid: outcomes[tid][1] for tid in fixes}},
+            )
+            self.dispatch(job_id)
+            return
+        transition(self.store, job_id, JobState.READY, Actor.VIGILD)
+        self._ready(job_id)
+
+    def _ready(self, job_id: str) -> None:
+        """Stage 8's queue: the job's PRs, each with its review and audit."""
+        job = self.store.get_job(job_id)
+        prs = []
+        for t in self.store.list_tasks(job_id):
+            if t.state in DEAD_TASK:
+                continue
+            rv = self.store.get_artifact(job_id, "review.json", t.id)
+            au = self.store.get_artifact(job_id, "audit.json", t.id)
+            review = json.loads(rv.content) if rv else {}
+            audit = Audit.model_validate_json(au.content) if au else None
+            prs.append(
+                {
+                    "task_id": t.id,
+                    "pr_url": self._task_pr(t.id),
+                    "head": self._task_head(t.id),
+                    "shape": review.get("shape"),
+                    "rung": review.get("rung"),
+                    "review_rounds": review.get("round"),
+                    "findings": len(review.get("findings") or []),
+                    "audited": audit is not None,
+                    "match_rate": round(audit.match_rate(), 3) if audit else None,
+                }
+            )
+        self.store.create_inbox_item(
+            "ready", "ready_to_merge", job_id, f"Ready to merge: {job.title}", {"prs": prs}
+        )
+
+    def _review_task(self, job: Any, t: Any) -> tuple[str, Any]:
+        """One task's review (and audit, when sampled): ("clean" | "fix" |
+        "failed", detail). Never raises: a vigild error is a failed review."""
+        try:
+            return self._review_one(job, t)
+        except Exception as e:
+            log.exception("review of %s failed", t.id)
+            return "failed", f"vigild error: {type(e).__name__}: {e}"[:1000]
+
+    def _review_one(self, job: Any, t: Any) -> tuple[str, Any]:
+        head = self._task_head(t.id)
+        if head is None:
+            return "failed", "no published head"
+        task = Task.model_validate(t.contract)
+        shape = classify_shape(task, self.cfg)
+        level = task.spec.verify.level
+        rung = self.ladder.rung(shape)
+        reviewer, auditor = self.ladder.presets(shape)
+        rnd = task.review_rounds + 1
+        audit_required = self.ladder.should_audit(shape, level)
+        base_sha = self.workspace.base_sha(t.id)
+        diff = self.workspace.full_diff(job.repo, base_sha, head)
+        spec_md = self.store.get_artifact(job.id, "spec.md")
+        report = self.store.get_artifact(job.id, "worker_report.json", t.id)
+        tests = self.store.get_artifact(job.id, "tests.json", t.id)
+        request = {
+            "job_id": job.id,
+            "task_id": t.id,
+            "round": rnd,
+            "head": head,
+            "base_sha": base_sha,
+            "contract": t.contract,
+            "verifier": json.loads(tests.content) if tests else None,  # vigild's own record
+            "spec_md": spec_md.content if spec_md else "",
+        }
+        untrusted = {
+            "the request": job.request,
+            "the worker's report": report.content if report else "(none)",
+        }
+        rules = self.workspace.read_blob(job.repo, base_sha, "CLAUDE.md") or ""  # the base's
+        packet = assemble_review(rules, request, diff=diff, untrusted=untrusted)
+        out, why = self._read_only_session(
+            job, t, Role.REVIEWER, reviewer, head, base_sha, rnd, packet.text, ReviewOutput,
+            self.cfg.budgets.review_session_usd,
+        )  # fmt: skip
+        if out is None:
+            return "failed", f"no valid review.json: {why}"
+        assert isinstance(out, ReviewOutput)
+        rv = Review(
+            **out.model_dump(),
+            task_id=t.id,
+            job_id=job.id,
+            head=head,
+            shape=shape,
+            rung=rung,
+            round=rnd,
+            audit_required=audit_required,
+            reviewer=reviewer,
+            provenance=Provenance.CLAUDE,
+        )
+        self.store.add_artifact(
+            job.id, "review.json", rv.model_dump_json(), Provenance.CLAUDE, task_id=t.id
+        )
+        findings = [f.model_dump(mode="json") for f in rv.blocking()]
+        if audit_required:
+            numbered = json.dumps(
+                {i: f.model_dump(mode="json") for i, f in enumerate(rv.findings)}, indent=1
+            )
+            apacket = assemble_audit(
+                rules, request, diff=diff, review=numbered, untrusted=untrusted
+            )
+            aout, why = self._read_only_session(
+                job, t, Role.AUDITOR, auditor, head, base_sha, rnd, apacket.text, AuditOutput,
+                self.cfg.budgets.audit_session_usd,
+            )  # fmt: skip
+            if aout is None:
+                return "failed", f"no valid audit.json: {why}"
+            assert isinstance(aout, AuditOutput)
+            audit = Audit(
+                **aout.model_dump(),
+                task_id=t.id,
+                job_id=job.id,
+                head=head,
+                shape=shape,
+                rung=rung,
+                auditor=auditor,
+                provenance=Provenance.CLAUDE,
+            )
+            self.store.add_artifact(
+                job.id, "audit.json", audit.model_dump_json(), Provenance.CLAUDE, task_id=t.id
+            )
+            change = self.ladder.record(audit, verify_level=level)
+            if change is not None:
+                self._ladder_page(change)
+            findings += [
+                f.model_dump(mode="json", exclude={"matched"})
+                for f in audit.missed()
+                if f.severity in BLOCKING
+            ]
+        if not findings:
+            self.store.update_task(t.id, state="reviewed")
+            return "clean", 0
+        self.store.add_artifact(
+            job.id,
+            "findings.json",
+            json.dumps({"round": rnd, "head": head, "findings": findings}),
+            Provenance.CLAUDE,
+            task_id=t.id,
+        )
+        self._reroute_for_round(job.id, t.id, rnd)
+        self.store.update_task(t.id, state="fix")
+        return "fix", len(findings)
+
+    def _reroute_for_round(self, job_id: str, task_id: str, rounds: int) -> None:
+        """A review round with findings is counted on the contract and the task
+        is routed again: the second round trips routing rule 5 (escalation)."""
+        t = self.store.get_task(task_id)
+        contract = {**t.contract, "review_rounds": rounds}
+        r = route(Task.model_validate(contract), self.cfg)
+        contract.update(tier=r.tier, tier_reason=r.tier_reason, backend=r.preset)
+        self.store.update_task(task_id, contract=contract)
+        self.store.route_task(
+            task_id, tier=r.tier, tier_reason=r.tier_reason, backend_preset=r.preset
+        )
+        self.store.update_task(task_id, state="fix")
+        if r.tier_reason.startswith("rule5") and not str(t.tier_reason or "").startswith("rule5"):
+            self.store.add_event(
+                "escalation",
+                {"task_id": task_id, "rounds": rounds, "from": t.backend_preset, "to": r.preset,
+                 "tier_reason": r.tier_reason},
+                Provenance.HUMAN, job_id=job_id, task_id=task_id,
+            )  # fmt: skip
+
+    def _ladder_page(self, change: LadderChange) -> None:
+        """You see every promotion and demotion (design, trust ladder)."""
+        verb = "promoted" if change.to > change.frm else "demoted"
+        self._page(
+            None,
+            f"review ladder: {change.shape.value} {verb} to rung {change.to}",
+            {"kind": "ladder", "shape": change.shape.value, "from": change.frm, "to": change.to,
+             "reason": change.reason, "actions": ["dismiss"]},
+        )  # fmt: skip
+
+    def _read_only_session(
+        self,
+        job: Any,
+        t: Any,
+        role: Role,
+        preset: str,
+        head: str,
+        base_sha: str,
+        rnd: int,
+        packet: str,
+        model: type[ReviewOutput] | type[AuditOutput],
+        amount: float,
+    ) -> tuple[ReviewOutput | AuditOutput | None, str]:
+        """A reviewer or auditor session on a fresh clone of the task's head:
+        read-only tools, its answer as structured output (validated here; an
+        empty or invalid answer fails the stage gate)."""
+        branch = str(t.contract["branch"])
+        parent = [s for s in self.store.list_sessions(job.id) if s.task_id == t.id]
+        s = self.store.create_session(
+            job.id, role, task_id=t.id, parent_session_id=parent[-1].id if parent else None,
+            backend_preset=preset, branch=branch,
+        )  # fmt: skip
+        try:
+            check_backend(self.cfg, job.repo, preset)
+            rid = self.budget.reserve(
+                session_id=s.id, task_id=None, amount=amount, purpose=role.value
+            )
+        except (RepoPolicyError, BudgetExceeded) as e:
+            self.store.update_session(s.id, status="refused")
+            return None, str(e)
+        clone_id = f"{t.id}-{role.value}{rnd}"
+        try:
+            clone = self.workspace.clone(
+                job.repo, clone_id, branch=branch, base=job.base, start=head, record_as=base_sha
+            )
+            self.workspace.write_task(
+                clone, {**t.contract, "base_sha": head, "head": head, "role": role.value}
+            )
+            session_image = self._session_image(job.repo, base_sha)
+        except Exception:
+            self.budget.settle(rid)
+            self.store.update_session(s.id, status="failed")
+            raise
+        spec = SessionSpec(
+            session_id=s.id,
+            role=role,
+            job_id=job.id,
+            task_id=t.id,
+            repo=job.repo,
+            preset=preset,
+            model=self.cfg.preset(preset).model or "",
+            clone=clone,
+            session_dir=self._session_dir(s.id),
+            max_turns=REVIEW_TURNS,
+            max_minutes=REVIEW_MINUTES,
+            max_budget_usd=amount,
+            mounts=self.workspace.overlays(clone),
+            packet=packet,
+            image=session_image,
+            output_schema=model.model_json_schema(),
+        )
+        attrs = {
+            "vigil.job_id": job.id,
+            "vigil.task_id": t.id,
+            "vigil.role": role.value,
+            "vigil.repo": job.repo,
+            "vigil.model": spec.model,
+            "vigil.attempt": rnd,
+        }
+        out = self._run_session(s, spec, rid, attrs)
+        if out.status != "done":
+            self.store.update_session(s.id, status="failed")
+            return None, f"{role.value} session {out.status}: {(out.error or '')[:500]}"
+        try:
+            parsed = model.model_validate(out.result.get("structured_output"))
+        except ValidationError as e:
+            self.store.update_session(s.id, status="failed")
+            return None, str(e)[:1000]
+        self.store.update_session(s.id, status="done")
+        return parsed, ""
 
 
 # --- wiring for the real daemon ------------------------------------------------------------
@@ -1126,6 +1496,7 @@ class GitHubPublisher:
         title: str,
         body: str,
         scope: list[str],
+        existing: str | None = None,
     ) -> str:
         from vigild.github.app import WORKER_PERMISSIONS
         from vigild.github.publish import RestPulls, publish
@@ -1143,6 +1514,7 @@ class GitHubPublisher:
                 pulls=RestPulls(self.http, tok.token),
                 scope=scope,
                 token=tok.token,
+                existing=existing,
             )
 
 
@@ -1158,5 +1530,6 @@ class NoPublisher:
         title: str,
         body: str,
         scope: list[str],
+        existing: str | None = None,
     ) -> str:
         raise PublishError("the GitHub App is not configured (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)")

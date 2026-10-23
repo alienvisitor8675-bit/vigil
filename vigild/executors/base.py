@@ -31,6 +31,9 @@ class SessionSpec:
     traceparent: str | None = None
     packet: str = ""
     image: str | None = None  # the repo's pinned dev image; None means the default executor
+    # A reviewer's or auditor's answer, as JSON schema: the harness asks the
+    # SDK for structured output and puts it on the result line (phase 2a).
+    output_schema: dict[str, Any] | None = None
 
 
 @dataclass

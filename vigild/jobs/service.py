@@ -467,7 +467,7 @@ class JobService:
             except TransitionError as e:
                 raise Conflict(str(e)) from e
             for t in self.store.list_tasks(job.id):
-                if t.state != "pr_open":
+                if t.state not in ("pr_open", "reviewed"):
                     self.store.update_task(t.id, state="abandoned")
             self.store.add_event(
                 "abandon", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=job.id

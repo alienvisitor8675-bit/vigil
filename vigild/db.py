@@ -34,6 +34,17 @@ from vigild.provenance import Provenance, require
 
 PROV = "provenance TEXT NOT NULL CHECK (provenance IN ('claude','local','human'))"
 
+# Phase 2a: each new table's DDL is a constant, used by SCHEMA (a new
+# database) and by its migration step (an old one).
+LADDER_DDL = f"""CREATE TABLE IF NOT EXISTS ladder (
+  shape TEXT PRIMARY KEY, rung INTEGER NOT NULL, window_from INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL, reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS audits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, task_id TEXT NOT NULL,
+  shape TEXT NOT NULL, rung INTEGER NOT NULL, verify_level INTEGER NOT NULL,
+  match_rate REAL NOT NULL, missed_high INTEGER NOT NULL, missed_medium INTEGER NOT NULL,
+  false_findings INTEGER NOT NULL, ts TEXT NOT NULL, {PROV})"""
+
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY, repo TEXT NOT NULL, base TEXT NOT NULL, title TEXT NOT NULL,
@@ -94,6 +105,7 @@ CREATE TABLE IF NOT EXISTS dev_images (
 CREATE TABLE IF NOT EXISTS ui_sessions (
   id_hash TEXT PRIMARY KEY, scope TEXT NOT NULL, created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL, revoked_at TEXT);
+{LADDER_DDL};
 CREATE INDEX IF NOT EXISTS events_job ON events(job_id, id);
 CREATE INDEX IF NOT EXISTS calls_session ON model_calls(session_id);
 CREATE INDEX IF NOT EXISTS res_day ON reservations(day, status);
@@ -129,10 +141,23 @@ def _m3_job_blocked_on(conn: sqlite3.Connection) -> None:
     _add_columns(conn, "jobs", {"blocked_on": "TEXT"})
 
 
+def _create(conn: sqlite3.Connection, ddl: str) -> None:
+    """CREATE statements one at a time (executescript would commit the
+    migration's transaction)."""
+    for stmt in filter(str.strip, ddl.split(";")):
+        conn.execute(stmt)
+
+
+def _m4_trust_ladder(conn: sqlite3.Connection) -> None:
+    """Phase 2a, item 1: the ladder's live rungs and the audits that move them."""
+    _create(conn, LADDER_DDL)
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
     _m3_job_blocked_on,
+    _m4_trust_ladder,
 ]
 
 

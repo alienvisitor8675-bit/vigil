@@ -266,3 +266,46 @@ def test_left_out_files_are_named_on_the_result_line(
     assert ep.main() == 0
     result = json.loads(capsys.readouterr().out.splitlines()[-1])["vigil_result"]
     assert result["not_committed"] == ["junk.log"]
+
+
+# --- phase 2a, item 1: reviewers and auditors read and answer ----------------------------
+
+
+def test_reviewers_get_read_only_tools_and_structured_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ep = _entrypoint()
+    schema = {"type": "object", "properties": {"verdict": {"type": "string"}}}
+    (tmp_path / "schema.json").write_text(json.dumps(schema))
+    monkeypatch.setenv("VIGIL_GATEWAY_URL", "http://gw")
+    monkeypatch.setenv("VIGIL_OUTPUT_SCHEMA", str(tmp_path / "schema.json"))
+    for role in ("reviewer", "auditor"):
+        opts = ep.agent_options(role, TOKEN, print)
+        assert opts["tools"] == ["Read", "Grep", "Glob"]
+        assert {"Bash", "Edit", "Write", "NotebookEdit"} <= set(opts["disallowed_tools"])
+        assert opts["output_format"] == {"type": "json_schema", "schema": schema}
+    monkeypatch.delenv("VIGIL_OUTPUT_SCHEMA")
+    worker = ep.agent_options("worker", TOKEN, print)
+    assert "tools" not in worker and "output_format" not in worker
+
+
+def test_a_review_commits_nothing_and_answers_on_the_result_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    work, base = _work(tmp_path)
+    (work / ".vigil" / "task.json").write_text(json.dumps(_task(base)))
+    ep = _harness(tmp_path, work)
+    answer = {"verdict": "clean", "findings": []}
+
+    async def agent(packet: str, role: str, token: str) -> dict[str, Any]:
+        return {"plugins": ["guard"], "structured_output": answer}
+
+    monkeypatch.setattr(ep, "run_agent", agent)
+    monkeypatch.setenv("VIGIL_ROLE", "reviewer")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"gateway_token": TOKEN}) + "\n"))
+    assert ep.main() == 0
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])["vigil_result"]
+    assert result["status"] == "done" and result["structured_output"] == answer
+    assert "head" not in result
+    assert not (ep.OUT / "result.bundle").exists()
+    assert _run(work, "rev-parse", BRANCH) == base

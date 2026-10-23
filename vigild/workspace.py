@@ -113,7 +113,20 @@ class Workspace:
                 )  # fmt: skip
         return path
 
-    def clone(self, repo: str, task_id: str, *, branch: str, base: str) -> Path:
+    def clone(
+        self,
+        repo: str,
+        task_id: str,
+        *,
+        branch: str,
+        base: str,
+        start: str | None = None,
+        record_as: str | None = None,
+    ) -> Path:
+        """A fresh clone for one session. `start` (a commit in the vault) puts
+        the branch there instead of at the base's tip, for a fix round, a
+        resumed worker or a reviewer (phase 2a); the base recorded is still
+        the base's, unless `record_as` names the base commit to record."""
         if not ID.match(task_id):
             raise WorkspaceError(f"bad task id {task_id!r}")
         if not BRANCH.match(branch) or ".." in branch:
@@ -132,7 +145,23 @@ class Workspace:
                 str(mirror), str(dest),
             )  # fmt: skip
         self._git(dest, "checkout", "--quiet", "--detach", base_sha)
-        self._git(dest, "checkout", "--quiet", "-b", branch)
+        if start is not None:
+            if not SHA.match(start):
+                raise WorkspaceError("bad start sha")
+            vault = self.vault(repo)
+            with self._repo_lock(f"vault:{repo}"):
+                self._git(
+                    dest, "-c", "uploadpack.allowAnySHA1InWant=true", "fetch", "--quiet",
+                    "--no-tags", str(vault), start,
+                )  # fmt: skip
+            if record_as is not None:
+                if not SHA.match(record_as):
+                    raise WorkspaceError("bad base sha")
+                base_sha = record_as  # the task's own base, not the branch's tip today
+            self._git(dest, "merge-base", "--is-ancestor", base_sha, start)
+            self._git(dest, "checkout", "--quiet", "-b", branch, start)
+        else:
+            self._git(dest, "checkout", "--quiet", "-b", branch)
         self._git(dest, "remote", "remove", "origin")
         self._git(dest, "config", "user.name", BOT_NAME)
         self._git(dest, "config", "user.email", BOT_EMAIL)
@@ -388,6 +417,15 @@ class Workspace:
         return self._git(
             self.vault(repo), "diff", "--no-renames", "--no-ext-diff", "--no-textconv",
             base_sha, head, "--", path,
+        )  # fmt: skip
+
+    def full_diff(self, repo: str, base_sha: str, head: str) -> str:
+        """The whole change, base to head, from the vault (what a reviewer reads)."""
+        if not SHA.match(base_sha) or not SHA.match(head):
+            raise WorkspaceError("bad sha")
+        return self._git(
+            self.vault(repo), "diff", "--no-renames", "--no-ext-diff", "--no-textconv",
+            base_sha, head,
         )  # fmt: skip
 
     def read_blob(self, repo: str, head: str, path: str, max_bytes: int = MAX_BLOB) -> str | None:

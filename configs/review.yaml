@@ -1,0 +1,35 @@
+# The trust ladder (design "Review tiers and the trust ladder"; plan 2a, item 1).
+#
+# Each shape starts at the rung named here. vigild moves a shape from its
+# audits (vigild/review/ladder.py) and keeps the live rung in its database,
+# with an event and an inbox page for every promotion and demotion; this file
+# is the starting point and the policy, changed only by PR.
+#
+# Hard-coded in ladder.py, not configurable here: `money`, `auth` and
+# `consent` stay at rung 0 permanently, and `deps` is capped at rung 1 (owner,
+# 2026-10-23). A file that says otherwise stops vigild at start.
+shapes:
+  docs: {rung: 0}
+  tests: {rung: 0}
+  feature: {rung: 0}
+  fix: {rung: 0}
+  refactor: {rung: 0}
+  deps: {rung: 1, max_rung: 1}   # the owner always reviews a deps PR too
+  money: {rung: 0, max_rung: 0}
+  auth: {rung: 0, max_rung: 0}
+  consent: {rung: 0, max_rung: 0}
+
+# Per rung: who reviews, who audits, the base audit rate, and what promotes.
+# Rung 1's local reviewer arrives with the tower (phase 5); until then a
+# preset that isn't live falls back to the routing file's `reviewer`.
+rungs:
+  0: {reviewer: claude-sonnet, auditor: claude-opus, audit: 1.00, promote_after: 20, min_match: 0.90}
+  1: {reviewer: claude-sonnet, auditor: claude-opus, audit: 1.00, promote_after: 20, min_match: 0.90, max_false_per_pr: 1}
+  2: {reviewer: tower-qwen, auditor: claude-sonnet, audit: 0.25, promote_after: 40, min_match: 1.00}
+  3: {reviewer: tower-qwen, auditor: claude-sonnet, audit: 0.10}
+
+# Weighted by verify level (design "Verification ladder"): an audit of a task
+# whose criteria sit at level 0 counts half a PR toward promotion, and a
+# level-0 shape is sampled twice as hard.
+verify_weight: {0: 0.5, 1: 1.0, 3: 1.5}
+level0_audit_factor: 2.0

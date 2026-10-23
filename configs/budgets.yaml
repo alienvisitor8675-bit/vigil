@@ -8,3 +8,5 @@ monthly_usd: 100.00      # mandatory (P4, owner 2026-10-22)
 wip_per_repo: 4          # enforced by the phase 2 scheduler
 coord_session_usd: 1.00  # reservation for one coord drafting session
 decider_call_usd: 0.01   # reservation for one Haiku decider call
+review_session_usd: 0.50 # one reviewer session (Sonnet); not counted in the task's cap
+audit_session_usd: 1.00  # one auditor session (Opus); not counted in the task's cap

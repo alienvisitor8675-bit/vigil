@@ -1,0 +1,166 @@
+{
+  "$defs": {
+    "Finding": {
+      "additionalProperties": false,
+      "properties": {
+        "claim": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "title": "Claim",
+          "type": "string"
+        },
+        "file": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "File",
+          "type": "string"
+        },
+        "fix": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "title": "Fix",
+          "type": "string"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Line"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "required": [
+        "severity",
+        "file",
+        "claim",
+        "fix"
+      ],
+      "title": "Finding",
+      "type": "object"
+    },
+    "Provenance": {
+      "enum": [
+        "claude",
+        "local",
+        "human"
+      ],
+      "title": "Provenance",
+      "type": "string"
+    },
+    "Severity": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "title": "Severity",
+      "type": "string"
+    },
+    "Shape": {
+      "description": "The kind of change, for the review ladder (phase 2). `deps` changes\nonly manifests and lockfiles, runs no model, starts at rung 1, is capped\nthere and always needs the owner's review (round 3; owner 2026-10-23).\n`money`, `auth` and `consent` stay at rung 0 permanently.",
+      "enum": [
+        "docs",
+        "tests",
+        "feature",
+        "fix",
+        "refactor",
+        "deps",
+        "money",
+        "auth",
+        "consent"
+      ],
+      "title": "Shape",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "review.json (stage 5): the reviewer's output, plus what vigild knows.",
+  "properties": {
+    "audit_required": {
+      "title": "Audit Required",
+      "type": "boolean"
+    },
+    "checklist": {
+      "additionalProperties": {
+        "type": "boolean"
+      },
+      "title": "Checklist",
+      "type": "object"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/Finding"
+      },
+      "maxItems": 100,
+      "title": "Findings",
+      "type": "array"
+    },
+    "head": {
+      "title": "Head",
+      "type": "string"
+    },
+    "job_id": {
+      "title": "Job Id",
+      "type": "string"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "reviewer": {
+      "title": "Reviewer",
+      "type": "string"
+    },
+    "round": {
+      "minimum": 1,
+      "title": "Round",
+      "type": "integer"
+    },
+    "rung": {
+      "maximum": 3,
+      "minimum": 0,
+      "title": "Rung",
+      "type": "integer"
+    },
+    "shape": {
+      "$ref": "#/$defs/Shape"
+    },
+    "task_id": {
+      "title": "Task Id",
+      "type": "string"
+    },
+    "verdict": {
+      "enum": [
+        "clean",
+        "changes"
+      ],
+      "title": "Verdict",
+      "type": "string"
+    }
+  },
+  "required": [
+    "verdict",
+    "findings",
+    "checklist",
+    "task_id",
+    "job_id",
+    "head",
+    "shape",
+    "rung",
+    "round",
+    "audit_required",
+    "reviewer",
+    "provenance"
+  ],
+  "title": "Review",
+  "type": "object"
+}

@@ -98,6 +98,34 @@ class Budgets(_M):
     wip_per_repo: int = Field(ge=1)
     coord_session_usd: float = Field(gt=0)
     decider_call_usd: float = Field(gt=0)
+    # Reservations for one reviewer and one auditor session (phase 2a). They
+    # count against the day and the month, not the task's own cap, so a fix
+    # round gets what's left of the worker's budget.
+    review_session_usd: float = Field(default=0.50, gt=0)
+    audit_session_usd: float = Field(default=1.00, gt=0)
+
+
+class ShapePolicy(_M):
+    rung: int = Field(ge=0, le=3)
+    max_rung: int = Field(default=3, ge=0, le=3)
+
+
+class RungPolicy(_M):
+    reviewer: str
+    auditor: str
+    audit: float = Field(ge=0, le=1)  # base share of reviews audited
+    promote_after: int | None = Field(default=None, ge=1)  # weighted PRs; None: top rung
+    min_match: float = Field(default=0.9, ge=0, le=1)
+    max_false_per_pr: float | None = Field(default=None, ge=0)
+
+
+class ReviewPolicy(_M):
+    """configs/review.yaml: where each shape starts and what moves it (item 1)."""
+
+    shapes: dict[str, ShapePolicy]
+    rungs: dict[int, RungPolicy]
+    verify_weight: dict[int, float]
+    level0_audit_factor: float = Field(default=1.0, ge=1)
 
 
 class LongContext(_M):
@@ -206,6 +234,7 @@ class Config(_M):
     prices: Prices
     egress: Egress
     vigild: Vigild
+    review: ReviewPolicy
 
     def preset(self, name: str) -> Preset:
         try:
@@ -228,6 +257,7 @@ FILES = {
     "prices": "prices.yaml",
     "egress": "egress.yaml",
     "vigild": "vigild.yaml",
+    "review": "review.yaml",
 }
 
 
@@ -265,6 +295,9 @@ def validate(cfg: Config) -> None:
             if path.startswith("/") or ".." in Path(path).parts:
                 raise ConfigError(f"{repo}: bad dev_lockfiles entry {path!r}")
     validate_repo_policies(cfg)
+    from vigild.review.ladder import validate_policy
+
+    validate_policy(cfg)
 
 
 # --- the env file -------------------------------------------------------------

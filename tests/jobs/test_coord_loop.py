@@ -27,6 +27,7 @@ from tests.test_devimage import FakeDocker, FakeSuites
 from vigild.api.app import create_app
 from vigild.budget import Budget
 from vigild.config import Config, RepoPolicy
+from vigild.contract.models import CHECKLIST
 from vigild.db import Store
 from vigild.devimage import DevImages, SessionImages
 from vigild.executors.base import EventSink, ExecOutcome, SessionSpec
@@ -131,6 +132,14 @@ TESTS = {
 }
 
 
+CLEAN_REVIEW: dict[str, Any] = {
+    "verdict": "clean",
+    "findings": [],
+    "checklist": {c: True for c in CHECKLIST},
+}
+CLEAN_AUDIT: dict[str, Any] = {"findings": [], "false_findings": []}
+
+
 def _work(clone: Path, doc: str, *, honest: bool = True) -> None:
     """A worker's change: its test first, then (if honest) the doc it checks."""
     test, text = TESTS[doc]
@@ -149,6 +158,10 @@ class StandIn:
     coord_extra: Callable[[Path, str], None] | None = None
     worker_edit: Callable[[SessionSpec, dict[str, Any]], None] | None = None
     on_session: Callable[[SessionSpec], None] | None = None
+    # a reviewer's and an auditor's structured output (phase 2a, item 1)
+    review: Callable[[SessionSpec], Any] = lambda spec: CLEAN_REVIEW
+    audit: Callable[[SessionSpec], Any] = lambda spec: CLEAN_AUDIT
+    specs: list[SessionSpec] = field(default_factory=list)
     calls: list[tuple[str, str]] = field(default_factory=list)
     running: int = 0
     max_running: int = 0
@@ -159,8 +172,12 @@ class StandIn:
         assert gateway_token.startswith("vgw_")
         assert spec.packet.startswith("# 1. Role and rules")
         self.calls.append((spec.role.value, spec.task_id or spec.job_id))
+        self.specs.append(spec)
         if self.on_session:
             self.on_session(spec)
+        if spec.role in (Role.REVIEWER, Role.AUDITOR):
+            answer = (self.review if spec.role is Role.REVIEWER else self.audit)(spec)
+            return ExecOutcome("done", 0, {"status": "done", "structured_output": answer})
         task = json.loads((spec.clone / ".vigil" / "task.json").read_text())
         with self.lock:
             self.running += 1
@@ -236,6 +253,7 @@ class BarePublisher:
         title: str,
         body: str,
         scope: list[str],
+        existing: str | None = None,
     ) -> str:
         from vigild.github.publish import publish
 
@@ -262,6 +280,7 @@ class BarePublisher:
             body=body,
             pulls=Pulls(),
             scope=scope,
+            existing=existing,
         )
 
 
@@ -377,7 +396,7 @@ def test_end_to_end(world: World) -> None:
     r = w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
     assert r.status_code == 200, r.text
     assert w.standin.max_running == 2
-    assert w.store.get_job(job).state.value == "in_review"
+    assert w.store.get_job(job).state.value == "ready"
 
     # two draft PRs, from the host, each branch with its own worker_report.json
     assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
@@ -390,7 +409,7 @@ def test_end_to_end(world: World) -> None:
 
     # the whole tree from one endpoint
     tree = w.client.get(f"/api/jobs/{job}/tree", headers=auth(w.tokens.read)).json()
-    assert tree["job"]["state"] == "in_review"
+    assert tree["job"]["state"] == "ready"
     (coord,) = tree["sessions"]
     assert coord["role"] == "coord" and coord["status"] == "done"
     workers = coord["children"]
@@ -399,9 +418,22 @@ def test_end_to_end(world: World) -> None:
     names = sorted(a["name"] for a in tree["artifacts"])
     assert names.count("worker_report.json") == 2
     assert {"spec.md", "plan.md", "approval.json", "spec_gate.json"} <= set(names)
-    assert {t["state"] for t in tree["tasks"]} == {"pr_open"}
+    assert {t["state"] for t in tree["tasks"]} == {"reviewed"}
     # every reservation was settled
     assert w.budget.open_today() == 0
+    # stages 5 and 6 (phase 2a): each PR reviewed in a read-only session, then
+    # audited (rung 0 audits all of them); the job waits in "Ready to merge"
+    roles = [c[0] for c in w.standin.calls]
+    assert roles.count("reviewer") == 2 and roles.count("auditor") == 2
+    assert names.count("review.json") == 2 and names.count("audit.json") == 2
+    reviewers = [s for s in w.standin.specs if s.role is Role.REVIEWER]
+    assert all(s.output_schema and "checklist" in s.output_schema["properties"] for s in reviewers)
+    assert all(s.preset == "claude-sonnet" for s in reviewers)
+    auditors = [s for s in w.standin.specs if s.role is Role.AUDITOR]
+    assert all(s.preset == "claude-opus" for s in auditors)
+    (ready,) = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["ready"]
+    assert ready["job_id"] == job and len(ready["body"]["prs"]) == 2
+    assert all(p["audited"] and p["rung"] == 0 for p in ready["body"]["prs"])
 
 
 def test_coord_revises_after_a_gate_failure(world: World) -> None:
@@ -699,7 +731,7 @@ def test_resume_after_the_cap_redispatches(world: World) -> None:  # item 18
     )
     r = w.client.post(f"/api/inbox/{page['id']}/resume", headers=auth(w.tokens.admin))
     assert r.status_code == 200, r.text
-    assert w.store.get_job(job).state.value == "in_review"
+    assert w.store.get_job(job).state.value == "ready"
     assert len(w.publisher.prs) == 2
 
 
@@ -764,7 +796,7 @@ def test_reconcile_restarts_an_approved_job_that_never_built(world: World) -> No
     # nothing starts until vigild's gateway is up and its images are validated (N11)
     assert w.store.get_job(job).state.value == "approved" and w.standin.calls == [("coord", job)]
     assert w.runner.start_deferred() == 1
-    assert w.store.get_job(job).state.value == "in_review"
+    assert w.store.get_job(job).state.value == "ready"
     assert w.runner.start_deferred() == 0
 
 
@@ -846,7 +878,7 @@ def test_fail_blocked_retry_done(world: World) -> None:
 
     r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
     assert r.status_code == 200, r.text
-    assert w.store.get_job(job).state.value == "in_review"
+    assert w.store.get_job(job).state.value == "ready"
     assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
     # the retry ran only w1, under what was left of its $2.00, not a fresh cap
     w1 = [b for b in budgets if b[0].endswith("w1")]
@@ -895,7 +927,7 @@ def test_replan_sends_the_job_back_to_the_coord_with_the_failure(world: World) -
     )
     assert r.status_code == 200, r.text
     qs = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
-    assert w.store.get_job(job).state.value == "in_review", [(q["title"], q["body"]) for q in qs]
+    assert w.store.get_job(job).state.value == "ready", [(q["title"], q["body"]) for q in qs]
     assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
 
 
@@ -1155,8 +1187,8 @@ def test_sessions_run_in_the_session_image_and_tests_in_the_dev_image(world: Wor
     seen: list[tuple[str, str | None]] = []
     w.standin.on_session = lambda spec: seen.append((spec.role.value, spec.image))
     job = _approve(w)
-    assert w.store.get_job(job).state.value == "in_review"
-    assert {r for r, _ in seen} == {"coord", "worker"}
+    assert w.store.get_job(job).state.value == "ready"
+    assert {r for r, _ in seen} == {"coord", "worker", "reviewer", "auditor"}
     assert all(img and img.startswith("vigil-session/fixture:") for _, img in seen), seen
     images = {c["image"] for c in w.tests.calls}
     assert images and all(i.startswith("vigil-dev/fixture:") for i in images), images
@@ -1176,7 +1208,7 @@ def test_build_output_a_worker_leaves_is_not_committed(world: World) -> None:  #
 
     w.standin.worker_edit = edit
     job = _approve(w)
-    assert w.store.get_job(job).state.value == "in_review"
+    assert w.store.get_job(job).state.value == "ready"
     assert len(w.publisher.prs) == 2
 
 

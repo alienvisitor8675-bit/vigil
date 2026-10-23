@@ -27,6 +27,7 @@ from vigild.executors.egress import acl_yaml, allowlist, proxy_config_yaml
 from vigild.verifier import MAX_REPORT, REPORT_DIR, RunResult
 
 LABEL = "dev.vigil.session"
+OUTPUT_SCHEMA = "/vigil/output_schema.json"
 HARNESS_CAPS = ("SETUID", "SETGID", "KILL")
 
 
@@ -84,6 +85,12 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         _mount(str(spec.session_dir / "out"), "/vigil/out", read_only=False),
         *[_mount(m.host, m.container, m.read_only) for m in spec.mounts],
     ]
+    if spec.output_schema is not None:
+        # a reviewer's or auditor's answer schema (phase 2a): structured output
+        mounts.append(
+            _mount(str(spec.session_dir / "output_schema.json"), OUTPUT_SCHEMA, read_only=True)
+        )
+        env["VIGIL_OUTPUT_SCHEMA"] = OUTPUT_SCHEMA
     return {
         "image": spec.image or cfg.vigild.images.claude_executor,
         "name": f"vigil-{spec.session_id}",
@@ -301,6 +308,9 @@ def write_session_files(cfg: Config, spec: SessionSpec) -> None:
     (sd / "out").mkdir()
     (sd / "out").chmod(0o777)
     (sd / "packet.md").write_text(spec.packet)
+    if spec.output_schema is not None:
+        (sd / "output_schema.json").write_text(json.dumps(spec.output_schema))
+        (sd / "output_schema.json").chmod(0o644)
     (sd / "proxy" / "acl.yaml").write_text(acl_yaml(allowlist(cfg, spec.role)))
     (sd / "proxy" / "config.yaml").write_text(proxy_config_yaml(cfg))
     for p in (sd, sd / "proxy"):

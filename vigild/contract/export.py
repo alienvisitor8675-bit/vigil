@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from vigild.contract.models import Event, Plan, Result, Task, WorkerReport
+from vigild.contract.models import Audit, Event, Plan, Result, Review, Task, WorkerReport
 
 MODELS: dict[str, type[BaseModel]] = {
     "task.schema.json": Task,
@@ -19,6 +19,8 @@ MODELS: dict[str, type[BaseModel]] = {
     "event.schema.json": Event,
     "worker_report.schema.json": WorkerReport,
     "plan.schema.json": Plan,
+    "review.schema.json": Review,
+    "audit.schema.json": Audit,
 }
 
 
