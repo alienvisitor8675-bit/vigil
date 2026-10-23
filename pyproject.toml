@@ -1,0 +1,67 @@
+[project]
+name = "vigil"
+version = "0.1.0"
+description = "Self-hosted orchestrator that runs isolated AI coding sessions"
+requires-python = "==3.14.8"
+dependencies = [
+  "fastapi==0.143.0",
+  "uvicorn==0.54.0",
+  "pydantic==2.14.0",
+  "httpx2==2.13.1",
+  "pyyaml==6.0.3",
+  "pyjwt==2.15.1",
+  "cryptography==50.0.2",
+  "docker==7.2.0",
+  "opentelemetry-api==1.45.1",
+  "opentelemetry-sdk==1.45.1",
+  "opentelemetry-exporter-otlp-proto-http==1.45.1",
+  "typer==0.27.3",
+]
+
+[dependency-groups]
+dev = [
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "ruff==0.16.10",
+  "mypy==2.4.0",
+]
+
+[tool.uv]
+# Not an installable package: run `python -m vigild` and `python -m vigil`.
+package = false
+# The pin rule (docs/sources.md): nothing released after 2026-10-08,
+# transitive dependencies included.
+exclude-newer = "2026-10-08T23:59:59Z"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+extend-exclude = [".claude"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF"]
+ignore = ["S101", "S603", "S607"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S108", "E501"]
+"images/**" = ["S602"]  # test_cmd is a shell command by contract
+
+[tool.mypy]
+strict = true
+python_version = "3.14"
+mypy_path = "cli"
+packages = ["vigild", "vigil"]
+
+[[tool.mypy.overrides]]
+module = ["yaml", "yaml.*", "docker", "docker.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "cli"]
+asyncio_mode = "auto"
+markers = [
+  "docker: needs Docker Desktop and the linux/arm64 images (pytest -m docker, on the Mac)",
+  "live: calls a hosted model through vigild's gateway; needs the vigil env file",
+]
+addopts = "-m 'not docker and not live' --strict-markers"

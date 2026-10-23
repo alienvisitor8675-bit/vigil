@@ -1,0 +1,115 @@
+# Which backends and decider routes may see each repo's text (design
+# "Decider"; architecture "Backends"). vigild refuses to start if a private
+# repo lists a hosted entry other than jev-cloudflare. The one exception,
+# `anthropic` for thomasbardhi01/vigil (owner, 2026-10-22, Q2), is hard-coded
+# in vigild/repos.py and can't be extended from this file.
+#
+# Dev images (owner direction, review round 2; vigild/devimage.py): each repo
+# names its image definition (images/dev/<repo>.Dockerfile) and the lockfiles
+# it installs from. vigild builds the image whenever their blobs at the base
+# commit change, and validates it by running every dev_suites command on a
+# clean checkout, inside the image, with no network. Test results come only
+# from that image, through the verifier. dev_excluded lists suites that can't
+# run there, and why. A test_cmd that needs a tool not in dev_image_tools is
+# refused at the spec gate.
+repos:
+  thomasbardhi01/parkagent:
+    visibility: public
+    decider: [haiku, jev-cloudflare]      # jev-openrouter once its key exists
+    backends: [claude-sonnet, claude-opus, claude-haiku]
+    worker_overflow: []
+    auto_merge: false
+    dev_dockerfile: images/dev/parkagent.Dockerfile
+    dev_lockfiles:
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - server/package.json
+      - executor/package.json
+      - data/pyproject.toml
+      - data/uv.lock
+      - data/.python-version
+    # Its CI's Linux jobs, offline. PostgreSQL with PostGIS runs inside the
+    # verifier's own container on loopback (vigil-prepare), and Chromium comes
+    # with the image, so nothing needs a sidecar or the network.
+    dev_suites:
+      server: pnpm -C server lint && pnpm -C server test
+      build: pnpm -C executor run build && DATABASE_URL=postgresql://ci:ci@127.0.0.1:5432/ci pnpm -C server build
+      server-pg: >-
+        export DATABASE_URL=postgresql://ci:ci@127.0.0.1:5432/pa_pg_test
+        TEST_PG_DATABASE_URL=postgresql://ci:ci@127.0.0.1:5432/pa_pg_test &&
+        pnpm -C server exec prisma generate && pnpm -C server exec prisma migrate deploy &&
+        pnpm -C server test:pg
+      boot: >-
+        export DATABASE_URL=postgresql://ci:ci@127.0.0.1:5432/ci &&
+        pnpm -C executor run build && pnpm -C server build &&
+        pnpm -C server exec prisma migrate deploy &&
+        scripts/boot-check.sh off && scripts/boot-check.sh on && scripts/boot-check.sh broken
+      executor: pnpm -C executor lint && pnpm -C executor test
+      scripts: >-
+        ./scripts/check-city-neutral.sh && node --test scripts/check-feature-map.test.mjs &&
+        node scripts/check-feature-map.mjs && node --test scripts/audit.test.mjs &&
+        node --test ios/Tools/flaky-tests.test.mjs
+      data: cd data && uv run --offline test_import_parkboston_zones.py && uv run --offline test_fetch_parking_footprints.py
+    dev_excluded:
+      ios: >-
+        The iOS app is SwiftUI with an XcodeGen project; its unit, Release-binary
+        and UI tests need Xcode and an iOS simulator (CI runs them on macos-latest).
+        No Linux container has either. The Linux-runnable ios/Tools node test is
+        in `scripts`.
+    dev_image_tools: [pnpm, node, npx, uv, python, git, grep, sh, bash, cat, head, tail, wc, diff, test]
+    # What decides how ParkAgent's tests run, read from its tree: the
+    # manifests and lockfiles, the vitest and TypeScript configs, the vitest
+    # setup files, eslint (the lint suites), prisma's config, lefthook, and the
+    # scripts its suites run.
+    runner_config:
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - server/package.json
+      - executor/package.json
+      - "**/vitest*.config.*"
+      - "**/vite.config.*"
+      - "**/tsconfig*.json"
+      - "**/eslint.config.*"
+      - server/test/setup/**
+      - server/prisma7.config.ts
+      - lefthook.yml
+      - scripts/boot-check.sh
+      - scripts/check-city-neutral.sh
+      - scripts/check-feature-map.mjs
+      - scripts/audit.mjs
+      - data/pyproject.toml
+      - data/uv.lock
+      - data/.python-version
+      - "**/conftest.py"
+      - "**/.npmrc"
+      - "**/node_modules/**"
+  thomasbardhi01/vigil:
+    visibility: private
+    decider: [haiku, jev-cloudflare]
+    backends: [claude-sonnet, claude-opus, claude-haiku]
+    worker_overflow: []
+    auto_merge: false
+    dev_dockerfile: images/dev/vigil.Dockerfile
+    dev_lockfiles: [pyproject.toml, uv.lock]
+    dev_suites:
+      tests: uv run --offline pytest -q -p no:cacheprovider
+    dev_excluded:
+      docker: >-
+        The `-m docker` and `-m live` tests start containers and call the model;
+        the verifier's container has no Docker socket and no network.
+    dev_image_tools: [uv, python, pytest, git, grep, sh, cat, head, tail, wc, diff, test]
+    runner_config:
+      - pyproject.toml
+      - uv.lock
+      - "**/conftest.py"
+      - pytest.ini
+      - setup.cfg
+      - tox.ini
+      - tests/harness.py
+      - pytest.toml
+      - .pytest.toml
+      - .pytest.ini
+      - uv.toml
+      - .python-version

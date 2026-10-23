@@ -1,0 +1,53 @@
+# Tracing: the OTel collector in front of Arize Phoenix (owner decision
+# 2026-10-22: Phoenix replaces Langfuse for phases 1-7; Langfuse v4 wants
+# ~16 GiB and the Docker VM here has 12). vigild itself runs natively.
+#
+#   docker compose --env-file ~/.config/vigil/env up -d --build
+#
+# Nothing is bind-mounted from the repo, so no container depends on where the
+# checkout lives (the collector's config is baked into its image).
+#
+# Secrets come from the env file by interpolation only: PHOENIX_SECRET,
+# PHOENIX_ADMIN_SECRET, PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD (runbook).
+name: vigil
+
+services:
+  phoenix:
+    image: arizephoenix/phoenix:version-20.19.0-nonroot@sha256:f2109e09662e2bd9570af155e707fab8cf92eab79911727d183d8e667d9411c9
+    restart: unless-stopped
+    environment:
+      PHOENIX_ENABLE_AUTH: "true"
+      PHOENIX_SECRET: ${PHOENIX_SECRET:?set PHOENIX_SECRET in the env file}
+      PHOENIX_ADMIN_SECRET: ${PHOENIX_ADMIN_SECRET:?set PHOENIX_ADMIN_SECRET in the env file}
+      PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD: ${PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD:?set it in the env file}
+      PHOENIX_WORKING_DIR: /home/nonroot/phoenix   # SQLite lives here (the nonroot image runs as 65532)
+      PHOENIX_USE_SECURE_COOKIES: "false"     # plain HTTP on 127.0.0.1 / the tailnet
+      PHOENIX_TELEMETRY_ENABLED: "false"
+    volumes:
+      - phoenix-data:/home/nonroot
+    ports:
+      - "127.0.0.1:${VIGIL_PHOENIX_PORT:-6006}:6006"   # UI + OTLP/HTTP
+    networks: [telemetry]
+    mem_limit: 2g
+
+  otel-collector:
+    image: vigil/otel-collector:0.162.0
+    build:
+      context: images/otel-collector
+      additional_contexts:
+        vigil_configs: ./configs
+    container_name: ${VIGIL_COLLECTOR_NAME:-otel-collector}   # vigild attaches it to each session network
+    restart: unless-stopped
+    environment:
+      PHOENIX_ADMIN_SECRET: ${PHOENIX_ADMIN_SECRET:?set PHOENIX_ADMIN_SECRET in the env file}
+    ports:
+      - "127.0.0.1:${VIGIL_OTLP_PORT:-4318}:4318"   # vigild's own spans
+    networks: [telemetry]
+    depends_on: [phoenix]
+    mem_limit: 256m
+
+volumes:
+  phoenix-data: {}
+
+networks:
+  telemetry: {}

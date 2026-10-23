@@ -1,0 +1,183 @@
+{
+  "$defs": {
+    "CriterionVerify": {
+      "additionalProperties": false,
+      "description": "How high one acceptance criterion's verification reaches, and why not higher.",
+      "properties": {
+        "criterion": {
+          "title": "Criterion",
+          "type": "string"
+        },
+        "level": {
+          "maximum": 5,
+          "minimum": 0,
+          "title": "Level",
+          "type": "integer"
+        },
+        "why_not_higher": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Why Not Higher"
+        }
+      },
+      "required": [
+        "criterion",
+        "level"
+      ],
+      "title": "CriterionVerify",
+      "type": "object"
+    },
+    "Size": {
+      "enum": [
+        "XS",
+        "S",
+        "M",
+        "L"
+      ],
+      "title": "Size",
+      "type": "string"
+    },
+    "WorkerContract": {
+      "additionalProperties": false,
+      "description": "One worker's contract inside plan.md; vigild routes it into a Task.",
+      "properties": {
+        "depends_on": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Depends On",
+          "type": "array"
+        },
+        "done_when": {
+          "title": "Done When",
+          "type": "string"
+        },
+        "files_in_scope": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Files In Scope",
+          "type": "array"
+        },
+        "goal": {
+          "title": "Goal",
+          "type": "string"
+        },
+        "labels": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "array"
+        },
+        "max_cost_usd": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Cost Usd"
+        },
+        "must_fail_first": {
+          "default": true,
+          "title": "Must Fail First",
+          "type": "boolean"
+        },
+        "out_of_scope": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Out Of Scope",
+          "type": "array"
+        },
+        "risk": {
+          "maximum": 5,
+          "minimum": 1,
+          "title": "Risk",
+          "type": "integer"
+        },
+        "size": {
+          "$ref": "#/$defs/Size"
+        },
+        "task_id": {
+          "title": "Task Id",
+          "type": "string"
+        },
+        "test_cmd": {
+          "minLength": 1,
+          "pattern": "\\S",
+          "title": "Test Cmd",
+          "type": "string"
+        },
+        "value": {
+          "maximum": 5,
+          "minimum": 1,
+          "title": "Value",
+          "type": "integer"
+        },
+        "verify_level": {
+          "default": 0,
+          "maximum": 5,
+          "minimum": 0,
+          "title": "Verify Level",
+          "type": "integer"
+        },
+        "why": {
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "goal",
+        "why",
+        "value",
+        "risk",
+        "size",
+        "test_cmd",
+        "done_when",
+        "files_in_scope"
+      ],
+      "title": "WorkerContract",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "verify": {
+      "items": {
+        "$ref": "#/$defs/CriterionVerify"
+      },
+      "minItems": 1,
+      "title": "Verify",
+      "type": "array"
+    },
+    "workers": {
+      "items": {
+        "$ref": "#/$defs/WorkerContract"
+      },
+      "title": "Workers",
+      "type": "array"
+    }
+  },
+  "required": [
+    "workers",
+    "verify"
+  ],
+  "title": "Plan",
+  "type": "object"
+}

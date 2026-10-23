@@ -1,0 +1,31 @@
+# Routing (design "Routing rules and escalation"). Rules run top to bottom;
+# the first match wins and its name goes to tier_reason. Tiers map to presets
+# in backends.yaml. A tier whose preset isn't live yet falls back to
+# `fallback`, and the reason says so.
+tiers:
+  spec: claude-sonnet          # rule 1: spec writing only, no code
+  claude-opus: claude-opus
+  claude-sonnet: claude-sonnet
+  local: tower-qwen
+  local-fast: tower-fast
+fallback: claude-sonnet
+coord: claude-opus             # the coord is the one place to spend quality
+reviewer: claude-sonnet
+auditor: claude-opus
+
+# Rule 2, not overridable. Glob semantics: vigild/intake/paths.py.
+money_paths:
+  - src/billing/**
+  - src/auth/**
+  - "**/payments/**"
+  - "**/consent/**"
+  - "**/stripe*"
+  - "**/wallet/**"
+  - fly.toml
+  - "*Config.xcconfig"
+architecture_labels: [architecture, migration]
+architecture_paths: [docs/architecture.md]
+local_labels: [tests, docs, deps, lint, copy, ui-small]
+xs_labels: [docs, lint]
+escalate_attempt: 3
+escalate_review_rounds: 2

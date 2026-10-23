@@ -1,0 +1,1199 @@
+"""The coord loop end to end on a fixture repo (not ParkAgent):
+request -> coord writes spec.md + plan.md -> spec gate -> inbox -> owner
+approves -> planning -> two workers in parallel -> host checks + draft PRs
+(against a local bare repo) -> worker_report.json -> job tree from one endpoint.
+
+The executor here is a stand-in for the container that does what the harness
+does (edit, report, commit); tests/jobs/test_coord_loop_docker.py runs the
+real container."""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+
+from tests.conftest import auth, git
+from tests.harness import LocalTestRunner, finish_session
+from tests.test_devimage import FakeDocker, FakeSuites
+from vigild.api.app import create_app
+from vigild.budget import Budget
+from vigild.config import Config, RepoPolicy
+from vigild.db import Store
+from vigild.devimage import DevImages, SessionImages
+from vigild.executors.base import EventSink, ExecOutcome, SessionSpec
+from vigild.jobs.model import Role
+from vigild.jobs.runner import JobRunner
+from vigild.jobs.service import JobService
+from vigild.services import Services, Tokens
+from vigild.telemetry.spans import Telemetry
+from vigild.verifier import Verifier
+from vigild.workspace import Workspace
+
+REPO = "o/fixture"
+
+SPEC = """# Spec: document the rate limit
+
+## Goal
+The feature map and the runbook both describe the rate limit.
+
+## Non-goals
+- Changing the limit.
+
+## Acceptance criteria
+- AC1: the feature map names the rate limit. test: `pytest -q tests/test_feature_map.py`
+- AC2: the runbook says how to change it. test: `pytest -q tests/test_runbook.py`
+
+## Files in scope
+- `docs/feature-map.md`
+- `docs/runbook.md`
+- `tests/test_feature_map.py`
+- `tests/test_runbook.py`
+
+## Files out of scope
+- `src/**`
+
+## Money paths
+none
+
+## Interfaces
+- None shared: each worker edits only its own doc and test (`docs/feature-map.md` and `tests/test_feature_map.py`, or `docs/runbook.md` and `tests/test_runbook.py`).
+
+## Risks
+- None.
+
+## Rollback
+Revert the PRs.
+"""
+
+
+def plan(job: str) -> str:
+    workers = [
+        {
+            "task_id": f"{job}-w1",
+            "goal": "feature map row",
+            "why": "AC1",
+            "value": 3,
+            "risk": 1,
+            "size": "XS",
+            "test_cmd": "pytest -q tests/test_feature_map.py",
+            "done_when": "AC1 holds",
+            "files_in_scope": ["docs/feature-map.md", "tests/test_feature_map.py"],
+            "labels": ["docs"],
+        },
+        {
+            "task_id": f"{job}-w2",
+            "goal": "runbook section",
+            "why": "AC2",
+            "value": 3,
+            "risk": 1,
+            "size": "XS",
+            "test_cmd": "pytest -q tests/test_runbook.py",
+            "done_when": "AC2 holds",
+            "files_in_scope": ["docs/runbook.md", "tests/test_runbook.py"],
+            "labels": ["docs"],
+        },
+    ]
+    verify = [
+        {"criterion": c, "level": 0, "why_not_higher": "a doc check has no property"}
+        for c in ("AC1", "AC2")
+    ]
+    return (
+        "# Plan\n\n## Notes addressed\n- keep it short: adopted\n\n## Workers\n```json\n"
+        + json.dumps({"workers": workers, "verify": verify}, indent=1)
+        + "\n```\n"
+    )
+
+
+EDITS = {
+    "docs/feature-map.md": "# Feature map\n\n| rate limit | 10 req/min |\n",
+    "docs/runbook.md": "# Runbook\n\nSet RATE_LIMIT in the env to change the limit.\n",
+}
+TESTS = {
+    "docs/feature-map.md": (
+        "tests/test_feature_map.py",
+        "from pathlib import Path\n\n\ndef test_rate_limit():\n"
+        "    assert 'rate limit' in Path('docs/feature-map.md').read_text()\n",
+    ),
+    "docs/runbook.md": (
+        "tests/test_runbook.py",
+        "from pathlib import Path\n\n\ndef test_rate_limit_var():\n"
+        "    assert 'RATE_LIMIT' in Path('docs/runbook.md').read_text()\n",
+    ),
+}
+
+
+def _work(clone: Path, doc: str, *, honest: bool = True) -> None:
+    """A worker's change: its test first, then (if honest) the doc it checks."""
+    test, text = TESTS[doc]
+    (clone / test).parent.mkdir(parents=True, exist_ok=True)
+    (clone / test).write_text(text)
+    (clone / doc).write_text(EDITS[doc] if honest else "nothing relevant\n")
+
+
+@dataclass
+class StandIn:
+    """Does what the container's harness does: run the agent's work, write the
+    report, commit, leave the result bundle in the session's out dir, and put
+    the head and the test record on the result line. Records concurrency."""
+
+    coord_drafts: list[Callable[[str], tuple[str, str]]] = field(default_factory=list)
+    coord_extra: Callable[[Path, str], None] | None = None
+    worker_edit: Callable[[SessionSpec, dict[str, Any]], None] | None = None
+    on_session: Callable[[SessionSpec], None] | None = None
+    calls: list[tuple[str, str]] = field(default_factory=list)
+    running: int = 0
+    max_running: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    barrier: threading.Barrier | None = None
+
+    def run(self, spec: SessionSpec, gateway_token: str, on_event: EventSink) -> ExecOutcome:
+        assert gateway_token.startswith("vgw_")
+        assert spec.packet.startswith("# 1. Role and rules")
+        self.calls.append((spec.role.value, spec.task_id or spec.job_id))
+        if self.on_session:
+            self.on_session(spec)
+        task = json.loads((spec.clone / ".vigil" / "task.json").read_text())
+        with self.lock:
+            self.running += 1
+            self.max_running = max(self.max_running, self.running)
+        try:
+            if spec.role is Role.COORD:
+                draft = (
+                    self.coord_drafts.pop(0) if self.coord_drafts else (lambda j: (SPEC, plan(j)))
+                )
+                sp, pl = draft(spec.job_id)
+                d = spec.clone / ".vigil" / spec.job_id
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "spec.md").write_text(sp)
+                (d / "plan.md").write_text(pl)
+                if self.coord_extra:
+                    self.coord_extra(spec.clone, spec.job_id)
+                git(spec.clone, "add", "-A")
+                git(spec.clone, "commit", "-q", "--allow-empty", "-m", "coord: spec and plan")
+                result = finish_session(
+                    spec.clone,
+                    spec.session_dir / "out",
+                    branch=task["branch"],
+                    base_sha=task["base_sha"],
+                    scope=[],
+                )
+                return ExecOutcome("done", 0, result)
+            if self.barrier:
+                self.barrier.wait(timeout=10)  # both workers must be in flight at once
+            if self.worker_edit:
+                self.worker_edit(spec, task)
+            else:
+                f = task["spec"]["files_in_scope"][0]
+                _work(spec.clone, f)
+            d = spec.clone / ".vigil" / spec.job_id / spec.task_id  # type: ignore[operator]
+            d.mkdir(parents=True, exist_ok=True)
+            if not (d / "ask_coord.json").exists() and not (d / "worker_report.json").exists():
+                (d / "worker_report.json").write_text(json.dumps({
+                    "task_id": spec.task_id, "job_id": spec.job_id, "test_before": "fail",
+                    "test_after": "pass", "files_changed": task["spec"]["files_in_scope"],
+                    "summary": "documented it",
+                    "self_check": {"test_failed_first": True, "outside_scope": [],
+                                   "not_done": "nothing", "reviewer_would_flag": "wording",
+                                   "could_delete": "nothing"},
+                    "open_questions": [], "provenance": "claude"}))  # fmt: skip
+            result = finish_session(
+                spec.clone,
+                spec.session_dir / "out",
+                branch=task["branch"],
+                base_sha=task["base_sha"],
+                scope=list(task["spec"]["files_in_scope"]),
+            )
+            return ExecOutcome("done", 0, result)
+        finally:
+            with self.lock:
+                self.running -= 1
+
+
+@dataclass
+class BarePublisher:
+    """GitHub stand-in: vigild's real publish, pushing to the local bare repo."""
+
+    ws: Workspace | None = None
+    prs: list[dict[str, Any]] = field(default_factory=list)
+
+    def publish(
+        self,
+        *,
+        repo: str,
+        head: str,
+        base_sha: str,
+        branch: str,
+        base: str,
+        title: str,
+        body: str,
+        scope: list[str],
+    ) -> str:
+        from vigild.github.publish import publish
+
+        prs = self.prs
+
+        class Pulls:
+            def create_pull(
+                self, repo: str, *, head: str, base: str, title: str, body: str, draft: bool
+            ) -> str:
+                prs.append(
+                    {"head": head, "base": base, "title": title, "draft": draft, "body": body}
+                )
+                return f"https://github.com/{repo}/pull/{len(prs)}"
+
+        assert self.ws is not None
+        return publish(
+            self.ws,
+            repo=repo,
+            head=head,
+            base_sha=base_sha,
+            branch=branch,
+            base=base,
+            title=title,
+            body=body,
+            pulls=Pulls(),
+            scope=scope,
+        )
+
+
+@dataclass
+class World:
+    client: TestClient
+    store: Store
+    budget: Budget
+    standin: StandIn
+    publisher: BarePublisher
+    bare: Path
+    tokens: Tokens
+    images: DevImages
+    runner: JobRunner
+    tests: LocalTestRunner
+
+
+@pytest.fixture
+def world(
+    cfg: Config, tmp_path: Path, fixture_repo: dict[str, Path], tokens: Tokens
+) -> Iterator[World]:
+    cfg.repos.repos[REPO] = RepoPolicy(
+        visibility="public",
+        decider=["haiku"],
+        backends=["claude-sonnet", "claude-opus", "claude-haiku"],
+        dev_dockerfile="images/dev/vigil.Dockerfile",
+        dev_lockfiles=["uv.lock"],
+        dev_suites={"smoke": "true"},
+        dev_image_tools=["git", "grep", "pytest"],
+    )
+    store = Store.open(":memory:")
+    budget = Budget(store, cfg.budgets)
+    from vigild.config import Secrets
+    from vigild.gateway.service import Gateway
+
+    gateway = Gateway(cfg, store, budget, Secrets({}))
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    images = DevImages(cfg, store, FakeDocker(), ws, FakeSuites())
+    standin, publisher, tests = StandIn(), BarePublisher(ws), LocalTestRunner()
+    runner = JobRunner(
+        cfg,
+        store,
+        budget,
+        gateway,
+        standin,
+        ws,
+        publisher,
+        Telemetry(),
+        images,
+        Verifier(ws, tests),
+        background=False,
+        session_images=SessionImages(images, lambda: tmp_path),
+    )
+    images.on_failure = runner.dev_image_failed
+    assert runner.session_images is not None
+    runner.session_images.on_failure = runner.dev_image_failed
+    jobs = JobService(cfg, store, runner)
+    runner.jobs = jobs
+    services = Services(cfg=cfg, store=store, tokens=tokens, jobs=jobs)
+    with TestClient(create_app(services)) as c:
+        yield World(
+            c,
+            store,
+            budget,
+            standin,
+            publisher,
+            fixture_repo["bare"],
+            tokens,
+            images,
+            runner,
+            tests,
+        )
+
+
+def _request(w: World) -> str:
+    r = w.client.post(
+        "/api/jobs",
+        headers=auth(w.tokens.admin),
+        json={
+            "repo": REPO,
+            "title": "Document the rate limit",
+            "request": "The limit is undocumented.",
+            "notes": ["keep it short"],
+            "why": "support asks weekly",
+            "value": 3,
+            "risk": 1,
+        },
+    )
+    assert r.status_code == 202, r.text
+    return str(r.json()["id"])
+
+
+def test_end_to_end(world: World) -> None:
+    w = world
+    w.standin.barrier = threading.Barrier(2)
+    job = _request(w)
+
+    # the coord drafted; the spec gate passed; the owner sees it in the inbox
+    inbox = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()
+    (item,) = inbox["specs"]
+    assert item["job_id"] == job
+    assert [x["task_id"] for x in item["body"]["workers"]] == [f"{job}-w1", f"{job}-w2"]
+    # the owner sees the exact command the verifier will run (round 2, N2)
+    assert [x["test_cmd"] for x in item["body"]["workers"]] == [
+        "pytest -q tests/test_feature_map.py",
+        "pytest -q tests/test_runbook.py",
+    ]
+    assert all(x["must_fail_first"] for x in item["body"]["workers"])
+    assert w.store.get_job(job).state.value == "spec_pending"
+    assert [c[0] for c in w.standin.calls] == ["coord"]
+
+    # approve from the inbox: plan, then two workers in parallel
+    r = w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    assert r.status_code == 200, r.text
+    assert w.standin.max_running == 2
+    assert w.store.get_job(job).state.value == "in_review"
+
+    # two draft PRs, from the host, each branch with its own worker_report.json
+    assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
+    assert all(p["draft"] for p in w.publisher.prs)
+    for n in (1, 2):
+        files = git(w.bare, "ls-tree", "-r", "--name-only", f"vigil/{job}-w{n}")
+        assert f".vigil/{job}/{job}-w{n}/worker_report.json" in files
+        assert f".vigil/{job}/spec.md" in files and f".vigil/{job}/plan.md" in files
+    assert git(w.bare, "log", "-1", "--format=%s", "main") == "seed"
+
+    # the whole tree from one endpoint
+    tree = w.client.get(f"/api/jobs/{job}/tree", headers=auth(w.tokens.read)).json()
+    assert tree["job"]["state"] == "in_review"
+    (coord,) = tree["sessions"]
+    assert coord["role"] == "coord" and coord["status"] == "done"
+    workers = coord["children"]
+    assert sorted(x["role"] for x in workers) == ["worker", "worker"]
+    assert all(x["status"] == "pr_open" and x["pr_url"] for x in workers)
+    names = sorted(a["name"] for a in tree["artifacts"])
+    assert names.count("worker_report.json") == 2
+    assert {"spec.md", "plan.md", "approval.json", "spec_gate.json"} <= set(names)
+    assert {t["state"] for t in tree["tasks"]} == {"pr_open"}
+    # every reservation was settled
+    assert w.budget.open_today() == 0
+
+
+def test_coord_revises_after_a_gate_failure(world: World) -> None:
+    w = world
+    bad = SPEC.replace(" test: `pytest -q tests/test_runbook.py`", "")
+    w.standin.coord_drafts = [lambda j: (bad, plan(j))]
+    job = _request(w)
+    assert [c[0] for c in w.standin.calls] == ["coord", "coord"]
+    (item,) = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"]
+    assert item["job_id"] == job
+
+
+def test_coord_pages_the_owner_after_three_failed_drafts(world: World) -> None:
+    w = world
+    bad = SPEC.replace(" test: `pytest -q tests/test_runbook.py`", "")
+    w.standin.coord_drafts = [lambda j: (bad, plan(j))] * 3
+    job = _request(w)
+    inbox = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()
+    assert inbox["specs"] == []
+    assert any(q["job_id"] == job and "spec gate" in q["title"] for q in inbox["questions"])
+    assert w.store.get_job(job).state.value == "spec_pending"
+
+
+def _approve(w: World) -> str:
+    job = _request(w)
+    item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    return job
+
+
+def test_daily_cap_halts_dispatch(world: World) -> None:
+    w = world
+    job = _request(w)
+    # spend the day elsewhere: $4.50 of $5 is held, so no $1 worker fits
+    w.budget.reserve(session_id=None, task_id="other-1", amount=2.0, purpose="worker")
+    w.budget.reserve(session_id=None, task_id="other-2", amount=2.0, purpose="worker")
+    w.budget.reserve(session_id=None, task_id="other-3", amount=0.5, purpose="worker")
+    item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    assert [c[0] for c in w.standin.calls] == ["coord"]  # no worker started
+    assert w.publisher.prs == []
+    jobrow = w.store.get_job(job)
+    assert jobrow.state.value == "blocked" and jobrow.blocked_from is not None
+    pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert any("daily" in p["title"] for p in pages)
+
+
+def test_a_dev_image_that_fails_refuses_dispatch_and_offers_rebuild(world: World) -> None:
+    w = world
+    w.images.docker.ok = False  # type: ignore[attr-defined]  # the build fails
+    job = _request(w)
+    assert w.standin.calls == []
+    pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert any(p["job_id"] == job and "dev image" in p["title"] for p in pages)
+    (item,) = [p for p in pages if p["body"].get("kind") == "dev_image"]
+    assert item["body"]["actions"] == ["rebuild", "dismiss"] and item["body"]["stage"] == "build"
+
+    w.images.docker.ok = True  # type: ignore[attr-defined]  # fixed; the owner rebuilds
+    r = w.client.post(f"/api/inbox/{item['id']}/rebuild", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert w.images.status(REPO, item["body"]["base_sha"])[0]
+    job_page = next(p for p in pages if p["job_id"] == job)
+    r = w.client.post(f"/api/inbox/{job_page['id']}/resume", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert [c[0] for c in w.standin.calls] == ["coord"]
+
+
+def test_ask_coord_files_a_question(world: World) -> None:
+    w = world
+
+    def ask(spec: SessionSpec, task: dict[str, Any]) -> None:
+        d = spec.clone / ".vigil" / spec.job_id / str(spec.task_id)
+        d.mkdir(parents=True, exist_ok=True)
+        if spec.task_id and spec.task_id.endswith("w2"):
+            (d / "ask_coord.json").write_text(json.dumps({"question": "Which env var name?"}))
+        else:
+            f = task["spec"]["files_in_scope"][0]
+            _work(spec.clone, f)
+
+    w.standin.worker_edit = ask
+    job = _approve(w)
+    questions = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    q = next(q for q in questions if q["kind"] == "ask_coord")
+    assert q["job_id"] == job and q["body"]["question"] == "Which env var name?"
+    assert q["body"]["coord_session_id"] == w.store.get_job(job).coord_session_id
+    assert [p["head"] for p in w.publisher.prs] == [f"vigil/{job}-w1"]
+    assert w.store.get_task(f"{job}-w2").state == "waiting"
+
+
+def test_out_of_scope_worker_is_not_published(world: World) -> None:
+    w = world
+
+    def sneaky(spec: SessionSpec, task: dict[str, Any]) -> None:
+        f = task["spec"]["files_in_scope"][0]
+        _work(spec.clone, f)
+        (spec.clone / "README.md").write_text("sneaky\n")
+
+    w.standin.worker_edit = sneaky
+    job = _approve(w)
+    assert w.publisher.prs == []
+    assert {t.state for t in w.store.list_tasks(job)} == {"failed"}
+    assert w.store.get_job(job).state.value == "blocked"  # round 2, N5: never stranded
+    pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert any("acceptance" in p["title"] for p in pages)
+
+
+def test_a_session_without_guard_fails_closed(world: World) -> None:
+    w = world
+
+    class NoGuard(StandIn):
+        def run(self, spec: SessionSpec, gateway_token: str, on_event: EventSink) -> ExecOutcome:
+            if spec.role is Role.COORD:
+                return super().run(spec, gateway_token, on_event)
+            return ExecOutcome(
+                "failed", 3, {"status": "failed", "error": "guard not loaded"}, "guard not loaded"
+            )
+
+    w.runner.executor = NoGuard()
+    job = _approve(w)
+    assert w.publisher.prs == []
+    assert {t.state for t in w.store.list_tasks(job)} == {"failed"}
+
+
+# --- review round 1 -----------------------------------------------------------------------
+
+
+def test_the_reports_test_claims_are_ignored(world: World) -> None:  # round 2, N1
+    """A worker whose report says pass, but whose change doesn't pass test_cmd
+    in the verifier, gets no PR."""
+    w = world
+
+    def lie(spec: SessionSpec, task: dict[str, Any]) -> None:
+        f = task["spec"]["files_in_scope"][0]
+        _work(spec.clone, f, honest=False)
+
+    w.standin.worker_edit = lie
+    job = _approve(w)
+    assert w.publisher.prs == []
+    pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert any("verifier saw it fail after" in json.dumps(p["body"]) for p in pages)
+    assert {t.state for t in w.store.list_tasks(job)} == {"failed"}
+    record = w.store.get_artifact(job, "tests.json", task_id=f"{job}-w1")
+    assert record is not None and record.provenance == "human"
+
+
+def test_hook_forgery_and_a_fifo_record_change_no_verdict(
+    world: World, tmp_path: Path
+) -> None:  # round 2, N1 + N3, the reviewer's replay
+    """Both workers plant commondir -> a copy with core.fsmonitor and
+    hooks/post-commit that write a passing record, and a FIFO at the old record
+    path. w1 does the work, w2 doesn't: w1 gets its PR, w2 doesn't, nothing
+    planted runs, and the FIFO never blocks vigild."""
+    w = world
+    marker = tmp_path / "PWNED"
+
+    def hostile(spec: SessionSpec, task: dict[str, Any]) -> None:
+        out = spec.session_dir / "out"
+        evil = tmp_path / f"evil-{spec.task_id}"
+        (evil / "hooks").mkdir(parents=True)
+        forge = (
+            f"#!/bin/sh\necho ran >> {marker}\n"
+            f'echo \'{{"before":{{"outcome":"fail"}},"after":{{"outcome":"pass"}}}}\''
+            f" > {out}/harness_tests.json\n"
+        )
+        for name in ("post-commit", "pre-commit"):
+            (evil / "hooks" / name).write_text(forge)
+            (evil / "hooks" / name).chmod(0o755)
+        (evil / "fsmonitor").write_text(forge)
+        (evil / "fsmonitor").chmod(0o755)
+        (evil / "config").write_text(
+            f"[core]\n\thooksPath = {evil / 'hooks'}\n\tfsmonitor = {evil / 'fsmonitor'}\n"
+        )
+        for d in ("objects", "refs"):
+            os.symlink(spec.clone / ".git" / d, evil / d)
+        (spec.clone / ".git" / "commondir").write_text(str(evil) + "\n")
+        out.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(out / "harness_tests.json")
+        f = task["spec"]["files_in_scope"][0]
+        honest = bool(spec.task_id and spec.task_id.endswith("w1"))
+        _work(spec.clone, f, honest=honest)
+
+    w.standin.worker_edit = hostile
+    done = threading.Event()
+    job_box: list[str] = []
+
+    def go() -> None:
+        job_box.append(_approve(w))
+        done.set()
+
+    threading.Thread(target=go, daemon=True).start()
+    assert done.wait(60), "vigild blocked"
+    job = job_box[0]
+    assert [p["head"] for p in w.publisher.prs] == [f"vigil/{job}-w1"]
+    assert w.store.get_task(f"{job}-w1").state == "pr_open"
+    assert w.store.get_task(f"{job}-w2").state == "failed"
+    assert not marker.exists()
+    for call in w.tests.calls:
+        assert call["hooksPath"] == "/dev/null" and not call["worker_files"]
+
+
+def test_a_coord_symlink_never_reads_a_host_file(world: World, tmp_path: Path) -> None:  # blocker 3
+    w = world
+    secret = tmp_path / "pretend-env"
+    secret.write_text("ANTHROPIC_API_KEY=must-not-leak")
+
+    def plant(clone: Path, job_id: str) -> None:
+        spec = clone / ".vigil" / job_id / "spec.md"
+        spec.unlink()
+        os.symlink(secret, spec)
+
+    w.standin.coord_extra = plant
+    job = _request(w)
+    for a in w.store.q("SELECT content FROM artifacts WHERE job_id=?", (job,)):
+        assert "must-not-leak" not in a["content"]
+
+
+def test_each_coord_draft_is_its_own_session_and_books_once(world: World) -> None:  # item 8
+    from vigild.metering.calls import CallUsage, record_call
+    from vigild.metering.prices import PriceTable
+
+    w = world
+    bad = SPEC.replace(" test: `pytest -q tests/test_runbook.py`", "")
+    w.standin.coord_drafts = [lambda j: (bad, plan(j))]
+    prices = PriceTable(w.runner.cfg.prices)
+
+    def spend(spec: SessionSpec) -> None:  # $0.10 of Opus output per draft
+        record_call(
+            w.store,
+            prices,
+            session_id=spec.session_id,
+            task_id=None,
+            job_id=spec.job_id,
+            purpose="session",
+            provider="anthropic",
+            backend_preset="claude-opus",
+            model="claude-opus-5-5",
+            usage=CallUsage(tokens_out=5000),
+        )
+
+    w.standin.on_session = spend
+    job = _request(w)
+    coords = [s for s in w.store.list_sessions(job) if s.role is Role.COORD]
+    assert len(coords) == 2 and coords[0].id != coords[1].id
+    assert w.store.get_job(job).coord_session_id == coords[1].id
+    booked = w.store.q("SELECT SUM(amount_usd) a FROM ledger")[0]["a"]
+    metered = w.store.q("SELECT SUM(cost_usd) c FROM model_calls")[0]["c"]
+    assert booked == pytest.approx(metered) == pytest.approx(0.20)
+
+
+def test_dependents_of_a_failed_worker_wait_and_the_job_blocks(world: World) -> None:  # item 17
+    w = world
+
+    def chained(j: str) -> tuple[str, str]:
+        p = plan(j).replace(
+            '"files_in_scope": [\n    "docs/runbook.md",\n    "tests/test_runbook.py"\n   ],',
+            '"files_in_scope": [\n    "docs/runbook.md",\n    "tests/test_runbook.py"\n   ],\n   "depends_on": ["'
+            + j
+            + '-w1"],',
+        )
+        assert "depends_on" in p
+        return SPEC, p
+
+    def fail_w1(spec: SessionSpec, task: dict[str, Any]) -> None:
+        f = task["spec"]["files_in_scope"][0]
+        _work(spec.clone, f)
+        if spec.task_id and spec.task_id.endswith("w1"):
+            (spec.clone / "README.md").write_text("out of scope\n")
+
+    w.standin.coord_drafts = [chained]
+    w.standin.worker_edit = fail_w1
+    job = _approve(w)
+    assert [c[1] for c in w.standin.calls if c[0] == "worker"] == [f"{job}-w1"]
+    assert w.store.get_job(job).state.value == "blocked"
+    item = _failure_item(w, job)
+    assert list(item["body"]["tasks"]) == [f"{job}-w1"] and item["body"]["resumable"]
+    assert w.store.get_task(f"{job}-w2").state == "queued"
+
+
+def test_resume_after_the_cap_redispatches(world: World) -> None:  # item 18
+    w = world
+    job = _request(w)
+    held = [
+        w.budget.reserve(session_id=None, task_id=f"other-{i}", amount=a, purpose="worker")
+        for i, a in enumerate((2.0, 2.0, 0.5))
+    ]
+    item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    assert w.store.get_job(job).state.value == "blocked"
+    for rid in held:
+        w.budget.settle(rid, 0.0)  # the other work finished
+    page = next(
+        p
+        for p in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+        if "cap" in p["title"]
+    )
+    r = w.client.post(f"/api/inbox/{page['id']}/resume", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert w.store.get_job(job).state.value == "in_review"
+    assert len(w.publisher.prs) == 2
+
+
+def test_a_failure_before_the_session_never_leaks_the_reservation(  # item 7
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    w = world
+    job = _request(w)
+    real = w.runner.workspace.clone
+
+    def broken(repo: str, task_id: str, **kw: Any) -> Path:
+        if "-w" in task_id:
+            raise OSError("disk full")
+        return real(repo, task_id, **kw)
+
+    monkeypatch.setattr(w.runner.workspace, "clone", broken)
+    item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    assert w.budget.open_today() == 0
+    assert {t.state for t in w.store.list_tasks(job)} == {"failed"}
+
+
+def test_reconcile_after_a_crash(world: World) -> None:  # item 7
+    from vigild.jobs.fsm import Actor, transition
+    from vigild.jobs.model import JobState
+
+    w = world
+    job = _request(w)
+    item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    w.runner.background = True  # pretend the build is mid-flight when vigild dies
+    w.runner.build = lambda j: None  # type: ignore[method-assign]
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    transition(w.store, job, JobState.PLANNING, Actor.VIGILD)
+    s = w.store.create_session(job, Role.WORKER, backend_preset="claude-sonnet")
+    w.store.update_session(s.id, status="running")
+    w.budget.reserve(session_id=s.id, task_id=f"{job}-w1", amount=1.0, purpose="worker")
+    tok = w.runner.gateway.issue_token(s.id, REPO, "claude-sonnet")
+
+    out = w.runner.reconcile()  # what vigild's startup runs
+    assert out["reservations"] == 1 and out["held"] == 1 and out["tokens"] >= 1
+    assert w.budget.open_today() == 0
+    assert w.store.get_session(s.id).status == "failed"
+    assert w.store.get_job(job).state.value == "blocked"
+    pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert any("restarted" in p["title"] and p["body"]["resumable"] for p in pages)
+    from vigild.gateway.service import GatewayError
+
+    with pytest.raises(GatewayError):
+        w.runner.gateway.authorize(tok)
+
+
+def test_reconcile_restarts_an_approved_job_that_never_built(world: World) -> None:  # item 19
+    w = world
+    job = _request(w)
+    item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    real_build = w.runner.build
+    w.runner.build = lambda j: None  # type: ignore[method-assign]  # vigild dies after the commit
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    assert w.store.get_job(job).state.value == "approved"
+    w.runner.build = real_build  # type: ignore[method-assign]
+    assert w.runner.reconcile()["rebuilt"] == 1
+    # nothing starts until vigild's gateway is up and its images are validated (N11)
+    assert w.store.get_job(job).state.value == "approved" and w.standin.calls == [("coord", job)]
+    assert w.runner.start_deferred() == 1
+    assert w.store.get_job(job).state.value == "in_review"
+    assert w.runner.start_deferred() == 0
+
+
+# --- review round 2, N5: a failed worker blocks its job; retry, re-plan or abandon ----------
+
+
+def _spend(w: World, amount_out_tokens: int) -> Callable[[SessionSpec], None]:
+    """Each worker session spends Opus output tokens through the meter."""
+    from vigild.metering.calls import CallUsage, record_call
+    from vigild.metering.prices import PriceTable
+
+    prices = PriceTable(w.runner.cfg.prices)
+
+    def spend(spec: SessionSpec) -> None:
+        if spec.role is Role.WORKER:
+            record_call(
+                w.store,
+                prices,
+                session_id=spec.session_id,
+                task_id=spec.task_id,
+                job_id=spec.job_id,
+                purpose="session",
+                provider="anthropic",
+                backend_preset="claude-opus",
+                model="claude-opus-5-5",
+                usage=CallUsage(tokens_out=amount_out_tokens),
+            )
+
+    return spend
+
+
+def _failure_item(w: World, job: str, kind: str = "worker_failed") -> dict[str, Any]:
+    items = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    (item,) = [q for q in items if q["job_id"] == job and q["body"].get("kind") == kind]
+    return item  # type: ignore[no-any-return]
+
+
+def _flaky(fail_first: set[str]) -> Callable[[SessionSpec, dict[str, Any]], None]:
+    """Workers whose first attempt strays out of scope; later attempts are clean."""
+    tries: dict[str, int] = {}
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        tid = str(spec.task_id)
+        tries[tid] = tries.get(tid, 0) + 1
+        f = task["spec"]["files_in_scope"][0]
+        _work(spec.clone, f)
+        if tries[tid] == 1 and tid[-2:] in fail_first:
+            (spec.clone / "README.md").write_text("out of scope\n")
+
+    return edit
+
+
+def test_fail_blocked_retry_done(world: World) -> None:
+    """End to end: a worker fails, the job blocks with one inbox item offering
+    retry, re-plan or abandon; retry re-runs only the failed task, with what's
+    left of its budget; the job reaches review."""
+    w = world
+    w.standin.worker_edit = _flaky({"w1"})
+    w.standin.on_session = _spend(w, 15_000)  # $0.30 of Opus output per worker session
+    budgets: list[tuple[str, float]] = []
+    real = w.standin.run
+
+    def run(spec: SessionSpec, token: str, sink: EventSink) -> ExecOutcome:
+        if spec.role is Role.WORKER:
+            budgets.append((str(spec.task_id), spec.max_budget_usd))
+        return real(spec, token, sink)
+
+    w.standin.run = run  # type: ignore[method-assign]
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "blocked"
+    item = _failure_item(w, job)
+    assert item["body"]["actions"] == ["retry", "replan", "abandon"]
+    failed = item["body"]["tasks"]
+    assert list(failed) == [f"{job}-w1"]
+    assert "outside scope" in json.dumps(failed)
+    assert failed[f"{job}-w1"]["spent_usd"] == pytest.approx(0.30)
+    assert failed[f"{job}-w1"]["remaining_usd"] == pytest.approx(1.70)
+    assert [p["head"] for p in w.publisher.prs] == [f"vigil/{job}-w2"]
+
+    r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert w.store.get_job(job).state.value == "in_review"
+    assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
+    # the retry ran only w1, under what was left of its $2.00, not a fresh cap
+    w1 = [b for b in budgets if b[0].endswith("w1")]
+    assert w1 == [(f"{job}-w1", 2.0), (f"{job}-w1", pytest.approx(1.70))]
+    assert sum(1 for b in budgets if b[0].endswith("w2")) == 1
+    held = w.store.q(
+        "SELECT amount_usd FROM reservations WHERE task_id=? ORDER BY id", (f"{job}-w1",)
+    )
+    assert [r["amount_usd"] for r in held] == [2.0, pytest.approx(1.70)]
+    assert w.budget.open_today() == 0
+
+
+def test_no_budget_left_offers_only_replan_or_abandon(world: World) -> None:
+    w = world
+    w.standin.worker_edit = _flaky({"w1"})
+    w.standin.on_session = _spend(w, 100_000)  # $2.00: the whole cap
+    job = _approve(w)
+    item = _failure_item(w, job)
+    assert item["body"]["actions"] == ["replan", "abandon"]
+    assert item["body"]["resumable"] is False
+    r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
+    assert r.status_code == 409
+    r = w.client.post(f"/api/inbox/{item['id']}/resume", headers=auth(w.tokens.admin))
+    assert r.status_code == 409
+
+
+def test_replan_sends_the_job_back_to_the_coord_with_the_failure(world: World) -> None:
+    w = world
+    w.standin.worker_edit = _flaky({"w1"})
+    packets: list[str] = []
+    w.standin.on_session = lambda spec: (
+        packets.append(spec.packet) if spec.role is Role.COORD else None
+    )
+    job = _approve(w)
+    item = _failure_item(w, job)
+    r = w.client.post(f"/api/inbox/{item['id']}/replan", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert len(packets) == 2
+    assert f"{job}-w1" in packets[1] and "outside scope" in packets[1]
+    assert "outside scope" not in packets[0]
+    # the new draft goes through approval again, then builds; w2's PR stands
+    assert w.store.get_job(job).state.value == "spec_pending"
+    spec_item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    r = w.client.post(
+        f"/api/inbox/{spec_item['id']}/approve", headers=auth(w.tokens.admin), json={}
+    )
+    assert r.status_code == 200, r.text
+    qs = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert w.store.get_job(job).state.value == "in_review", [(q["title"], q["body"]) for q in qs]
+    assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
+
+
+def test_abandon_ends_the_job(world: World) -> None:
+    w = world
+    w.standin.worker_edit = _flaky({"w1"})
+    job = _approve(w)
+    item = _failure_item(w, job)
+    calls = len(w.standin.calls)
+    r = w.client.post(f"/api/inbox/{item['id']}/abandon", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert w.store.get_job(job).state.value == "abandoned"
+    assert w.store.get_task(f"{job}-w1").state == "abandoned"
+    assert w.store.get_task(f"{job}-w2").state == "pr_open"
+    assert len(w.standin.calls) == calls
+    assert w.budget.open_today() == 0
+    r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
+    assert r.status_code in (404, 409)
+
+
+@pytest.mark.parametrize("cause", ["ask_coord", "stale_image", "session_failed"])
+def test_every_worker_failure_blocks_with_actions(world: World, cause: str) -> None:
+    w = world
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        f = task["spec"]["files_in_scope"][0]
+        _work(spec.clone, f)
+        if cause == "ask_coord" and str(spec.task_id).endswith("w1"):
+            d = spec.clone / ".vigil" / spec.job_id / str(spec.task_id)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "ask_coord.json").write_text(json.dumps({"question": "which?"}))
+
+    w.standin.worker_edit = edit
+    if cause == "stale_image":
+        real_fresh = w.images.ensure_fresh
+        n = [0]
+
+        def fresh(repo: str, base_sha: str, force: bool = False) -> str:
+            n[0] += 1
+            if n[0] > 1:  # the coord ran; the image is gone and won't build again
+                w.images.docker.ids.clear()  # type: ignore[attr-defined]
+                w.images.docker.ok = False  # type: ignore[attr-defined]
+            return real_fresh(repo, base_sha, force=force)
+
+        w.images.ensure_fresh = fresh  # type: ignore[method-assign]
+    if cause == "session_failed":
+        real = w.standin.run
+
+        def run(spec: SessionSpec, token: str, sink: EventSink) -> ExecOutcome:
+            if spec.role is Role.WORKER and str(spec.task_id).endswith("w1"):
+                return ExecOutcome("timeout", None, {}, "over 40 min")
+            return real(spec, token, sink)
+
+        w.standin.run = run  # type: ignore[method-assign]
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "blocked"
+    item = _failure_item(w, job)
+    assert "replan" in item["body"]["actions"] and "abandon" in item["body"]["actions"]
+    assert f"{job}-w1" in item["body"]["tasks"]
+    assert w.budget.open_today() == 0
+
+
+def test_reconcile_offers_retry_or_cancel_for_a_coord_it_failed(world: World) -> None:  # N6
+    w = world
+    w.runner.run_coord = lambda j: None  # type: ignore[method-assign]  # vigild dies drafting
+    job = _request(w)
+    coord = w.store.create_session(job, Role.COORD, backend_preset="claude-opus")
+    w.store.set_coord_session(job, coord.id)
+    w.store.update_session(coord.id, status="running")
+    del w.runner.run_coord  # back to the real one
+
+    out = w.runner.reconcile()
+    assert out["sessions"] == 1 and out["held"] == 1
+    assert w.store.get_session(coord.id).status == "failed"
+    items = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    (item,) = [q for q in items if q["job_id"] == job]
+    assert "restarted" in item["title"]
+    assert item["body"]["actions"] == ["retry", "abandon"] and item["body"]["resumable"]
+
+    r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert [c[0] for c in w.standin.calls] == ["coord"]
+    assert w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"]
+
+
+def test_cancel_a_spec_pending_job(world: World) -> None:  # N6
+    w = world
+    w.runner.run_coord = lambda j: None  # type: ignore[method-assign]
+    job = _request(w)
+    coord = w.store.create_session(job, Role.COORD, backend_preset="claude-opus")
+    w.store.update_session(coord.id, status="running")
+    w.runner.reconcile()
+    item = next(
+        q
+        for q in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+        if q["job_id"] == job
+    )
+    r = w.client.post(f"/api/inbox/{item['id']}/abandon", headers=auth(w.tokens.admin))
+    assert r.status_code == 200, r.text
+    assert w.store.get_job(job).state.value == "abandoned"
+
+
+# --- review round 3, F1: runner config ------------------------------------------------------
+
+
+def test_an_unnamed_runner_config_change_is_rejected(world: World) -> None:
+    w = world
+    w.runner.cfg.repos.repos[REPO].runner_config = ["conftest.py"]
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+        (spec.clone / "conftest.py").write_text("collect_ignore = ['tests']\n")
+        # committed by the agent itself (an untracked file out of scope would
+        # simply be left out of the commit, round 4)
+        git(spec.clone, "add", "conftest.py")
+        git(spec.clone, "commit", "-qm", "narrow the tests")
+
+    w.standin.worker_edit = edit
+    job = _approve(w)
+    assert w.publisher.prs == []
+    item = _failure_item(w, job)
+    assert "changes how tests run" in json.dumps(item["body"])
+
+
+def test_a_named_runner_config_change_is_flagged_and_still_runs_the_base_copy(
+    world: World,
+) -> None:
+    w = world
+    w.runner.cfg.repos.repos[REPO].runner_config = ["conftest.py"]
+
+    def named(j: str) -> tuple[str, str]:
+        sp = SPEC.replace(
+            "- `tests/test_runbook.py`\n", "- `tests/test_runbook.py`\n- `conftest.py`\n"
+        )
+        pl = plan(j).replace(
+            '"tests/test_feature_map.py"\n   ]',
+            '"tests/test_feature_map.py",\n    "conftest.py"\n   ]',
+        )
+        assert "conftest.py" in pl
+        return sp, pl
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+        if str(spec.task_id).endswith("w1"):
+            # would hide every test if the verifier ran it
+            (spec.clone / "conftest.py").write_text("collect_ignore_glob = ['*']\n")
+
+    w.standin.coord_drafts = [named]
+    w.standin.worker_edit = edit
+    job = _request(w)
+    item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
+    flags = {x["task_id"]: x["changes_how_tests_run"] for x in item["body"]["workers"]}
+    assert flags == {f"{job}-w1": ["conftest.py"], f"{job}-w2": []}
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    pr = next(p for p in w.publisher.prs if p["head"] == f"vigil/{job}-w1")
+    assert "changes how tests run" in pr["body"] and "`conftest.py`" in pr["body"]
+    record = json.loads(w.store.get_artifact(job, "tests.json", task_id=f"{job}-w1").content)
+    assert record["runner_config"]["pinned_to_base"] == ["conftest.py"]
+    assert record["after"]["outcome"] == "pass" and record["ran"]["ok"]
+
+
+# --- owner direction, round 3: a task that needs a dependency blocks on it --------------------
+
+
+def test_a_worker_that_reports_needs_deps_blocks_its_job(world: World) -> None:
+    w = world
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+        if str(spec.task_id).endswith("w1"):
+            d = spec.clone / ".vigil" / spec.job_id / str(spec.task_id)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "worker_report.json").write_text(json.dumps({
+                "task_id": spec.task_id, "job_id": spec.job_id, "files_changed": [],
+                "summary": "needs a parser", "provenance": "claude",
+                "self_check": {"test_failed_first": True, "outside_scope": [], "not_done": "all",
+                               "reviewer_would_flag": "-", "could_delete": "-"},
+                "needs_deps": [{"ecosystem": "pypi", "package": "tomlkit", "version": "0.13.2",
+                                "why": "round-trip TOML"}]}))  # fmt: skip
+
+    w.standin.worker_edit = edit
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "blocked"
+    assert w.store.get_task(f"{job}-w1").state == "needs_deps"
+    item = _failure_item(w, job, kind="needs_deps")
+    deps = item["body"]["tasks"][f"{job}-w1"]["needs_deps"]
+    assert deps == [{"ecosystem": "pypi", "package": "tomlkit", "version": "0.13.2",
+                     "why": "round-trip TOML"}]  # fmt: skip
+    assert item["body"]["actions"] == ["retry", "abandon"]
+    assert w.tests.calls == [c for c in w.tests.calls if f"{job}-w1" not in c["source"]]
+
+
+def test_a_lockfile_change_is_read_as_needs_deps(world: World) -> None:
+    """The worker edits the manifest instead of asking: vigild reads what it
+    wanted from the diff, shows the diff fenced, and doesn't verify the task."""
+    w = world
+    w.runner.cfg.repos.repos[REPO].dev_lockfiles = ["package.json"]
+    w.runner.cfg.repos.repos[REPO].runner_config = ["package.json"]
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+        if str(spec.task_id).endswith("w1"):
+            (spec.clone / "package.json").write_text('{"dependencies": {"left-pad": "1.3.0"}}\n')
+            git(spec.clone, "add", "package.json")  # the agent commits it itself
+            git(spec.clone, "commit", "-qm", "add left-pad")
+
+    w.standin.worker_edit = edit
+    job = _approve(w)
+    item = _failure_item(w, job, kind="needs_deps")
+    t = item["body"]["tasks"][f"{job}-w1"]
+    assert t["needs_deps"] == [
+        {"ecosystem": "npm", "package": "left-pad", "version": "1.3.0", "why": "read from the diff"}
+    ]
+    assert t["diff"].startswith("<<<UNTRUSTED") and '+{"dependencies"' in t["diff"]
+
+
+def test_needs_deps_is_inferred_from_manifests() -> None:
+    from vigild.jobs.deps import infer_deps
+
+    pkg_a = '{"dependencies": {"a": "1.0.0"}, "devDependencies": {"b": "2.0.0"}}'
+    pkg_b = '{"dependencies": {"a": "1.1.0", "c": "^3"}, "devDependencies": {"b": "2.0.0"}}'
+    got = infer_deps("server/package.json", pkg_a, pkg_b)
+    assert [(d.ecosystem, d.package, d.version) for d in got] == [
+        ("npm", "a", "1.1.0"),
+        ("npm", "c", "^3"),
+    ]
+    py_a = '[project]\nname = "x"\ndependencies = ["requests>=2.32"]\n'
+    py_b = '[project]\nname = "x"\ndependencies = ["requests>=2.32", "tomlkit==0.13.2"]\n'
+    got = infer_deps("data/pyproject.toml", py_a, py_b)
+    assert [(d.ecosystem, d.package, d.version) for d in got] == [("pypi", "tomlkit", "==0.13.2")]
+    assert infer_deps("uv.lock", "a", "b") == []
+
+
+def test_a_job_already_running_is_not_started_twice(world: World) -> None:  # round 3, F7
+    w = world
+    job = _request(w)
+    started: list[str] = []
+    gate = threading.Event()
+
+    def slow(j: str) -> None:
+        started.append(j)
+        gate.wait(5)
+
+    w.runner.background = True
+    w.runner.run_coord = slow  # type: ignore[method-assign]
+    w.runner.on_resume(job)
+    w.runner.on_resume(job)  # a second resume while the first runs
+    gate.set()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and w.runner.running():
+        time.sleep(0.01)
+    assert started == [job]
+
+
+def test_sessions_run_in_the_session_image_and_tests_in_the_dev_image(world: World) -> None:
+    w = world  # owner direction, round 3
+    seen: list[tuple[str, str | None]] = []
+    w.standin.on_session = lambda spec: seen.append((spec.role.value, spec.image))
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "in_review"
+    assert {r for r, _ in seen} == {"coord", "worker"}
+    assert all(img and img.startswith("vigil-session/fixture:") for _, img in seen), seen
+    images = {c["image"] for c in w.tests.calls}
+    assert images and all(i.startswith("vigil-dev/fixture:") for i in images), images
+
+
+def test_build_output_a_worker_leaves_is_not_committed(world: World) -> None:  # round 4, item 7
+    """A worker that ran pytest in its session leaves __pycache__ and build
+    output: they aren't committed, so the scope check still passes."""
+    w = world
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+        (spec.clone / "tests" / "__pycache__").mkdir(parents=True, exist_ok=True)
+        (spec.clone / "tests" / "__pycache__" / "t.cpython-314.pyc").write_bytes(b"\0")
+        (spec.clone / ".pytest_cache").mkdir(exist_ok=True)
+        (spec.clone / ".pytest_cache" / "README.md").write_text("cache\n")
+
+    w.standin.worker_edit = edit
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "in_review"
+    assert len(w.publisher.prs) == 2
+
+
+def test_a_scripts_edit_is_runner_config_not_needs_deps(world: World) -> None:  # round 4, item 8
+    w = world
+    w.runner.cfg.repos.repos[REPO].dev_lockfiles = ["package.json"]
+    w.runner.cfg.repos.repos[REPO].runner_config = ["package.json"]
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        _work(spec.clone, task["spec"]["files_in_scope"][0])
+        if str(spec.task_id).endswith("w1"):
+            (spec.clone / "package.json").write_text('{"scripts": {"test": "vitest run x"}}\n')
+            git(spec.clone, "add", "package.json")
+            git(spec.clone, "commit", "-qm", "narrow the test script")
+
+    w.standin.worker_edit = edit
+    job = _approve(w)
+    assert w.store.get_task(f"{job}-w1").state == "failed"  # not needs_deps
+    item = _failure_item(w, job)
+    assert "changes how tests run" in json.dumps(item["body"])

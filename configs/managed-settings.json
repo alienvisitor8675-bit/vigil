@@ -1,0 +1,51 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(gh:*)",
+      "Bash(git push:*)",
+      "Bash(git remote:*)",
+      "Bash(git config:*)",
+      "Bash(fly:*)",
+      "Bash(flyctl:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(docker:*)",
+      "Bash(sudo:*)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(/run/**)",
+      "Read(/proc/*/environ)",
+      "Read(**/Config.xcconfig)",
+      "Edit(/work/.github/**)",
+      "Edit(/work/.claude/**)",
+      "Edit(/work/.opencode/**)",
+      "Edit(/work/.git/**)",
+      "Write(/work/.github/**)",
+      "Write(/work/.claude/**)",
+      "Write(/work/.opencode/**)",
+      "Write(/work/.git/**)",
+      "WebFetch",
+      "WebSearch"
+    ]
+  },
+  "enabledPlugins": {
+    "guard@claude-mods": true
+  },
+  "extraKnownMarketplaces": {
+    "claude-mods": {
+      "source": {
+        "source": "directory",
+        "path": "/opt/claude-mods"
+      }
+    }
+  },
+  "claudeMods": {
+    "guard": {
+      "secretPaths": ["run/**", "Config.xcconfig"],
+      "denyWorkflowRunOnDefaultBranch": true,
+      "blockedMessage": "vigil worker: a human merges every PR; vigild pushes and opens PRs; secrets never enter a worker."
+    }
+  }
+}

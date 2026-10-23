@@ -1,0 +1,94 @@
+{
+  "$defs": {
+    "EventType": {
+      "enum": [
+        "model_request",
+        "tool_call",
+        "tool_result",
+        "decision",
+        "state"
+      ],
+      "title": "EventType",
+      "type": "string"
+    },
+    "Provenance": {
+      "enum": [
+        "claude",
+        "local",
+        "human"
+      ],
+      "title": "Provenance",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "data": {
+      "additionalProperties": true,
+      "title": "Data",
+      "type": "object"
+    },
+    "job_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Job Id"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "session_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Session Id"
+    },
+    "task_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Task Id"
+    },
+    "ts": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Ts"
+    },
+    "type": {
+      "$ref": "#/$defs/EventType"
+    }
+  },
+  "required": [
+    "type",
+    "data",
+    "provenance"
+  ],
+  "title": "Event",
+  "type": "object"
+}

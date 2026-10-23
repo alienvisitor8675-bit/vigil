@@ -1,0 +1,26 @@
+# Dated price table (docs/sources.md, checked 2026-10-22). Cost is always
+# tokens x this table; a provider's own cost, when it reports one, is stored
+# beside it as a cross-check. USD per million tokens.
+as_of: "2026-10-22"
+models:
+  claude-opus-5-5:   {input: 4.00, cache_write_5m: 5.00, cache_write_1h: 8.00, cache_read: 0.20, output: 20.00}
+  claude-sonnet-5-5: {input: 2.00, cache_write_5m: 2.50, cache_write_1h: 4.00, cache_read: 0.10, output: 10.00}
+  claude-haiku-5-5:
+    input: 0.10
+    cache_write_5m: 0.125
+    cache_write_1h: 0.20
+    cache_read: 0.01
+    output: 0.50
+    long_context:          # prompts over 100k tokens
+      threshold: 100000
+      input: 0.50
+      cache_write_5m: 0.625
+      cache_write_1h: 1.00
+      cache_read: 0.05
+      output: 2.50
+  # Jev: $0.042 per million input tokens, output free (docs/sources.md).
+  typesafe/jev:      {input: 0.042, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, output: 0}
+  typesafe/jev-1.13: {input: 0.042, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, output: 0}
+  # Local models cost nothing per token; their cost is GPU time (phase 5).
+  qwen3.6-35b-a3b: {input: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, output: 0}
+  gpt-oss-20b:     {input: 0, cache_write_5m: 0, cache_write_1h: 0, cache_read: 0, output: 0}

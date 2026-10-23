@@ -1,0 +1,159 @@
+{
+  "$defs": {
+    "DepRequest": {
+      "additionalProperties": false,
+      "description": "A dependency a worker needs and the repo's dev image doesn't have.",
+      "properties": {
+        "ecosystem": {
+          "enum": [
+            "npm",
+            "pypi"
+          ],
+          "title": "Ecosystem",
+          "type": "string"
+        },
+        "package": {
+          "maxLength": 214,
+          "minLength": 1,
+          "title": "Package",
+          "type": "string"
+        },
+        "version": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Version",
+          "type": "string"
+        },
+        "why": {
+          "default": "",
+          "title": "Why",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ecosystem",
+        "package",
+        "version"
+      ],
+      "title": "DepRequest",
+      "type": "object"
+    },
+    "Provenance": {
+      "enum": [
+        "claude",
+        "local",
+        "human"
+      ],
+      "title": "Provenance",
+      "type": "string"
+    },
+    "SelfCheck": {
+      "additionalProperties": false,
+      "description": "The five questions every worker answers before returning.",
+      "properties": {
+        "could_delete": {
+          "title": "Could Delete",
+          "type": "string"
+        },
+        "not_done": {
+          "title": "Not Done",
+          "type": "string"
+        },
+        "outside_scope": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Outside Scope",
+          "type": "array"
+        },
+        "reviewer_would_flag": {
+          "title": "Reviewer Would Flag",
+          "type": "string"
+        },
+        "test_failed_first": {
+          "title": "Test Failed First",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "test_failed_first",
+        "outside_scope",
+        "not_done",
+        "reviewer_would_flag",
+        "could_delete"
+      ],
+      "title": "SelfCheck",
+      "type": "object"
+    },
+    "TestOutcome": {
+      "enum": [
+        "fail",
+        "pass",
+        "unknown"
+      ],
+      "title": "TestOutcome",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "files_changed": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Files Changed",
+      "type": "array"
+    },
+    "job_id": {
+      "title": "Job Id",
+      "type": "string"
+    },
+    "needs_deps": {
+      "items": {
+        "$ref": "#/$defs/DepRequest"
+      },
+      "title": "Needs Deps",
+      "type": "array"
+    },
+    "open_questions": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Open Questions",
+      "type": "array"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "self_check": {
+      "$ref": "#/$defs/SelfCheck"
+    },
+    "summary": {
+      "title": "Summary",
+      "type": "string"
+    },
+    "task_id": {
+      "title": "Task Id",
+      "type": "string"
+    },
+    "test_after": {
+      "$ref": "#/$defs/TestOutcome",
+      "default": "unknown"
+    },
+    "test_before": {
+      "$ref": "#/$defs/TestOutcome",
+      "default": "unknown"
+    }
+  },
+  "required": [
+    "task_id",
+    "job_id",
+    "files_changed",
+    "summary",
+    "self_check",
+    "provenance"
+  ],
+  "title": "WorkerReport",
+  "type": "object"
+}

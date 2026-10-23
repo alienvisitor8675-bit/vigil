@@ -24,21 +24,22 @@ These CSS variables are the only colours:
 | `--ink` | `#E8EDF2` | Primary text. |
 | `--dim` | `#6B7580` | Secondary text, borders, idle state. |
 | `--sonar` | `#9FD8F0` | Accent: live activity, links, the selected row, the logo. |
-| `--sonar-2` | `#3A7CA5` | Dark accent: fills, graph bodies, hover. |
+| `--sonar-2` | `#346E93` | Dark accent: fills, graph bodies, hover. |
 | `--warn` | `--ink` text on a `--sonar-2` background | Anything that needs you: cap reached, guard denial, failed, escalated. |
 
 - **Borders** are hairlines only: 1px `--dim` at 30% opacity.
 - **Corners** are never rounded more than 2px.
 - **Icons:** none from icon packs.
 
-**Contrast, measured.** The palette stands as written unless you change
-it.
-- `--dim` on black is 4.48:1, a hair under WCAG AA's 4.5:1 for 12px text.
-  `#707A85` would give about 4.8:1.
-- The warn pair (`--ink` on `--sonar-2`) is about 3.9:1. WCAG AA allows
-  that only for large text (18.7px bold or 24px regular), so 12–13px warn
-  text fails. This is question Q3 in `docs/architecture.md`; until you
-  answer, phase 3 uses the palette as written.
+**Contrast, measured** (owner decision Q3, 2026-10-22). The final hexes:
+`--bg #000000`, `--ink #E8EDF2`, `--dim #6B7580`, `--sonar #9FD8F0`,
+`--sonar-2 #346E93`.
+- `--sonar-2` was `#3A7CA5`, which gave the warn pair (`--ink` on
+  `--sonar-2`) 3.87:1. At `#346E93` it is **4.69:1**, which passes WCAG AA
+  for 12–13px text.
+- `--dim` on black is 4.48:1, a hair under AA; it stays `#6B7580` by the
+  owner's choice.
+- `--sonar` on black is 13.55:1.
 
 ### Type
 
@@ -108,17 +109,48 @@ reference: a shape made of characters that breathes while it's live.
   `--sonar-2` on a 2 s cycle.
 - A stale source (no sample for 10 s) goes still in `--dim`.
 - `prefers-reduced-motion` turns all motion off.
+- **The one exception** is `/watch`'s CRT effects (flicker, scanlines,
+  beam, glow): on that page only, CSS only, off under
+  `prefers-reduced-motion`, and toggled with `f`.
 
 ## Behaviour
 
 - **Live data.** There is one stream per page: `GET /api/stream?topics=…`,
   in server-sent events format. The browser's `EventSource` can't send an
   `Authorization` header, so the UI reads the stream with `fetch()` and a
-  roughly 30-line line parser. That keeps one auth mechanism, the bearer
-  token, for everything.
-- **Token.** The UI asks for the token and keeps it in page memory only,
-  so it lasts until the tab is closed or reloaded. It is cleared on a 401.
-  P7 in `docs/architecture.md` would keep it in `localStorage`.
+  roughly 30-line line parser. The session cookie rides along with it.
+  The UI never polls: a page paints from its GETs once, then the stream
+  keeps it current.
+- **Stream topics.** A page asks only for the topics it shows:
+  - `job` and `job:{id}`: jobs and one job's timeline;
+  - `session`: live sessions and heartbeats;
+  - `summary`: the header-strip numbers (queue, WIP, $ today, rates);
+  - `talk:{id}`: one coordinator's thread;
+  - new for `/watch` (phase 3): `code`, the active worker's latest edit;
+    `events`, every event as it is stored; `tower`, GPU, VRAM, W and slots
+    (empty before phase 5).
+  - Every event and every `code` payload passes through one redactor,
+    `vigild.redact.redact`, the same function the event log and the
+    gateway use, before it is stored or published.
+- **Login, not a stored token** (P7 is no, owner 2026-10-22). The UI never
+  keeps a token, in storage or in page memory:
+  - The login form posts the admin (or read) token once to
+    `POST /api/login`. vigild answers with a `vigil_session` cookie and the
+    page forgets the token.
+  - The cookie is a random id, stored hashed in vigild: `HttpOnly`,
+    `SameSite=Strict`, `Path=/`, 12 hours, absolute (log in again after).
+  - `Secure` is set when the UI is reached over HTTPS through
+    `tailscale serve` (`api.cookie_secure: true` in `configs/vigild.yaml`).
+    Over plain HTTP on the tailnet it can't be set, because the browser
+    would never send the cookie back; the tailnet's WireGuard encryption is
+    the transport there.
+  - Every write the UI makes carries `X-Vigil-UI: 1`; vigild refuses a
+    cookie-authenticated write without it, so a cross-site form can't
+    write even if a browser ignored SameSite.
+  - On a 401 the UI shows the login form. `POST /api/logout` ends the
+    session.
+- **Where it's served.** The UI binds to the Mac's Tailscale address only,
+  never `0.0.0.0`. The CLI and MCP keep bearer tokens.
 - **A live row pulses** in `--sonar` once per update, for 600 ms.
 - **Keyboard:**
   - `/` focuses the filter.
@@ -127,6 +159,8 @@ reference: a shape made of characters that breathes while it's live.
   - `Esc` clears the filter.
   - `x` on `/job/:id` asks to kill the running session.
   - On `/job/:id`, `Enter` on a timeline line expands it.
+  - `f` on `/watch` (only there) turns the CRT effects on and off; the
+    choice isn't saved.
 - **Pages, not overlays.** No modals: detail is a page, and expanding a
   timeline line opens it in place.
 - **Width.** No page scrolls horizontally at 1280px. Long values (branch
@@ -140,8 +174,8 @@ reference: a shape made of characters that breathes while it's live.
 
 ## Pages
 
-These eight pages, and nothing else. The Vigil UI canvas is the visual
-reference for all eight, Talk included. Each page lists the API calls
+These nine pages, and nothing else. The Vigil UI canvas is the visual
+reference for all nine, Talk and Watch included. Each page lists the API calls
 behind it; the UI calls nothing else. A **job** is the UI's word for a task (the API says `tasks`): one
 contract, and every session (attempt, review, audit) it has spawned.
 
@@ -319,15 +353,62 @@ coordinators from anywhere").
 `POST /api/coords/{id}/messages`, `POST /api/coords/{id}/backend`, and
 the stream's `talk:{id}` topic.
 
+### 9. `/watch`: Watch
+
+A full-screen ambient display, made to be left open on a screen. The page
+fills the viewport and has no nav chrome. Going fullscreen is the
+browser's own control: the page never calls the Fullscreen API.
+
+**Layout.** A 12-column pane grid. No horizontal scroll at 1280px, and it
+reads well at 1920px and wider (the panes grow; the type doesn't).
+
+| Row | Panes (column span) |
+|---|---|
+| 1–2 | Live code stream (8, two rows tall) · Throughput (4) · Funnel (4) |
+| 3 | Cost burn (4) · Tower meters (4) · Sessions (4) |
+| 4 | Quality strip (12) |
+| 5 | Event log (12) |
+
+**Panes:**
+- **Live code stream:** the active worker's latest edit, from the
+  session proxy (phase 2), with its repo, file path and worker id. It is
+  redacted on the server by `vigild.redact.redact`, the one redactor the
+  event log and the gateway use, before it enters the stream. With no
+  active worker, the last edit stays, in `--dim`.
+- **Throughput:** jobs started and finished, and PRs opened and merged,
+  per hour, as sparklines.
+- **Funnel:** the count of jobs in each state, `spec_pending` through
+  `done`, as bars.
+- **Cost burn:** $ per hour, and today against the daily cap as a bar.
+- **Tower meters:** GPU, VRAM, W and slots; `—` before phase 5, as
+  everywhere.
+- **Sessions:** a compact `/sessions`: one line per live session.
+- **Quality strip:** the KPIs: first-pass merge rate, findings per PR by
+  severity, revert + fix-job rate, cost per merged PR, median spec→merge.
+- **Event log:** a tail of the event stream.
+
+**CRT effects** (flicker, scanlines, beam, glow), on this page only:
+- CSS only: no `<canvas>`, no SVG, no library, as everywhere.
+- Off under `prefers-reduced-motion`.
+- `f` toggles them; the toggle isn't saved.
+
+**API:** the same API as every page. First paint from `GET /api/summary`,
+`GET /api/tasks`, `GET /api/sessions?live=1` and `GET /api/budgets`; then
+one stream, `GET /api/stream?topics=code,summary,session,events,tower`.
+No polling. The 100 KB page-weight limit applies.
+
+**Depends on:** the phase 2 session proxy (the code stream) and phase 2
+review data (the quality strip's findings); tower meters wait for phase 5.
+
 ## Files
 
 ```text
 vigild/web/
   index.html        one shell; routes by path
   app.css           the palette, type and hairlines; nothing else
-  js/api.js         fetch + bearer token + stream reader
+  js/api.js         fetch (session cookie, X-Vigil-UI on writes) + stream reader
   js/glyphs.js      sparkline, bar, timeline, meter, histogram as pure functions over numbers → strings
-  js/keys.js        / j k Enter Esc l
+  js/keys.js        / j k Enter Esc l, and f on /watch
   js/pages/*.js     one module per page
   assets/mark.txt   the logo, both sizes
 ```
@@ -343,4 +424,10 @@ string.
 - `/metrics` shows its counters.
 - Each page is under 100 KB, with no horizontal scroll at 1280px.
 - `/`, `j`, `k` and `Enter` work.
-- The PR includes a screenshot of each of the eight pages.
+- The PR includes a screenshot of each of the nine pages.
+- `/watch` (`tests/web/test_watch.py`):
+  - a secret-shaped string planted in a worker's edit never reaches the
+    `code` topic;
+  - under `prefers-reduced-motion` the CRT effects are off;
+  - after first paint the page makes no request but its one stream (no
+    polling).

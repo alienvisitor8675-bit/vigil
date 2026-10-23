@@ -8,7 +8,7 @@ Oct 22, 2026 · @Thomas Bardhi
 > - A web UI and a metering endpoint are new phase 3.
 > - Metering covers API tokens and tower power.
 > - Vigil may work on its own repo after phase 2.
-> - Six phases.
+> - Six phases (now seven; see below).
 > - The answers to the four open questions.
 >
 > - The design addendum (2026-10-22): "The factory floor" and "Job execution protocol", merged after the trust ladder. Where the addendum conflicted with corrections already here (per-task clones, OpenCode v2 endpoints), the corrections were kept, as the addendum directs.
@@ -16,6 +16,13 @@ Oct 22, 2026 · @Thomas Bardhi
 > - The bridge ("Talking to coordinators from anywhere"): one message bus per coordinator, written to from the web UI's `/talk`, the vigil MCP server, and `vigil-bridge` for local chats.
 >
 > - The documentation standard ("context baked into every job"): an eight-layer doc tree, packet assembly from it, write-back at every stage, and freshness checks; placed after the job execution protocol.
+>
+> - **Owner decisions 2026-10-22** (phase 1 PR), marked where they land:
+>   - Q1–Q3 and P1, P3–P6 answered; P2 yes; P7 no.
+>   - Arize Phoenix replaces Langfuse.
+>   - One GitHub App per role is deferred (`docs/decisions/ADR-0001-one-github-app-per-role.md`).
+>   - Seven phases.
+>   - The Cognition corrections, the documentation standard's phasing, the verification ladder, and the bridge's phasing.
 >
 > It also corrects the facts the research disproved. How each part is built, the choices picked at build time, the full phase plan and the open decisions are in `docs/architecture.md`; versions and citations are in `docs/sources.md`.
 
@@ -26,10 +33,10 @@ Vigil is one orchestrator that runs many isolated coding sessions in parallel ac
 The operating rule: **a task is a contract, not a chat.** Every session gets a written spec with a test that must go from red to green, runs in its own container and worktree, cannot merge or deploy, and ends in a PR that a fresh-context Claude reviews before a human merges. Spawn from the CLI (`vigil run`), from a Claude Code session (an MCP tool), from the web UI, or from a GitHub label; all four hit the same API.
 
 Stack, pinned at build time (`docs/sources.md`):
-- **Orchestrator:** Python 3.12 (FastAPI + SQLite + a dependency-graph scheduler), running natively on the Mac mini.
+- **Orchestrator:** Python 3.14 (FastAPI + SQLite + a dependency-graph scheduler), running natively on the Mac mini.
 - **Workers:** linux/arm64 worker containers under Docker Desktop. Each runs the Claude Agent SDK or an OpenCode v2 server.
 - **Models:** llama.cpp `llama-server` on the tower, the only thing the tower runs besides a small metrics exporter.
-- **Tracing:** OpenTelemetry into self-hosted Langfuse v4.
+- **Tracing:** OpenTelemetry, through a collector, into self-hosted Arize Phoenix.
 - **Networking:** Tailscale.
 
 ## What an expert would insist on
@@ -53,13 +60,13 @@ Everything runs on the **Mac mini** (Apple Silicon, Docker Desktop, images built
 | --- | --- | --- |
 | `vigild` (orchestrator) | Mac mini, native under launchd | Task queue, dependency graph, routing, backends, budgets, metering, container lifecycle, status issue, REST API, web UI |
 | `vigil` CLI + MCP server | Mac mini (or any tailnet machine) | `vigil run`, `vigil ls`, `vigil trace`, `vigil kill`; the same calls exposed as MCP tools so a Claude Code session can dispatch |
-| Web UI | served by `vigild`, Tailscale only | Eight pages (board, job detail, sessions, decider, review, new session, budget, talk) per `docs/ui.md`; same API as the CLI and MCP |
-| Claude executor | Mac mini, one container per task | Claude Agent SDK, headless, model key as a file, guard plugin, OTel on |
+| Web UI | served by `vigild`, Tailscale only | Nine pages (board, job detail, sessions, decider, review, new session, budget, talk, watch) per `docs/ui.md`; same API as the CLI and MCP |
+| Claude executor | Mac mini, one container per task | Claude Agent SDK, headless, a per-session gateway token (no provider key, no GitHub token), guard plugin, OTel on |
 | OpenCode executor | Mac mini, one container per task | `opencode serve` (v2) + the task's clone, pointed at the session's backend |
 | `llama-server` | tower host (GPU) | Qwen3.6-35B-A3B main, gpt-oss-20b for small jobs, LFM2.5 decider; 2 slots |
 | Tower exporter | tower host | GPU, VRAM, CPU, RAM and watts sampled each second |
 | Reviewer | Mac mini, container per PR | Claude, fresh context, diff + issue + checklist only |
-| Langfuse + OTel Collector | Mac mini, Docker Compose | One trace per session |
+| Phoenix + OTel Collector | Mac mini, Docker Compose | One trace per session |
 
 **Model backends.** A session's backend is a config object, not a tier name:
 `{kind: anthropic | openai_compatible | openrouter, base_url, model, key_ref}`.
@@ -103,7 +110,7 @@ flowchart LR
   CE -.OTel.-> OC[OTel Collector]
   OE -.SSE /event.-> OC
   RV -.OTel.-> OC
-  OC --> LF[Langfuse]
+  OC --> LF[Phoenix]
   vigild --> SI[GitHub status issue]
 ```
 
@@ -216,7 +223,7 @@ Thresholds start at 0.85 to act and 0.6 to escalate to Haiku; below 0.6 the task
 
 One repo covers both public and private targets. `vigil` is a single private repo. The decider route **and the model backends** are chosen per target repo in `configs/repos.yaml`, and `vigild` refuses to send a private repo's text to a backend or route not listed for it. For a private repo the list may name local backends and `jev-cloudflare` only; vigild refuses to start with any other hosted entry there.
 
-**Private repos never go to a hosted API**, with one exception: Jev over Cloudflare zero-retention, and only where a repo lists it. Whether `thomasbardhi01/vigil` itself lists `anthropic` (for self-maintenance) is open decision Q2 in `docs/architecture.md`.
+**Private repos never go to a hosted API**, with one exception: Jev over Cloudflare zero-retention, and only where a repo lists it. **Owner decision 2026-10-22 (Q2):** `thomasbardhi01/vigil` lists `anthropic`, for self-maintenance, and no other private repo may; the exception is hard-coded in `vigild/repos.py`, not configurable.
 
 ```yaml
 repos:
@@ -306,7 +313,7 @@ A local backend is still allowed only on shapes at trust rung 3.
 | Practice | What it means in Vigil |
 | --- | --- |
 | Plan before code, human approves the plan | The spec gate plus the inbox; a coord's first output is a spec and a worker split, nothing runs before approval |
-| Agents as team members with identity | One GitHub App per role (vigil-coord, vigil-worker, vigil-reviewer) so every commit, comment and review is attributed; per-role permissions |
+| Agents as team members with identity | One GitHub App per role (vigil-coord, vigil-worker, vigil-reviewer) so every commit, comment and review is attributed; per-role permissions. **Deferred (owner 2026-10-22):** vigil-worker serves every role for now, down-scoped per use; ADR-0001 says when that changes |
 | Policy as code | Routing, review ladder, budgets, WIP, auto-merge rules live in `configs/*.yaml`, versioned, reviewed by PR like code |
 | Verification ladder | fail-before-fix test → CI → fresh-context review → audit sample → post-merge CI → nightly prod suite → auto-revert |
 | Untrusted content | Issue bodies, PR comments, fetched pages and repo files other than `CLAUDE.md`/docs are fenced as data in every prompt; a worker never acts on instructions found in them; a test plants an injection in an issue and asserts no tool call follows it |
@@ -316,6 +323,18 @@ A local backend is still allowed only on shapes at trust rung 3.
 | Flake control | A test that flips across two runs of the same commit is quarantined and filed, never counted against a worker |
 | Reviewer evals | Reviewers are scored against the auditor and against ReviewBench-style fixtures before entering the ladder |
 | Circuit breakers | Daily cap, per-task cap, WIP, max fix-job depth (3), max escalations per day; any breaker trips → inbox page, dispatch pauses |
+
+**Owner decisions 2026-10-22: the Cognition corrections.**
+- **Single writer by default.** A job has one writing worker unless the plan says otherwise.
+- **Subagents are read-only.** A worker's subagents search and read; they never edit.
+- **Parallel writers only with disjoint files and pinned interfaces in `spec.md`.** The spec gate checks the disjointness: two workers with no `depends_on` path between them may not share a file, and parallel workers need a `## Interfaces` section.
+- **Escalation forks full context.** An escalated attempt starts from the failed attempt's whole context, not a summary (phase 2, with escalation).
+- **A per-repo knowledge base** (code map, lessons store, search subagent): phase 2.
+- **A dev image per repo, built by vigild from the repo's lockfiles when they change and validated by running its suites offline, with dispatch refused on a stale or failed image: phase 1** (owner direction, review round 2; this replaced the nightly validation).
+- **KPIs drive the ladder, routing and the cost model:** first-pass merge rate, findings per PR by severity, revert + fix-job rate, cost per merged PR, median spec→merge. They are defined now and their raw data is stored now; each is computed where data exists.
+- **`ask_coord` in the worker packet: phase 1.** A blocked worker asks its coord instead of guessing; the question also lands in your inbox.
+
+**Owner decisions 2026-10-22: the bridge's phasing.** The bus, the MCP tools (`vigil_talk`, `vigil_listen`) and `vigil-bridge` are phase 2. The `/talk` page is phase 3.
 
 ## Job execution protocol: stages, artifacts, acceptance, prompting
 
@@ -328,9 +347,9 @@ This is how a job runs, written the way a release process is written at a compan
 | Stage | Input | Owner | Artifact produced | Acceptance (machine-checked) | On failure |
 | --- | --- | --- | --- | --- | --- |
 | 0 Intake | issue, label, or `vigil run` text; your rough ideas | decider | `intake.json`: value, risk, size, touches\_money, duplicate\_of, confidences | confidences above act threshold; not a duplicate; WIP free | wait in inbox or page you |
-| 1 Spec | intake + repo docs + your notes | coord (Claude) | `spec.md`: goal, non-goals, acceptance criteria as testable statements, `test_cmd` per criterion, files in/out of scope, risks, rollback; `plan.md`: worker split with a contract per worker, dependency order, estimated size | spec gate: every criterion has a test command; every worker contract validates against the schema; money paths flagged match the path rules | coord revises up to 2×, then pages you |
+| 1 Spec | intake + repo docs + your notes | coord (Claude) | `spec.md`: goal, non-goals, acceptance criteria as testable statements, `test_cmd` per criterion, files in/out of scope, money paths, interfaces (when workers run in parallel), risks, rollback; `plan.md`: worker split with a contract per worker, dependency order, estimated size, each criterion's verification level | spec gate: every criterion has a test command; every worker contract validates against the schema; money paths flagged match the path rules; parallel workers have disjoint files and pinned interfaces; every criterion has a verify entry, and one left at level 0 says why | coord revises up to 2×, then pages you |
 | 2 Approve | spec + plan | you (inbox) | approval record with your edits | signed by you | job stays `spec_pending` |
-| 3 Build | one worker contract | worker | branch with commits; `worker_report.json`: test before/after, files changed, summary, self-check answers, open questions | `must_fail_first` observed; `test_cmd` exits 0; files changed ⊆ scope; no test weakened (diff of test files reviewed by a check); lint/types clean; turns and cost under limits | retry with findings appended (attempt 2), then escalate tier |
+| 3 Build | one worker contract | worker, then vigild | branch with commits; `worker_report.json`: test before/after, files changed, summary, self-check answers, open questions; a draft PR that **vigild** pushes and opens from the host (P2, owner 2026-10-22), never the worker | `must_fail_first` observed; `test_cmd` exits 0; files changed ⊆ scope; no test weakened (diff of test files reviewed by a check); lint/types clean; turns and cost under limits; all checked on the host before the push | retry with findings appended (attempt 2), then escalate tier |
 | 4 Verify | branch | CI (GitHub Actions) | CI run; coverage delta; flake status | all required checks green on a clean runner, not the worker's shell; flaky tests quarantined, not counted | back to build with the CI log attached |
 | 5 Review | PR diff + issue + spec | reviewer (fresh context) | `review.json`: findings\[\] {severity, file, line, claim, fix}, verdict | zero findings of severity ≥ medium; checklist complete | findings become a fix task on the same branch; two rounds, then escalate |
 | 6 Audit | review + diff | auditor (Opus, sampled by rung) | `audit.json`: findings the reviewer missed, match rate | match rate feeds the trust ladder; no missed high finding | demote shape; findings become a fix task |
@@ -350,9 +369,21 @@ This is how a job runs, written the way a release process is written at a compan
 5. *Output schema*: the exact JSON the session must end with (`worker_report.json`, `review.json`). A session that ends without it is a failure, not a partial success.
 6. *Self-check*: before returning, the worker answers five questions in the report: did the test fail first; what did I change outside scope and why (must be nothing); what did I not do; what would a reviewer flag; what could be deleted.
 
+The worker packet also explains `ask_coord` (owner decisions 2026-10-22, phase 1): a blocked worker writes its question to `.vigil/<job>/<task>/ask_coord.json` and stops; vigild files it to the coord and the inbox.
+
 Role prompts are short, imperative, and never change mid-job. Changing a prompt is a PR with an eval run attached. No session is ever asked to "continue" in a chat; a new stage is a new packet.
 
 **When to move on.** A stage advances only when its acceptance column is true and the owner has written the artifact. Vigild enforces this in one state machine (`vigild/jobs/fsm.py`) with a test per transition. There is no manual override except yours from the inbox, and that is logged.
+
+**Dependency changes are their own job** (owner direction, 2026-10-22). A worker never adds a dependency: verification runs the base's runner files on images built from the base's lockfiles, so a dependency change can't pass. Instead:
+1. The worker's task blocks with "needs dep <name>@<version>": it reports `needs_deps: [{ecosystem, package, version, why}]` in `worker_report.json`, or vigild reads it from a manifest or lockfile the worker changed. The inbox item shows the requested deps and the worker's manifest and lockfile diff, fenced as untrusted.
+2. vigild opens a child **deps job** (shape `deps`; the blocked task's `blocked_on`) that changes only the manifest and the lockfile. It runs **no model**: vigild runs the package manager's lockfile-only update (`pnpm add <pkg>@<ver> --lockfile-only`, `uv add …`) in a dedicated build container with registry egress and nothing else: no repo secrets, no gateway token, no model. A diff that touches anything but manifests and lockfiles fails the job.
+3. **Pins:** the requested version must be a release at least 14 days old by the registry's publish time, and so must every other package the lockfile pulls in, or the job fails with the list.
+4. **Gates:** the dev image is rebuilt from the new lockfile, the full suite runs offline on base plus the new lockfile, and vigild opens the PR. `deps` starts at rung 1 and always needs your review, like money paths.
+5. After that PR merges, the dev image key changes, and the original task resumes on the new image.
+6. Dependabot-style bumps come in the same way: a scheduled intake, or a Dependabot PR adopted as a deps job.
+
+Phase 1 builds the block, the inbox item and the job link in the state machine (you resume from the inbox); phase 2 the deps job and auto-resume; phase 6 the Dependabot intake.
 
 ## Documentation standard: context baked into every job
 
@@ -384,6 +415,26 @@ The rule: **the repo is the source of truth, every job reads from it through one
 **What each stage writes back.** Spec and plan write layer 6; a plan that changes a flow also writes layer 2 and an ADR; build writes layer 6 and any layer-2/3 updates the spec requires (checked, not trusted); close writes `close.md`, which vigild distils into one layer-5 line and, if the job shipped a new route or job, re-runs the code-map agent for layer 3. The UI's job page links every layer-6 artifact, and the session packet is downloadable, so you can see at any moment exactly what a worker was given.
 
 **Freshness.** Drift is caught by machines, not memory: the layer-3 CI check, the layer-2 "docs in the same PR" check, a nightly audit that diffs layer 1 against layers 2–3 for duplicated or contradicting facts, and a staleness score per file on the dashboard (days since a doc mentioning it was updated versus days since the file changed). A repo whose staleness score crosses a threshold gets a docs job proposed to the inbox.
+
+**Owner decisions 2026-10-22: the documentation standard's phasing.**
+- **Phase 1:** layers 1, 2, 3 and 6; the packet assembler with per-layer token budgets and a dropped-items log; the "docs in the same PR" check; the missing-route check.
+- **Phase 2:** layers 4, 5 and 7, the search subagent, and the staleness score.
+- **Layer 8 is never read by a job.**
+- The tree applies to the vigil repo from the phase 1 PR onward.
+
+## Verification ladder (owner decisions 2026-10-22)
+
+How far each acceptance criterion's check reaches. Levels 0, 1 and 3 only, for now:
+- **Level 0:** example tests that fail first. **Phase 1:** a `verify` field in the spec schema, at level 0.
+- **Level 1 (phase 2):** properties derived from the criteria:
+  - Hypothesis for Python;
+  - SwiftCheck or parameterised swift-testing for Swift;
+  - Schemathesis for OpenAPI routes;
+  - Hypothesis stateful tests for vigild's job FSM.
+- **Level 3:** models of ParkAgent's payment state machine and vigild's FSM. You write them with Opus, agents maintain them, CI checks them. Scheduled after phase 2.
+- **The coord must state in `plan.md` any criterion it couldn't raise above level 0, and why.** The plan schema enforces this.
+- **Levels 2, 4 and 5** are documented as later options, not built.
+- **Audit sampling and ladder promotion weight criteria by verify level:** a shape whose criteria sit at level 0 is sampled harder and promoted slower than one at level 1 or 3. Documented now; the code is phase 2.
 
 ## Tower: local model serving
 
@@ -486,7 +537,8 @@ Why OpenCode over OpenHands, in one paragraph: OpenHands bundles its own sandbox
 - **Permissions:** `permission_mode="bypassPermissions"` inside the sandbox. It refuses to run as root, so the container user is non-root.
 - **Guard plugin:** ParkAgent's guard, now the `guard@claude-mods` plugin, installed at build time from claude-mods at a pinned commit SHA. claude-mods is private, so the build reads it with a contents:read installation token of the vigil-worker App, passed as a BuildKit secret.
 - **Deny list:** the repo's deny list goes in the image's managed settings.
-- **Model key:** a read-only file, read through `apiKeyHelper`, never an environment variable.
+- **Model access:** through vigild's model gateway (P1, owner 2026-10-22). The container gets `ANTHROPIC_BASE_URL` pointing at the gateway and a per-session gateway token as the auth token, on its stdin; it never holds a provider key. The gateway injects the key, meters every call and refuses a call that would cross a budget.
+- **GitHub:** none. Workers commit; vigild checks scope and pushes from the host (P2).
 - **OTel:** on.
 
 The SDK runs the Claude Code CLI as a child process and exports spans, metrics and log events over OTLP when `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1` and the three `OTEL_*_EXPORTER=otlp` variables are set ([Agent SDK observability](https://code.claude.com/docs/en/agent-sdk/observability)). `vigild` sets `OTEL_RESOURCE_ATTRIBUTES=vigil.task_id=…,vigil.tier=claude,vigil.repo=…` and `TRACEPARENT` so the run nests under the task's trace. It bills to the API key of the "vigil" org. That org's monthly credit ($100–200) is a hard ceiling, so vigild's caps sit well under it: $5 a day, $2 a task, and reviews count toward the day.
@@ -506,7 +558,7 @@ The SDK runs the Claude Code CLI as a child process and exports spans, metrics a
 
 The Claude Code route is how coord keeps its role: coord decides and dispatches, `vigild` executes and reports. Coord never runs workers itself anymore, which also frees your Max-plan session from doing the cheap work.
 
-`vigil ls --live` streams a table: task, tier, model, status, turns, minutes, cost or GPU-seconds, PR, CI, review. `vigil trace <id>` prints the Langfuse URL and a 30-line summary of the tool calls.
+`vigil ls --live` streams a table: task, tier, model, status, turns, minutes, cost or GPU-seconds, PR, CI, review. `vigil trace <id>` prints the Phoenix URL and a 30-line summary of the tool calls.
 
 ## Security: three layers, no secrets in workers
 
@@ -514,9 +566,9 @@ No session can merge, push to main, deploy, or read a secret. Each of these is s
 
 | Threat | Layer 1: GitHub | Layer 2: container | Layer 3: harness config |
 | --- | --- | --- | --- |
-| Merge or approve | GitHub App installation token per task, scoped to the one repo, `contents:write`, `pull_requests:write`, no `administration`, no `workflows`; ruleset on `main` requires PR + checks and blocks force push | token lives in a tmpfs file read by a `git credential` helper, not in env | `gh pr merge*`, `gh pr review*--approve*`, `gh api*` denied |
+| Merge or approve | vigild's installation token per publish, scoped to the one repo, `contents:write`, `pull_requests:write`, no `administration`, no `workflows`; ruleset on `main` requires PR + checks and blocks force push | **no token in the container** (P2, owner 2026-10-22): vigild pushes and opens the PR from the host | `gh pr merge*`, `gh pr review*--approve*`, `gh api*` denied |
 | Push to main | ruleset: direct pushes to `main` blocked | pre-push hook in the image refuses `main`; `.git/hooks` and `.git/config` read-only | `git push*main*` denied |
-| Deploy / prod | worker token has no Fly, no prod access | egress allowlist, per session: `api.github.com`, `github.com`, `registry.npmjs.org`, `pypi.org`, plus the session's backend host (`api.anthropic.com`, `openrouter.ai`, or the tower's `llama-server`); there is no other route out | `fly *` denied |
+| Deploy / prod | no Fly or prod credential anywhere | egress allowlist, per session: package registries for workers (`pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`) and vigild's gateway; no model host and no GitHub host (P1, P2); there is no other route out | `fly *` denied |
 | Read secrets | — | no `.env`, no `~/.aws`, no SSH keys mounted; root FS read-only; only `/work` and `/tmp` writable | `read *.env*` denied |
 | Escape the worktree | — | only the task's clone is mounted; user is non-root; `--cap-drop ALL`, `--pids-limit 512`, memory cap | `external_directory` denied |
 | Change its own rules | the token has no `workflows` permission, so GitHub refuses a push that touches `.github/workflows` | `.opencode/`, `.github/`, `.claude/` mounted read-only over the clone | `edit .github/*`, `edit .opencode/*` denied; guard's self-protection |
@@ -528,8 +580,8 @@ No session can merge, push to main, deploy, or read a secret. Each of these is s
 - The `llama-server` port on the tower is reachable only over Tailscale, and the Tailscale ACL allows only the Mac.
 
 **Tokens and keys.**
-- `vigild` mints a GitHub App installation token per task, with a 1-hour life, and revokes it when the container exits.
-- The model key reaches only the executor container, as a read-only file (`key_ref` says which one).
+- `vigild` mints a GitHub App installation token per publish, for one repo listed in `configs/repos.yaml`, with a 1-hour life, and revokes it after the push and the PR. No container ever holds one (P2).
+- No provider key reaches any container. A session holds a gateway token that works only on vigild's gateway, only for its repo and backend, and only until it ends (P1).
 - `vigild` meters cost itself (Tracking, below), so no key is shared with the UI.
 - Secrets live only in `~/.config/vigil/env` (mode 600) on the Mac, plus the App's `.pem` beside it. The tower holds its own llama-server key. The variable list is in `docs/runbook.md` "Credentials".
 
@@ -539,7 +591,7 @@ Anything that needs a secret (migrations against prod, Fly secrets, Stripe keys)
 
 ## Tracking: one trace per session
 
-Every session, from either tier, becomes one trace in self-hosted Langfuse v4. The task id is the trace name. `tier`, `model`, `repo`, `branch`, `pr_url` and `attempt` are filterable metadata, set on every span. An OpenTelemetry Collector sits in front so both tiers write the same way.
+Every session, from either tier, becomes one trace in self-hosted Arize Phoenix. The session id groups it (`session.id`); the task id is on every span. `tier`, `model`, `repo`, `branch`, `pr_url` and `attempt` are filterable metadata, set on every span. An OpenTelemetry Collector sits in front so both tiers write the same way.
 
 | Source | How it reaches the collector | What you get |
 | --- | --- | --- |
@@ -547,21 +599,21 @@ Every session, from either tier, becomes one trace in self-hosted Langfuse v4. T
 | OpenCode executor | `vigild` subscribes to `/api/event` and translates bus events (message parts, tool start/finish, idle, permission events) into OTLP spans with the same names | one span per turn and per tool call; tokens from the message usage fields; GPU-seconds and joules from the tower exporter, attributed per session |
 | `vigild` itself | its own spans: `vigil.route`, `vigil.spawn`, `vigil.review`, `vigil.escalate` | the routing reason and every state change in the same trace |
 
-Why Langfuse over Phoenix: Langfuse is MIT outside its `ee/` directories, runs identically self-hosted, and stores traces in ClickHouse, which handles long agent traces with large payloads well ([comparison](https://langfuse.com/compare/arize-phoenix)). Phoenix is lighter to run (one container) but its Elastic licence and the Dynatrace acquisition of Arize make it a weaker long-term bet.
+Why Phoenix over Langfuse (**reversed, owner decision 2026-10-22**): this design first chose Langfuse for its MIT licence and ClickHouse storage. But self-hosted Langfuse v4 is six containers and wants about 16 GiB, and the Mac mini has 24 GiB with a 12 GiB Docker VM that the workers also need. Phoenix is one container, OTel-native, and the owner judged its licence fine for self-hosted use. The collector stays in front of it, so the exporters never change and Langfuse remains an option for a machine with more memory.
 
-Self-hosted Langfuse is **six** containers: web, worker, Postgres, ClickHouse, Redis and MinIO. All six have arm64 images, and the Compose file includes them. Langfuse recommends about 16 GiB for the stack, so Docker Desktop's VM memory on the Mac must be raised to fit it beside the workers. It ingests OTLP over HTTP only. Hook spans would need Claude Code's detailed beta tracing, which reroutes logs, so they are not collected.
+Phoenix ingests OTLP over HTTP (`/v1/traces`) and keeps traces in SQLite under its working directory. It runs with auth on; the collector authenticates with Phoenix's admin secret. Phoenix takes traces only, so the collector drops Claude Code's metrics and log events; per-call metering comes from vigild's gateway, not from telemetry. Hook spans would need Claude Code's detailed beta tracing, which reroutes logs, so they are not collected.
 
 Tool content is off by default; the Claude tier turns on `OTEL_LOG_TOOL_DETAILS=1` so commands and file paths show, and `OTEL_LOG_TOOL_CONTENT=1` only for the reviewer, whose inputs are a diff you already own. Prompts are logged for both tiers because you own the repos.
 
-**Web UI.** Langfuse's sessions view is the drill-down. The fleet view is `vigild`'s own web UI (phase 3), specified in `docs/ui.md`:
-- these eight pages and nothing else: board, job detail, sessions, decider, review ladder, new session, budget, talk;
-- the Vigil UI canvas is the visual reference for all eight, Talk included;
+**Web UI.** Phoenix's trace view is the drill-down. The fleet view is `vigild`'s own web UI (phase 3), specified in `docs/ui.md`:
+- these nine pages and nothing else: board, job detail, sessions, decider, review ladder, new session, budget, talk, watch (a full-screen ambient display; owner direction, 2026-10-22);
+- the Vigil UI canvas is the visual reference for all nine, Talk and Watch included;
 - plain HTML, CSS and a little vanilla JS, with no build step;
 - served on Tailscale only, from the same API as the CLI and MCP server.
 
 **Metering.** Every task and session records two kinds of usage.
 - **API calls, from phase 1, for any provider.** Each call records input, output, cache-read and cache-write tokens and its cost.
-  - Claude executor: the token counts come from Claude Code's `claude_code.api_request` events.
+  - All hosted calls: vigild's gateway reads the usage on every response it forwards (P1, owner 2026-10-22).
   - OpenCode executor: they come from the v2 event stream.
   - Cost is always tokens × the dated price table in `configs/prices.yaml`. The SDK's own `total_cost_usd` is a client-side estimate, used only as a cross-check.
 - **Tower jobs, from phase 5.** GPU utilization, VRAM, CPU, RAM and watts are sampled every second by the tower exporter. Each sample is attributed to the sessions with a request in flight on llama-server, and summarized as joules per token and GPU-seconds per token. Measured energy replaces the old 0.4 kW estimate.
@@ -618,11 +670,11 @@ vigil/
   schemas/           task, result and event JSON schemas
   images/            Dockerfiles (linux/arm64): claude-executor (also reviewer/auditor), opencode-executor, egress-proxy
   tower/             llama-server systemd unit, models.lock, exporter/ (NVML + psutil service), check.sh
-  compose.yaml       otel-collector, langfuse (6 services); vigild itself runs natively under launchd
+  compose.yaml       otel-collector, phoenix; vigild itself runs natively under launchd
   configs/           vigild.yaml (fleet coord backend), backends.yaml, routing.yaml, budgets.yaml, prices.yaml, repos.yaml, review.yaml,
                      egress.yaml, opencode.json, managed-settings.json, otel-collector.yaml
   evals/             specs/, run.py, results/
-  docs/              design.md, architecture.md, feature-map.md, runbook.md, sources.md, ui.md
+  docs/              design.md, architecture.md, feature-map.md, runbook.md, sources.md, ui.md, decisions/ (ADRs)
   tests/
 ```
 
@@ -632,16 +684,17 @@ Build sessions use two models:
 - **Opus** for coord, the phase 1 and 2 workers, and every review.
 - **Sonnet** for later phases, unless a review sends work back twice.
 
-The per-phase detail (deliverables, credentials, spend) is in `docs/architecture.md` "Six-phase plan".
+The per-phase detail (deliverables, credentials, spend) is in `docs/architecture.md` "Seven-phase plan". **Seven phases (owner decision 2026-10-22):**
 
 | Phase | Delivers | Done when |
 | --- | --- | --- |
-| 1. Core, all Claude | `vigild`, task contract, spec gate, intake scoring through the decider interface (Jev via Cloudflare, Haiku fallback), backends and presets, budgets (hard stops), per-call API metering, Claude executor image with the guard plugin, per-task clone + container spawn + egress proxy, GitHub App tokens, OTel → Langfuse, CI (lint, types, tests) | one ParkAgent docs task runs Sonnet in a container, opens a draft PR, trace visible |
-| 2. Review ladder + fleet + CLI/MCP | reviewer (Sonnet) + auditor (Opus), rung-0 audit of 100%, scheduler with dep graph, 3 parallel containers, WIP limit, escalation, `vigil` CLI + MCP server, label intake | 3 batch tasks run in parallel, reviewed and audited; `vigil kill` works; dispatched once from a Claude Code session |
-| 3. Web UI + metering endpoint | the web UI in `docs/ui.md`; metering as JSON and Prometheus `/metrics`; one API behind CLI, MCP and UI | a session started from `/new` shows live on the board; its detail page shows each model call with tokens and cost summing to the session total; `/metrics` shows it; a screenshot of each page in the PR |
-| 4. OpenCode executor on Claude | OpenCode v2 executor image pointed at Claude through OpenCode's Anthropic provider; both executors pass the same contract tests | the same docs task passes through both executors with identical results and traces |
-| 5. Tower | llama-server unit, models.lock, tower exporter, GPU metering (J/token, GPU-s/token), tower presets, OpenCode provider switched to the tower, LFM added as the local decider backend | `tower/check.sh` passes; one local task opens a PR; tokens/s and J/token recorded and shown |
-| 6. Eval + tuning | `evals/run.py` over workers, reviewers and deciders; routing.yaml and review.yaml edited from results | results.csv committed; first shapes at rung 1; cost table in the UI uses real numbers |
+| 1. Core | `vigild`, task contract, spec gate, intake scoring, jobs as trees with the state machine and the inbox, the coord loop, backends and presets, the model gateway, budgets (hard stops), per-call metering, Claude executor image with the guard plugin, per-task clone + container + egress proxy, host-side publish, GitHub App tokens, pinned dev images, OTel → Phoenix, CI (lint, types, tests) | an approved spec on ParkAgent produces a coord that writes `spec.md` and `plan.md`; you approve from the inbox; two workers build in their own containers; both open draft PRs through vigil-worker, each with `worker_report.json`; the job tree is readable from one endpoint |
+| 2. Review ladder + fleet + CLI/MCP + session proxy | reviewer + auditor, rung-0 audit of 100%, scheduler, WIP limit, escalation (forking full context), `vigil` CLI + MCP server, label intake, the session proxy (read and join a live session), the bridge's bus, MCP tools and `vigil-bridge`, documentation layers 4, 5, 7, verification level 1 | 3 batch tasks run in parallel, reviewed and audited; `vigil kill` works; dispatched once from a Claude Code session |
+| 3. Web UI + metering | the web UI in `docs/ui.md` (with `/talk`); metering as JSON and Prometheus `/metrics` | a session started from `/new` shows live on the board; per-call costs sum to the session total; `/metrics` shows it; a screenshot of each page |
+| 4. OpenCode executor | OpenCode v2 executor image on Claude through the gateway; both executors pass the same contract tests | the same docs task passes through both executors with identical results and traces |
+| 5. Tower | llama-server (router mode), models.lock, tower exporter, GPU metering, tower presets, LFM decider | `tower/check.sh` passes; one local task opens a PR; tokens/s and J/token recorded and shown |
+| 6. Post-merge + fix jobs + auto-merge | the post-merge watcher (48 h window), fix jobs as children with the coord resumed, auto-revert, auto-merge for shapes at rung 3 | defined when the phase is dispatched |
+| 7. Eval | `evals/run.py` over workers, reviewers and deciders; routing.yaml and review.yaml edited from results | results.csv committed; first shapes at rung 1; cost table uses real numbers |
 
 After phase 6: the training-data firewall exporter (the provenance tag exists from phase 1), the RunPod overflow adapter if the eval calls for it, and more repos added via `repos.yaml`.
 
@@ -650,7 +703,7 @@ After phase 6: the training-data firewall exporter (the provenance tag exists fr
 By hand, once. The exact steps are in `docs/runbook.md` "Credentials":
 
 - [ ] **Mac mini:**
-  - Docker Desktop, with VM memory raised for Langfuse (about 16 GiB) plus workers.
+  - Docker Desktop with a 12 GiB VM (Phoenix, the collector and the sessions fit).
   - Tailscale.
   - `~/.config/vigil/env`, mode 600, with the App `.pem` beside it.
 - [ ] **Tower:**
@@ -658,13 +711,13 @@ By hand, once. The exact steps are in `docs/runbook.md` "Credentials":
   - Tailscale joined, with an ACL allowing only the Mac to reach llama-server and the exporter.
   - NVMe space for about 40 GB of GGUFs.
   - Nothing else: no Docker.
-- [ ] **GitHub App "vigil-worker":**
-  - Permissions: `contents:write`, `pull_requests:write`, `issues:read`, and no `workflows`.
-  - Installed on parkagent, on vigil (for self-maintenance after phase 2), and on claude-mods (read-only by token down-scoping, for the guard plugin).
+- [x] **GitHub App "vigil-worker"** (verified 2026-10-22):
+  - Permissions: `contents:write`, `pull_requests:write`, `issues:write`, `checks:read`, `metadata:read`, `artifact_metadata:read`, and no `workflows`. vigild down-scopes every token to its use.
+  - Installed on all eight of your repos; vigild mints only for those in `configs/repos.yaml`, plus claude-mods (read-only, for the guard plugin).
   - Private key kept on the Mac outside any worker mount.
 - [ ] **Branch ruleset on `main` in every repo:** PR required, checks required, no force push. The fleet never gets admin.
 - [ ] **Anthropic Console:** org "vigil" with its own API key (exists) and a monthly spend limit.
-- [ ] **Langfuse:** keys and login, generated by you into the env file.
+- [ ] **Phoenix:** `PHOENIX_SECRET`, `PHOENIX_ADMIN_SECRET` and the first admin password, generated by you into the env file (`docs/runbook.md`).
 - [ ] **Each repo:** an `AGENTS.md → CLAUDE.md` symlink committed, and `docs/feature-map.md` and `docs/architecture.md` kept current, since they are the local model's whole map of the codebase.
 
 Answers to the questions (2026-10-22):

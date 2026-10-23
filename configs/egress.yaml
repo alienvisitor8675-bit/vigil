@@ -1,0 +1,26 @@
+# Per-session egress allowlists for the smokescreen sidecar (B4, B5).
+# No model host and no GitHub host is listed: hosted model calls go through
+# vigild's gateway (P1), and vigild pushes and opens PRs from the host (P2), so
+# a worker needs neither. PyPI stays for workers (uploads go to
+# upload.pypi.org, which isn't listed). npm is gone (review r1, item 12): its
+# registry takes publishes on the same host as reads, and smokescreen can't
+# filter methods, so a worker's npm dependencies must be baked into its repo's
+# dev image.
+gateway:
+  host: host.docker.internal
+  port: 8788
+  # smokescreen blocks private ranges by default, and host.docker.internal is
+  # one (Docker Desktop's host address, checked 2026-10-22). Only this
+  # address:port is opened; vigild's API port on the same host stays refused.
+  allow_address: "192.168.65.254:8788"
+collector:
+  host: otel-collector       # attached to each session network; never proxied
+  port: 4318
+proxy:
+  alias: egress
+  port: 4750
+roles:
+  coord:    []
+  worker:   [pypi.org, files.pythonhosted.org]
+  reviewer: []
+  auditor:  []

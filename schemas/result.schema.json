@@ -1,0 +1,170 @@
+{
+  "$defs": {
+    "Provenance": {
+      "enum": [
+        "claude",
+        "local",
+        "human"
+      ],
+      "title": "Provenance",
+      "type": "string"
+    },
+    "ResultStatus": {
+      "enum": [
+        "pr_open",
+        "failed",
+        "escalate",
+        "timeout"
+      ],
+      "title": "ResultStatus",
+      "type": "string"
+    },
+    "TestOutcome": {
+      "enum": [
+        "fail",
+        "pass",
+        "unknown"
+      ],
+      "title": "TestOutcome",
+      "type": "string"
+    },
+    "Usage": {
+      "additionalProperties": false,
+      "properties": {
+        "cost_usd": {
+          "default": 0,
+          "title": "Cost Usd",
+          "type": "number"
+        },
+        "energy_j": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Energy J"
+        },
+        "gpu_seconds": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpu Seconds"
+        },
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "tokens_cache_read": {
+          "default": 0,
+          "title": "Tokens Cache Read",
+          "type": "integer"
+        },
+        "tokens_cache_write": {
+          "default": 0,
+          "title": "Tokens Cache Write",
+          "type": "integer"
+        },
+        "tokens_in": {
+          "default": 0,
+          "title": "Tokens In",
+          "type": "integer"
+        },
+        "tokens_out": {
+          "default": 0,
+          "title": "Tokens Out",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "title": "Usage",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "branch": {
+      "title": "Branch",
+      "type": "string"
+    },
+    "files_changed": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Files Changed",
+      "type": "array"
+    },
+    "pr_url": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Pr Url"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "status": {
+      "$ref": "#/$defs/ResultStatus"
+    },
+    "summary": {
+      "title": "Summary",
+      "type": "string"
+    },
+    "task_id": {
+      "title": "Task Id",
+      "type": "string"
+    },
+    "test_after": {
+      "$ref": "#/$defs/TestOutcome"
+    },
+    "test_before": {
+      "$ref": "#/$defs/TestOutcome"
+    },
+    "trace_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Trace Id"
+    },
+    "usage": {
+      "$ref": "#/$defs/Usage"
+    }
+  },
+  "required": [
+    "task_id",
+    "status",
+    "branch",
+    "test_before",
+    "test_after",
+    "files_changed",
+    "summary",
+    "usage",
+    "provenance"
+  ],
+  "title": "Result",
+  "type": "object"
+}

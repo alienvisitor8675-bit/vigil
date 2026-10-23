@@ -1,0 +1,5 @@
+#!/bin/sh
+# Workers never push: vigild pushes the branch from the host after its checks
+# (P2, owner 2026-10-22). This hook is the layer-2 backstop.
+echo "vigil: pushing from a worker container is not allowed; vigild publishes the branch" >&2
+exit 1

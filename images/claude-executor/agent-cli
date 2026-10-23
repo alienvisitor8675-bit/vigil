@@ -1,0 +1,6 @@
+#!/bin/sh
+# The CLI as the agent uid: no capabilities, no supplementary groups. The
+# harness (PID 1, root) gives this path to the Agent SDK as cli_path, so the
+# model and everything it starts can't signal the harness or write its stdout.
+uid="${VIGIL_AGENT_UID:-10001}"
+exec setpriv --reuid="$uid" --regid="$uid" --clear-groups --inh-caps=-all -- /usr/local/bin/claude "$@"

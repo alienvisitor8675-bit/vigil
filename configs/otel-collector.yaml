@@ -1,0 +1,38 @@
+# The collector stays in front of the trace store so the exporters never
+# change (B23). Workers send OTLP/HTTP here over their session network;
+# vigild sends its own spans to 127.0.0.1:4318. Phoenix ingests traces only;
+# Claude Code's metric and log events are dropped (per-call metering comes
+# from vigild's gateway, P1, not from telemetry).
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 200
+  batch: {}
+
+exporters:
+  otlphttp/phoenix:
+    endpoint: http://phoenix:6006
+    headers:
+      Authorization: "Bearer ${env:PHOENIX_ADMIN_SECRET}"
+  nop: {}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/phoenix]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [nop]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter]
+      exporters: [nop]

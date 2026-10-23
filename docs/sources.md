@@ -9,6 +9,16 @@ released at least two weeks earlier, which today means on or before
 - Our own code is pinned by commit SHA and isn't subject to the rule.
   That covers claude-mods, read at `c0fd9b19c4742dba84543e351a41e0faa60c84c8`
   (2026-10-21).
+- **One owner-granted exception:** Claude Code CLI **2.1.306** (released
+  2026-10-21) in the executor image, because Claude Code is the harness and
+  guard is verified on it (Q1, owner 2026-10-22).
+- **PyPI pins are enforced, not just listed:** `pyproject.toml` sets
+  `[tool.uv] exclude-newer = "2026-10-08T23:59:59Z"`, so transitive
+  dependencies obey the rule too.
+- **Docker base images are pinned by digest.** Official images are rebuilt
+  in place for OS patches. A digest resolved on 2026-10-22 is the current
+  build of a release that itself meets the rule (CPython 3.14.8, Node
+  24.21.0), so the OS layer may be newer than the cut-off.
 
 When a phase adds or bumps a pin, it updates this file in the same PR.
 
@@ -16,7 +26,7 @@ When a phase adds or bumps a pin, it updates this file in the same PR.
 
 | Component | Pin | Released | Newest seen | Where it's used | Source |
 |---|---|---|---|---|---|
-| CPython | 3.12.15 (P3 would make it 3.14.8) | 2026-09-30 | 3.15.0 (2026-10-09) | vigild, CLI, executor entrypoints | https://www.python.org/downloads/ · https://peps.python.org/api/release-cycle.json |
+| CPython | **3.14.8** (P3, owner 2026-10-22; `uv python install 3.14.8`) | 2026-09-30 | 3.15.0 (2026-10-09) | vigild, CLI, executor harness | https://www.python.org/downloads/ · https://peps.python.org/api/release-cycle.json |
 | uv | 0.12.24 | 2026-10-08 | 0.13.5 | builds, lockfiles, CI | https://pypi.org/project/uv/ |
 | fastapi | 0.143.0 | 2026-10-08 | 0.159.1 | vigild API, native SSE | https://pypi.org/project/fastapi/ · https://fastapi.tiangolo.com/release-notes/ |
 | uvicorn | 0.54.0 | 2026-09-25 | same | vigild server | https://pypi.org/project/uvicorn/ |
@@ -34,17 +44,19 @@ When a phase adds or bumps a pin, it updates this file in the same PR.
 | pytest-asyncio | 1.4.0 | 2026-05-26 | same | tests | https://pypi.org/project/pytest-asyncio/ |
 | ruff | 0.16.10 | 2026-10-01 | 0.17.1 | lint + format | https://pypi.org/project/ruff/ |
 | mypy | 2.4.0 | 2026-10-01 | same | types | https://pypi.org/project/mypy/ |
-| claude-agent-sdk (Python) | 0.2.165 (bundles CLI 2.1.294) | 2026-10-08 | 0.2.172 | Claude executor | https://pypi.org/project/claude-agent-sdk/#history · https://github.com/anthropics/claude-agent-sdk-python |
-| Claude Code CLI | 2.1.295 is pin-able; **2.1.306 is what guard needs (Q1)** | 2026-10-08 / 2026-10-21 | 2.1.308 | Claude executor (`cli_path`) | https://www.npmjs.com/package/@anthropic-ai/claude-code |
+| claude-agent-sdk (Python) | 0.2.165 (bundles CLI 2.1.294; vigil runs its own CLI through `cli_path`) | 2026-10-08 | 0.2.172 | Claude executor image | https://pypi.org/project/claude-agent-sdk/#history · https://github.com/anthropics/claude-agent-sdk-python |
+| Claude Code CLI | **2.1.306**, the owner's exception (Q1) | 2026-10-21 | 2.1.308 | Claude executor (`cli_path=/usr/local/bin/claude`) | https://www.npmjs.com/package/@anthropic-ai/claude-code |
+| Node.js | 24.21.0 (LTS "Krypton"), only to run the CLI; `node:24.21.0-trixie-slim@sha256:173f1258…fb66` | 2026-09-07 | 24.22.1 | Claude executor image | https://nodejs.org/dist/index.json |
+| Python base image | `python:3.14.8-slim-trixie@sha256:fbecd461…ed4a` | 2026-09-30 (CPython) | — | executor and proxy images | https://hub.docker.com/_/python |
 | OpenCode | v2.0.26 (`@opencode/cli`, linux-arm64 package) | 2026-10-08 | v2.1.3 | OpenCode executor (phase 4) | https://opencode.ai/changelog · https://github.com/anomalyco/opencode |
 | llama.cpp | b11513 (ubuntu-cuda-12.8 / 13.4 x64 binaries, sm_120 included) | 2026-10-08 | b11819 | tower (phase 5) | https://github.com/ggml-org/llama.cpp/releases/tag/b11513 |
 | nvidia-ml-py | 13.615.71 | 2026-09-25 | same | tower exporter | https://pypi.org/project/nvidia-ml-py/ |
 | psutil | 7.2.2 | 2026-01-28 | same | tower exporter | https://pypi.org/project/psutil/ |
-| Langfuse (self-hosted) | v4.55.0 (web + worker images amd64/arm64) | 2026-10-08 | v4.68.0 | tracing | https://github.com/langfuse/langfuse/releases · https://langfuse.com/changelog/2026-08-17-langfuse-v4 |
-| ClickHouse | 25.12 (Langfuse v4's compose default and minimum) | — | 26.4 | Langfuse | https://langfuse.com/self-hosting/upgrade/upgrade-guides/upgrade-v3-to-v4 |
-| OTel Collector Contrib | 0.162.0 (arm64 image) | 2026-09-29 | 0.163.2 | collector | https://github.com/open-telemetry/opentelemetry-collector-releases/releases |
-| smokescreen | v0.1.0 (`linux_arm64` binary; image built locally because ghcr pulls were denied) | 2026-09-21 | same | egress proxy | https://github.com/stripe/smokescreen/releases |
-| Docker Desktop | 4.94.0 (Engine 29.8.2) | 2026-10-05 | 4.96.2 | Mac runtime | https://docs.docker.com/desktop/release-notes/ |
+| Arize Phoenix (self-hosted) | 20.19.0, `arizephoenix/phoenix:version-20.19.0-nonroot@sha256:f2109e09…11c9` (amd64/arm64) | 2026-10-01 | 20.24.0 | trace store (owner decision 2026-10-22) | https://github.com/Arize-ai/phoenix/releases/tag/arize-phoenix-v20.19.0 · https://hub.docker.com/r/arizephoenix/phoenix |
+| OTel Collector Contrib | 0.162.0, `otel/opentelemetry-collector-contrib@sha256:39923a8e…74be6` (arm64) | 2026-09-29 | 0.163.2 | collector | https://github.com/open-telemetry/opentelemetry-collector-releases/releases |
+| smokescreen | v0.1.0 `linux_arm64` tarball, SHA-256 `f15ddd0d…b7c9` (checked by `ADD --checksum`) | 2026-09-21 | same | egress proxy | https://github.com/stripe/smokescreen/releases/tag/v0.1.0 |
+| Docker Desktop | 4.94.0; the engine here reports 29.9.2 | 2026-10-05 | 4.96.2 | Mac runtime | https://docs.docker.com/desktop/release-notes/ |
+| Langfuse (option, not used) | v4.55.0, for a machine with ~16 GiB for the Docker VM | 2026-10-08 | v4.68.0 | — | https://github.com/langfuse/langfuse/releases |
 | actions/checkout | v7.0.1 `3d3c42e5aac5ba805825da76410c181273ba90b1` | 2026-07-20 | same | CI | https://github.com/actions/checkout/releases |
 | astral-sh/setup-uv | v10.2.0 `c18668ad3cf93ea998bef934396af7bb5c839dc7` | 2026-09-21 | v10.3.2 | CI | https://github.com/astral-sh/setup-uv/releases |
 | Jev on OpenRouter | `typesafe/jev-1.13` (endpoint `jev-1.13-20260917`) | 2026-09-18 | jev-1.14 (2026-10-14) | decider | https://openrouter.ai/docs/guides/community/jev |
@@ -165,10 +177,32 @@ Sources: https://platform.claude.com/docs/en/about-claude/models/overview · htt
   `nvidia-smi -q -d POWER` on the tower first.
 - Source: https://docs.nvidia.com/deploy/nvml-api/
 
-**Langfuse v4 (self-hosted)**
+**Arize Phoenix 20.19.0 (self-hosted; the trace store)**
+- **One container** serving the UI and OTLP over HTTP on port 6006
+  (`/v1/traces`); gRPC on 4317 is unused. Storage is SQLite under
+  `PHOENIX_WORKING_DIR` (or Postgres via `PHOENIX_SQL_DATABASE_URL`). The
+  `-nonroot` image runs as uid 65532, so its volume is mounted at
+  `/home/nonroot`; a volume at `/mnt/data` fails with EACCES (checked).
+- **Auth:** `PHOENIX_ENABLE_AUTH=true` with `PHOENIX_SECRET` (≥ 32
+  characters). `PHOENIX_ADMIN_SECRET` works as a bearer token for the first
+  system user, which is how the collector authenticates.
+  `PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD` sets the first login.
+- **Grouping:** the `openinference.project.name` resource attribute picks
+  the project ("vigil"); the OpenInference `session.id` span attribute
+  groups a session.
+- **REST:** `GET /v1/projects/{name}/spans` (used by the compose test).
+- Checked end to end on 2026-10-22: a vigild span sent to the collector
+  appears in Phoenix (`tests/telemetry/test_spans.py`, docker).
+- Sources: `src/phoenix/config.py` and
+  `src/phoenix/server/api/routers/v1/spans.py` at tag
+  `arize-phoenix-v20.19.0`.
+- Licence: Elastic License 2.0. Self-hosted use for your own traces is
+  fine per the owner.
+
+**Langfuse v4 (self-hosted; an option, not used)**
 - **Containers:** six (web, worker, postgres:17, clickhouse ≥ 25.12,
   redis 7, minio), all arm64. The docs recommend 4 cores, 16 GiB and
-  100 GiB of disk.
+  100 GiB of disk, which is more than this Mac's 12 GiB Docker VM.
 - **OTLP ingest:** HTTP only, at `/api/public/otel`, with Basic auth and
   the `x-langfuse-ingestion-version: 4` header.
 - **Trace attributes:** `langfuse.trace.name`, `langfuse.session.id`,
@@ -201,6 +235,15 @@ Sources: https://platform.claude.com/docs/en/about-claude/models/overview · htt
   - https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token
   - https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps
 
+**smokescreen v0.1.0 (checked on this Mac, 2026-10-22)**
+- With no TLS client certificates it can't tell roles apart, so
+  `allow_missing_role: true` in its `--config-file` makes every request use
+  the ACL's `default` policy (otherwise every request is a 407).
+- `allow_addresses: ["192.168.65.254:8788"]` opens exactly the gateway's
+  address and port in the private ranges smokescreen blocks by default;
+  port 8787 on the same host stays refused.
+- Flags and config keys: `smokescreen --help` in the built image.
+
 **Docker Desktop networking**
 - **Internal networks** have no default route:
   https://docs.docker.com/reference/cli/docker/network/create/
@@ -210,6 +253,14 @@ Sources: https://platform.claude.com/docs/en/about-claude/models/overview · htt
   https://security-tracker.debian.org/tracker/CVE-2024-29018
 - **How Desktop routes container traffic:**
   https://www.docker.com/blog/how-docker-desktop-networking-works-under-the-hood/
+- **Checked 2026-10-22:** from a container on an `internal` network,
+  through the sidecar, `host.docker.internal` (192.168.65.254) reaches a
+  server bound to the Mac's `127.0.0.1`. That is how workers reach the
+  gateway. Direct connections out fail ("Network is unreachable").
+- **Checked 2026-10-22:** without Files and Folders access to `~/Documents`,
+  a bind mount from there hangs `docker start` until Docker Desktop restarts.
+  The grant has since been given on this Mac. Mounts from the home directory
+  and from `/private/var/folders` work either way.
 - **Not verified:** that a Desktop container reaches a tailnet `100.x`
   address while the Tailscale app runs. Phase 5 tests it first.
 
@@ -241,13 +292,34 @@ Sources: https://platform.claude.com/docs/en/about-claude/models/overview · htt
 - **Keys:** management keys can create keys with credit limits.
 - Source: https://openrouter.ai/docs
 
+**Claude Code 2.1.306 in the container (checked 2026-10-22)**
+- **Managed settings:** `/etc/claude-code/managed-settings.json` is read:
+  - its `enabledPlugins` turns guard on;
+  - its `claudeMods.guard.blockedMessage` is the message the guard test
+    sees.
+- **Plugin seeding:** at build time, `CLAUDE_CODE_PLUGIN_CACHE_DIR=/opt/claude-seed`
+  with the CLI's marketplace-add and install commands (see
+  `images/claude-executor/Dockerfile`); at run time,
+  `CLAUDE_CODE_PLUGIN_SEED_DIR`. The CLI's plugin list shows guard enabled.
+- **The init message's `plugins`** lists guard, plus the CLI's built-ins
+  `cc-plugin-sec-default`, `cc-plugin-agents-md` and
+  `cc-plugin-plugin-authoring`.
+- **`ANTHROPIC_BASE_URL` plus `ANTHROPIC_AUTH_TOKEN`** send every model
+  call to vigild's gateway. The guard test and the real-container
+  coord-loop test ran through it.
+
+**The vigil-worker App (checked 2026-10-22 with `vigil doctor`)**
+- `GET /app`, one installation, and a mint and revoke work on vigil and
+  claude-mods.
+- GitHub adds `metadata: read` to every installation token, even one asked
+  for `{"contents": "read"}` alone.
+
 ## Not yet verified (checked in the phase that needs it)
 
-- **Phase 1:** Claude Code reads managed settings from
-  `/etc/claude-code/managed-settings.json` inside the container. Phase
-  1's first container test checks it.
-- **Phase 1:** draft PRs on a private repo under your GitHub plan.
-  Phase 1's App check finds out.
+- **Phase 1:** draft PRs on a private repo through the App. The phase 1
+  PR itself is a draft on the private vigil repo, but it was opened with
+  the owner's own `gh` login, not the App; the App's first draft PR is the
+  done-when run.
 - **Phase 5:** Docker Desktop container → smokescreen → tower over
   Tailscale. Phase 5 tests this first.
 - **Phase 5:** NVML power on the RTX 5070 Ti.

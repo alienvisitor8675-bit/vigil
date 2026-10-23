@@ -1,0 +1,27 @@
+# vigild's own settings. Non-secret only: secrets live in ~/.config/vigil/env.
+data_dir: ~/vigil-data            # vigil.db, mirrors/, clones/, sessions/
+api:
+  host: 127.0.0.1
+  port: 8787
+  tailscale_host: null            # the Mac's 100.x address, to serve the API on the tailnet too
+  cookie_secure: false            # true when the UI is reached through `tailscale serve` (HTTPS)
+gateway:
+  host: 127.0.0.1                 # containers reach it as host.docker.internal (configs/egress.yaml)
+  port: 8788
+fleet_coord: claude-opus
+images:
+  claude_executor: vigil/claude-executor:2.1.306
+  egress_proxy: vigil/egress-proxy:0.1.0
+collector:
+  container: otel-collector
+  otlp_http: http://127.0.0.1:4318
+github:
+  owner: thomasbardhi01
+  claude_mods: thomasbardhi01/claude-mods
+  claude_mods_sha: c0fd9b19c4742dba84543e351a41e0faa60c84c8
+container:
+  memory: 4g
+  pids_limit: 512
+  uid: 10001
+  verifier_memory: 6g   # checkout + dependencies + a database, in tmpfs
+  verifier_concurrency: 1   # one verifier container at a time on this machine

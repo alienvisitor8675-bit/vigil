@@ -1,0 +1,114 @@
+"""Shared fixtures. No fixture holds a real secret: tokens are generated per test."""
+
+from __future__ import annotations
+
+import secrets
+import subprocess
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+
+from vigild import config as config_mod
+from vigild.api.app import create_app
+from vigild.config import Config
+from vigild.db import Store
+from vigild.jobs.service import JobService
+from vigild.services import Services, Tokens
+
+
+@pytest.fixture
+def cfg(tmp_path: Path) -> Config:
+    c = config_mod.load()
+    c.vigild.data_dir = str(tmp_path / "data")
+    return c
+
+
+@pytest.fixture
+def store() -> Store:
+    return Store.open(":memory:")
+
+
+@dataclass
+class RecordingRunner:
+    created: list[str] = field(default_factory=list)
+    approved: list[str] = field(default_factory=list)
+    resumed: list[str] = field(default_factory=list)
+    rebuilt: list[tuple[str, str]] = field(default_factory=list)
+
+    def on_job_created(self, job_id: str, needs_spec: bool) -> None:
+        self.created.append(job_id)
+
+    def on_approved(self, job_id: str) -> None:
+        self.approved.append(job_id)
+
+    def on_resume(self, job_id: str) -> None:
+        self.resumed.append(job_id)
+
+    def on_rebuild(self, repo: str, base_sha: str) -> None:
+        self.rebuilt.append((repo, base_sha))
+
+
+@pytest.fixture
+def tokens() -> Tokens:
+    return Tokens(
+        admin=secrets.token_hex(16), read=secrets.token_hex(16), heartbeat=secrets.token_hex(16)
+    )
+
+
+@pytest.fixture
+def runner() -> RecordingRunner:
+    return RecordingRunner()
+
+
+@pytest.fixture
+def services(cfg: Config, store: Store, tokens: Tokens, runner: RecordingRunner) -> Services:
+    return Services(cfg=cfg, store=store, tokens=tokens, jobs=JobService(cfg, store, runner))
+
+
+@pytest.fixture
+def client(services: Services) -> Iterator[TestClient]:
+    """The loopback listener: bearer tokens only, no UI routes."""
+    with TestClient(create_app(services)) as c:
+        yield c
+
+
+@pytest.fixture
+def ui_client(services: Services) -> Iterator[TestClient]:
+    """The Tailscale listener: the UI's cookie login as well (P7)."""
+    with TestClient(create_app(services, ui=True)) as c:
+        yield c
+
+
+def auth(token: str | None) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def git(cwd: Path, *args: str) -> str:
+    out = subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+@pytest.fixture
+def fixture_repo(tmp_path: Path) -> dict[str, Any]:
+    """A bare 'remote' standing in for GitHub, seeded with a small repo."""
+    bare = tmp_path / "remote" / "fixture.git"
+    bare.parent.mkdir(parents=True)
+    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(bare))
+    seed = tmp_path / "seed"
+    git(tmp_path, "init", "-q", "-b", "main", str(seed))
+    git(seed, "config", "user.email", "t@vigil.invalid")
+    git(seed, "config", "user.name", "t")
+    (seed / "README.md").write_text("# fixture\n")
+    (seed / "CLAUDE.md").write_text("# Fixture rules\nRun `grep` checks.\n")
+    (seed / "docs").mkdir()
+    (seed / "docs" / "feature-map.md").write_text("# Feature map\n")
+    (seed / "docs" / "runbook.md").write_text("# Runbook\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "seed")
+    git(seed, "remote", "add", "origin", str(bare))
+    git(seed, "push", "-q", "origin", "main")
+    return {"bare": bare, "seed": seed}

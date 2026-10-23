@@ -1,0 +1,390 @@
+{
+  "$defs": {
+    "Backend": {
+      "additionalProperties": false,
+      "description": "A model backend. `key_ref` names a variable in ~/.config/vigil/env.",
+      "properties": {
+        "base_url": {
+          "title": "Base Url",
+          "type": "string"
+        },
+        "key_ref": {
+          "title": "Key Ref",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/BackendKind"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        }
+      },
+      "required": [
+        "kind",
+        "base_url",
+        "key_ref"
+      ],
+      "title": "Backend",
+      "type": "object"
+    },
+    "BackendKind": {
+      "enum": [
+        "anthropic",
+        "openai_compatible",
+        "openrouter"
+      ],
+      "title": "BackendKind",
+      "type": "string"
+    },
+    "Limits": {
+      "additionalProperties": false,
+      "properties": {
+        "max_cost_usd": {
+          "default": 1.0,
+          "exclusiveMinimum": 0,
+          "title": "Max Cost Usd",
+          "type": "number"
+        },
+        "max_minutes": {
+          "default": 40,
+          "minimum": 1,
+          "title": "Max Minutes",
+          "type": "integer"
+        },
+        "max_turns": {
+          "default": 60,
+          "minimum": 1,
+          "title": "Max Turns",
+          "type": "integer"
+        }
+      },
+      "title": "Limits",
+      "type": "object"
+    },
+    "Shape": {
+      "description": "The kind of change, for the review ladder (phase 2). `deps` changes\nonly manifests and lockfiles, runs no model, starts at rung 1 and always\nneeds the owner's review (round 3).",
+      "enum": [
+        "docs",
+        "tests",
+        "feature",
+        "fix",
+        "refactor",
+        "deps"
+      ],
+      "title": "Shape",
+      "type": "string"
+    },
+    "Size": {
+      "enum": [
+        "XS",
+        "S",
+        "M",
+        "L"
+      ],
+      "title": "Size",
+      "type": "string"
+    },
+    "Source": {
+      "enum": [
+        "human",
+        "self"
+      ],
+      "title": "Source",
+      "type": "string"
+    },
+    "Spec": {
+      "additionalProperties": false,
+      "properties": {
+        "done_when": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Done When"
+        },
+        "files_in_scope": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Files In Scope",
+          "type": "array"
+        },
+        "goal": {
+          "title": "Goal",
+          "type": "string"
+        },
+        "must_fail_first": {
+          "default": true,
+          "title": "Must Fail First",
+          "type": "boolean"
+        },
+        "out_of_scope": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Out Of Scope",
+          "type": "array"
+        },
+        "test_cmd": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Test Cmd"
+        },
+        "verify": {
+          "$ref": "#/$defs/Verify"
+        }
+      },
+      "required": [
+        "goal"
+      ],
+      "title": "Spec",
+      "type": "object"
+    },
+    "Verify": {
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "default": 0,
+          "maximum": 5,
+          "minimum": 0,
+          "title": "Level",
+          "type": "integer"
+        },
+        "method": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Method"
+        }
+      },
+      "title": "Verify",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "attempt": {
+      "default": 1,
+      "minimum": 1,
+      "title": "Attempt",
+      "type": "integer"
+    },
+    "backend": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Backend"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Backend"
+    },
+    "base": {
+      "default": "main",
+      "title": "Base",
+      "type": "string"
+    },
+    "blocked_on": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Blocked On"
+    },
+    "branch": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Branch"
+    },
+    "depends_on": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Depends On",
+      "type": "array"
+    },
+    "has_existing_tests": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Has Existing Tests"
+    },
+    "job_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Job Id"
+    },
+    "labels": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Labels",
+      "type": "array"
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits"
+    },
+    "parent_task": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Parent Task"
+    },
+    "repo": {
+      "title": "Repo",
+      "type": "string"
+    },
+    "review_rounds": {
+      "default": 0,
+      "title": "Review Rounds",
+      "type": "integer"
+    },
+    "risk": {
+      "maximum": 5,
+      "minimum": 1,
+      "title": "Risk",
+      "type": "integer"
+    },
+    "shape": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Shape"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "size": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Size"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "source": {
+      "$ref": "#/$defs/Source",
+      "default": "human"
+    },
+    "spec": {
+      "$ref": "#/$defs/Spec"
+    },
+    "task_id": {
+      "title": "Task Id",
+      "type": "string"
+    },
+    "tier": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tier"
+    },
+    "tier_reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tier Reason"
+    },
+    "value": {
+      "maximum": 5,
+      "minimum": 1,
+      "title": "Value",
+      "type": "integer"
+    },
+    "why": {
+      "title": "Why",
+      "type": "string"
+    }
+  },
+  "required": [
+    "task_id",
+    "repo",
+    "why",
+    "value",
+    "risk",
+    "spec"
+  ],
+  "title": "Task",
+  "type": "object"
+}

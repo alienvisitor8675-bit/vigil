@@ -1,8 +1,8 @@
 # Runbook
 
-Operating Vigil by hand. This first version holds only **Credentials**;
-start, stop, rotate and recover sections arrive with the phases that build
-those things.
+Operating Vigil by hand. Credentials first, then starting the stack and
+the checks phase 1 needs. Stop, rotate and recover sections arrive with
+the phases that build those things.
 
 ## Credentials
 
@@ -18,119 +18,102 @@ those things.
   touch ~/.config/vigil/env && chmod 600 ~/.config/vigil/env
   ```
 
-- **vigild loads that file once at startup** and never writes it. The
-  CLI and `vigil mcp` read `VIGIL_API_TOKEN` from it too, so there is no
-  second token file.
-- **The Docker Compose stack (Langfuse and the OTel collector) reads its
-  own secrets** from the same file through `docker compose --env-file
-  ~/.config/vigil/env`. Those are the only containers that hold secrets
-  in their environment, and none of them runs agent code.
-- **No worker container gets a secret in its environment.**
-  - The executor gets its model key as a read-only file mount at
-    `/run/secrets/model_key`. The `key_ref` of the session's backend names
-    which variable vigild writes into that file.
-  - The agent's own uid can read that file. Only the guard and
-    managed-settings deny rules stop it (`docs/architecture.md` B15).
-  - A worker that needs GitHub gets a one-hour installation token, never
-    the App's private key.
-  - Langfuse keys stay in the collector.
-- **The tower holds exactly one secret**, `LLAMA_API_KEY`, in
-  `/etc/vigil/llama.env` (root, mode `600`). Its llama-server unit reads
-  that file. The Mac keeps the same value in its own env file so vigild can
-  call the server.
+- **vigild loads that file once at startup** and never writes it. It
+  refuses to start if the file is readable by anyone but you. The CLI reads
+  `VIGIL_API_TOKEN` from it too, so there is no second token file.
+- **Docker Compose (Phoenix and the OTel collector) reads its own secrets**
+  from the same file by interpolation:
+  `docker compose --env-file ~/.config/vigil/env up -d --build`. Those are
+  the only containers that hold a secret in their environment, and none of
+  them runs agent code.
+- **No worker container holds a provider key or a GitHub token.**
+  - Model calls go through vigild's gateway (P1). A session gets a
+    per-session gateway token, on its stdin, never in the environment
+    `docker inspect` shows. The token works only on the gateway, only for
+    that session's repo and model, and expires with the session; every token
+    is revoked when vigild restarts. Token-shaped strings are redacted from
+    session events.
+  - vigild pushes branches and opens PRs from the host (P2). The one-hour
+    installation token lives in vigild's memory for one publish and is
+    revoked after it.
+  - Trace-store keys stay in the collector.
+- **The tower holds exactly one secret** (phase 5), `LLAMA_API_KEY`, in
+  `/etc/vigil/llama.env` (root, mode `600`).
 - **Nothing here is ever committed.** `.env.example` at the repo root lists
   the names with no values.
 - **A Claude session (coord or worker) never reads, prints or writes any
   of these.**
   - It never opens `~/.config/vigil/` or any `.env*` file other than
-    `.env.example`.
-  - vigild checks a key only through `vigil doctor` (phase 1). That command
-    makes one health call per credential and prints `pass` or `fail` and
-    the variable name, never the value.
+    `.env.example`. The guard plugin does not protect that path by name, so
+    this rule is the session's own.
+  - Credentials are checked only by `vigil doctor` (below), which prints the
+    check's name and pass or fail, never a value.
 
 ### Variables
 
 The **Phase** column says when vigild first needs the variable. Until then
-it can be missing. A missing optional variable switches only its feature
-off, and `vigil doctor` reports which ones are off.
+it can be missing. A missing optional variable switches off only its
+feature: vigild logs `config: <feature> is off`, `/api/health` lists it in
+`degraded`, and `vigil doctor` reports it.
 
-| Variable | Purpose | Where to get it | Scope / limits | Phase | Health check (`vigil doctor`) |
+| Variable | Purpose | Where to get it | Scope / limits | Phase | `vigil doctor` |
 |---|---|---|---|---|---|
-| `ANTHROPIC_API_KEY` | Claude executor, reviewer, auditor, and the Haiku decider. | Console → org **vigil** → API keys. It already exists. | Org "vigil" only. Set a Console spend limit at or under the monthly credit ($100–200); vigild's own caps sit below it (daily $5, per task $2, monthly see `configs/budgets.yaml`). | 1 | `GET https://api.anthropic.com/v1/models` → 200 |
-| `VIGIL_GITHUB_APP_CLIENT_ID` | Identifies the vigil-worker App when vigild signs its JWT. Not secret, but kept with the key it pairs with. | GitHub → Settings → Developer settings → GitHub Apps → vigil-worker → **Client ID**. | — | 1 | `GET /app` with the JWT → 200 |
-| `VIGIL_GITHUB_APP_KEY_PATH` | Path to the App's private key, normally `~/.config/vigil/vigil-worker.pem`. | Same page → **Generate a private key**. Save the `.pem` beside the env file and `chmod 600` it. | Never mounted into any container. vigild mints per-task installation tokens from it. | 1 | same as above, plus `GET /app/installations` finds the one installation on your account, and `GET /installation/repositories` (with an installation token) lists vigil, parkagent and claude-mods |
-| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | The OTel collector sends traces to Langfuse with these (HTTP Basic auth). | Generate both yourself, e.g. `printf 'pk-lf-%s' "$(openssl rand -hex 16)"` and `printf 'sk-lf-%s' "$(openssl rand -hex 24)"`. Langfuse's headless init (`LANGFUSE_INIT_PROJECT_PUBLIC_KEY` / `_SECRET_KEY`) creates the project with them on first start. | One Langfuse project, "vigil". | 1 | `GET <langfuse>/api/public/health`, then an authenticated `GET /api/public/projects` → 200 |
-| `LANGFUSE_INIT_USER_EMAIL`, `LANGFUSE_INIT_USER_PASSWORD` | Your Langfuse login, created on first start. | Choose them. | Local only (Tailscale). | 1 | login page loads |
-| `LANGFUSE_NEXTAUTH_SECRET`, `LANGFUSE_SALT`, `LANGFUSE_ENCRYPTION_KEY`, `LANGFUSE_POSTGRES_PASSWORD`, `LANGFUSE_CLICKHOUSE_PASSWORD`, `LANGFUSE_REDIS_PASSWORD`, `LANGFUSE_MINIO_PASSWORD` | Langfuse's own internals, read only by the Compose stack. | `openssl rand -hex 32` for each. It prints 64 hex characters, which is exactly the length `LANGFUSE_ENCRYPTION_KEY` requires. | Compose services only. | 1 | Compose services healthy |
-| `CLOUDFLARE_ACCOUNT_ID` | Account for Workers AI, where the Jev decider runs (zero data retention). | Cloudflare dashboard → right sidebar of any zone or Workers page. | — | 1 (Jev; Haiku covers until then) | `POST …/ai/run` with a one-question Jev request → 200 |
-| `CLOUDFLARE_API_TOKEN` | Calls Jev on Workers AI. | Cloudflare → My Profile → API Tokens → Create Custom Token: **Account · Workers AI · Read** and **Account · Workers AI · Edit**, limited to that one account, with a TTL if you want one. | Workers AI only. | 1 (Jev) | same |
-| `OPENROUTER_API_KEY` | The OpenRouter backend preset, and Jev's alternative route. | openrouter.ai → Keys → Create key, with a **credit limit** (for example $10, monthly reset). | That key's limit only. Never used for a private repo: vigild refuses to start if `configs/repos.yaml` lists it for one. | 4 (OpenCode's second backend), or earlier if you want the preset sooner | `GET https://openrouter.ai/api/v1/key` → 200 |
-| `LLAMA_API_KEY` | llama-server's `--api-key`; vigild, the exporter scrape and OpenCode workers send it. | `openssl rand -hex 32`. Put it in **both** `~/.config/vigil/env` and the tower's `/etc/vigil/llama.env`. | Tower only, reached over Tailscale. | 5 | `GET http://<tower>:8080/health` with the key → 200 |
-| `VIGIL_API_TOKEN` | Admin bearer token for the REST API, the CLI, the MCP server and the web UI. | `openssl rand -hex 32`. The CLI and `vigil mcp` read it from this same env file. The web UI asks for it and keeps it in page memory only. | Full control of vigild. | 1 (API), 2 (CLI/MCP) | `GET /api/health` with it → 200 |
-| `VIGIL_METRICS_TOKEN` | Read-only bearer token for `/metrics` and `/api/metering`, for Hearth and Prometheus. | `openssl rand -hex 32`. Hand it to Hearth yourself. | Read-only metering. | 3 | `GET /metrics` with it → 200 |
-| `VIGIL_HEARTBEAT_TOKEN` | Lets an outside session (vigil-coord, or ParkAgent's coord if you wire it) post heartbeats for the UI's `/sessions` page. | `openssl rand -hex 32`. Give it only to sessions you want listed. | Write heartbeats; nothing else. | 3 | `POST /api/heartbeat` with it → 204 |
+| `ANTHROPIC_API_KEY` | The gateway's key for every Claude call: coord, workers, reviewer, auditor, the Haiku decider. | Console → org **vigil** → API keys. It already exists. | Org "vigil" only. Set a Console spend limit at or under the monthly credit; vigild's caps sit below it ($5/day, $2/task, $100/month, `configs/budgets.yaml`). | 1 | `GET /v1/models` → 200 |
+| `GITHUB_APP_ID` | The vigil-worker App's numeric App ID: the `iss` of its JWT. Not secret, but kept with its key. | GitHub → Settings → Developer settings → GitHub Apps → vigil-worker → **App ID**. | — | 1 | `GET /app` → slug `vigil-worker` |
+| `GITHUB_APP_KEY_PATH` | Path to the App's private key, normally `~/.config/vigil/vigil-worker.pem`. | Same page → **Generate a private key**. Save it beside the env file and `chmod 600` it. | Never mounted into any container. | 1 | one installation; mint + revoke a token per repo in `configs/repos.yaml`, and a `contents:read` one on claude-mods |
+| `PHOENIX_SECRET` | Phoenix signs its JWTs with it. | `printf 's%s' "$(openssl rand -hex 24)"` (at least 32 characters, with a digit and a lowercase letter). | Compose only. | 1 | — |
+| `PHOENIX_ADMIN_SECRET` | The collector's bearer token for Phoenix's OTLP endpoint. It acts as Phoenix's first system user. | `printf 'a%s' "$(openssl rand -hex 24)"`. It must differ from `PHOENIX_SECRET`. | Compose only: Phoenix and the collector. | 1 | Phoenix `healthz`, collector port |
+| `PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD` | Your Phoenix login (user `admin`) on first start. | Choose it. Changing it later has no effect; change the password in Phoenix. | 127.0.0.1 / `tailscale serve` only. | 1 | — |
+| `VIGIL_API_TOKEN` | Admin bearer token for the REST API and the CLI; the one-time login for the web UI. | `openssl rand -hex 32`. | Full control of vigild. | 1 | `GET /api/health` → 200 |
+| `VIGIL_METRICS_TOKEN` | Read-only token: GET endpoints, `/metrics` (phase 3), and a read-only UI login. | `openssl rand -hex 32`. Hand it to Hearth yourself. | Read only. | 1 (reads), 3 (metering) | — |
+| `VIGIL_HEARTBEAT_TOKEN` | Lets an outside session post heartbeats for the UI's `/sessions` page. | `openssl rand -hex 32`. | Write heartbeats; nothing else. | 3 | — |
+| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | Jev on Workers AI (zero retention), the default decider. Without them, Haiku decides. | Cloudflare → My Profile → API Tokens → Custom token: **Account · Workers AI · Read** and **Edit**, that one account. | Workers AI only. | 1 (optional) | reported missing |
+| `OPENROUTER_API_KEY` | The OpenRouter preset and Jev's other route. | openrouter.ai → Keys, with a **credit limit**. | Never for a private repo: vigild refuses to start if `repos.yaml` lists it for one. | 4 | — |
+| `LLAMA_API_KEY` | llama-server's `--api-key`. In **both** the env file and the tower's `/etc/vigil/llama.env`. | `openssl rand -hex 32`. | Tower only, over Tailscale. | 5 | — |
 
-Non-secret settings (hosts, ports, the tower's Tailscale name, the Langfuse
-URL) live in `configs/*.yaml`, not here.
+Non-secret settings (hosts, ports, image names, the data directory) live in
+`configs/*.yaml`, not here. Langfuse's variables are gone: Phoenix replaced
+it (`docs/architecture.md` B23). Langfuse v4 remains an option for a machine
+with about 16 GiB to spare for the Docker VM.
 
 ### The GitHub App "vigil-worker"
 
-Make it once. vigild uses it for every GitHub call a worker or reviewer
-needs, and nothing else.
+Made, installed and verified (coordinator, 2026-10-22):
+- **Installation:** one, on all eight of your repos.
+- **Permissions:** contents:write, pull_requests:write, issues:write,
+  checks:read, metadata:read, artifact_metadata:read.
 
-1. GitHub → Settings → Developer settings → GitHub Apps → **New GitHub App**.
-   - Name `vigil-worker`. Homepage: the vigil repo URL.
-   - Webhook: **off** for now (intake polls; a webhook comes later, if ever).
-   - **Repository permissions:**
-     - Contents: Read and write
-     - Pull requests: Read and write
-     - Issues: Read-only (the `vigil:ready` label intake reads issues)
-     - Metadata: Read-only (always on)
-   - Everything else: No access. In particular **no Administration, no
-     Workflows, no Secrets, no Actions write**.
-   - Where can it be installed: **Only on this account**.
-2. Create it. On its page, copy the **Client ID** into `VIGIL_GITHUB_APP_CLIENT_ID`.
-   Then **Generate a private key** and move the `.pem` to
-   `~/.config/vigil/vigil-worker.pem`, then `chmod 600` it.
-3. **Install** it (Install App → your account → Only select repositories):
-   - `thomasbardhi01/vigil`: needed from phase 1 for CI-path tests, and
-     from phase 2 for self-maintenance.
-   - `thomasbardhi01/claude-mods`: needed so the Claude executor image can
-     fetch the guard plugin. **This install is read-only in practice, not
-     by GitHub's settings.** A GitHub App has one permission set on every
-     installation, so GitHub would let this install write too. vigild
-     always mints claude-mods tokens with
-     `{"permissions": {"contents": "read"}}` and the single repository,
-     and a test asserts that no code path asks for more. If you want
-     GitHub itself to enforce read-only, make a second App
-     (`vigil-reader`, Contents: Read only) for claude-mods instead, and
-     tell coord.
-   - `thomasbardhi01/parkagent`: needed for phase 1's done-when check.
-     Coord asks you before any worker touches ParkAgent.
-4. Run `vigil doctor` (phase 1). It should find the one installation, list
-   its three repositories, and mint and then revoke one test token per repo.
+vigild narrows that in code (`vigild/github/app.py`, ADR-0001):
+- **Repos:** it mints only for repos in `configs/repos.yaml`, plus
+  claude-mods, and every claude-mods token is `{"contents": "read"}`. The
+  App's installations on your other repos, including private ones like
+  hearth, are never used.
+- **Permissions:** each token is one repo, one hour, and only what its use
+  needs.
+  - Publishing a branch: contents:write and pull_requests:write.
+  - Refreshing a mirror: contents:read (no host git credentials are ever
+    used).
+  - Checking a repo's visibility at start: metadata:read.
+  - Label intake (phase 2): issues:read.
+- **Revoked:** after every use. Anything GitHub grants beyond what was
+  asked (other than the metadata:read it always adds) makes vigild revoke
+  the token and refuse.
+- **Never in a container:** no token ever enters one (P2).
 
-How tokens are used:
-- **One token per task**, for that task's repository only, valid for one
-  hour and revoked (`DELETE /installation/token`) when the container exits.
-- **A token never enters an environment variable.** It sits in a tmpfs
-  file that a `git credential` helper reads.
-- **claude-mods tokens exist only during an image build.** They are passed
-  as a BuildKit secret, so they never land in an image layer.
+One App per role is deferred: ADR-0001 says when it changes.
 
 ### Ruleset on `main` (every target repo)
 
-The App can't merge, approve or push to `main`, and GitHub enforces each of
-those. Every repo the fleet works in needs a `main` ruleset that does
-these things:
+Every repo the fleet works in needs a `main` ruleset that:
 - requires a pull request;
 - blocks force pushes and deletion;
-- requires the CI checks (for vigil, the command is in the phase 1 PR);
+- requires the CI checks (for vigil: `lint`, `types`, `test`; the command
+  is in the phase 1 PR);
 - has **no bypass actor** that includes the App.
 
 ### What a Claude session never does here
 
-Coord and the workers never run any of these:
+Coord and the workers never:
 - create, read, print, store or commit a secret;
 - open `~/.config/vigil/`;
 - run `gh secret set`;
@@ -139,3 +122,131 @@ Coord and the workers never run any of these:
 
 When a phase needs a credential, coord stops, posts these steps in the
 status issue (#1), and waits for you.
+
+## Running phase 1
+
+### Docker Desktop on this Mac
+
+- 4.94 with a 12 GiB VM. That fits Phoenix (2 GiB cap), the collector
+  (256 MiB), and the sessions (4 GiB cap each, plus a 128 MiB proxy).
+- **Setup step: if you keep checkouts in `~/Documents`, grant Docker
+  access to it** (System Settings → Privacy & Security → Files and Folders
+  → Docker → Documents). Without that grant, a bind mount from there hangs
+  `docker start` until Docker Desktop restarts. Done on this Mac.
+- Even so, nothing vigil runs bind-mounts from the repo: the collector's
+  config is baked into its image, and vigild's data (`~/vigil-data`: clones,
+  session files) lives outside the checkout.
+- The CLI is at `~/.docker/bin/docker`. Put it on `PATH` for launchd jobs.
+
+### Build the images
+
+```sh
+uv run python scripts/build-images.py --claude-mods-repo <a local claude-mods checkout>
+```
+
+It builds:
+- `vigil/egress-proxy:0.1.0`: smokescreen, checked against the release's
+  SHA-256;
+- `vigil/claude-executor:2.1.306`: guard@claude-mods is seeded from a
+  `git archive` of the pinned SHA, so no token is needed.
+
+### Start the trace stack
+
+```sh
+docker compose --env-file ~/.config/vigil/env up -d --build
+```
+
+- Phoenix is at http://127.0.0.1:6006. Log in as `admin` with
+  `PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD`. For the tailnet:
+  `tailscale serve --bg --https=6443 http://127.0.0.1:6006`.
+- The collector listens on 127.0.0.1:4318 for vigild's own spans.
+- vigild attaches the collector to each session's network as
+  `otel-collector`.
+
+### Dev images
+
+Each repo's tests run only in its own dev image (`images/dev/<repo>.Dockerfile`,
+named in `configs/repos.yaml`). **vigild builds and validates it itself**,
+when the repo's lockfiles change at the base commit (the first job after a
+lockfile change waits for it; ParkAgent's takes about 3 minutes cold and is
+about 3.8 GB): the build installs from the lockfiles, with the network; the
+validation runs every suite in `dev_suites` on a clean checkout, in the
+image, with no network. There is no timer and no launchd job.
+
+- **When it fails**, every session for that repo is refused and the inbox
+  gets one item per image saying what failed (the build's tail, or each
+  suite's outcome and tail), with **Rebuild** and **Dismiss**. Fix the cause
+  (often the Dockerfile or the suite command in `repos.yaml`, through a
+  PR), then press Rebuild, then retry the blocked job from its own item.
+- **By hand**, the same build and validation at the base branch's tip:
+
+  ```sh
+  uv run python cli/vigil dev-image --repo thomasbardhi01/vigil
+  uv run python cli/vigil dev-image --repo thomasbardhi01/vigil --rebuild
+  ```
+
+- **Session images.** A repo's coord and worker sessions run in its session
+  image: the executor layer (`images/claude-executor/Dockerfile`) built over
+  its dev image, so workers can run the real suite offline. vigild builds it
+  right after the dev image, and rebuilds it when the dev image or the layer
+  changes (ParkAgent's: about 4.8 GB, the layer about 25 s with a warm build
+  cache). It fails, pages and rebuilds like a dev image. The generic
+  `vigil/claude-executor` image (`scripts/build-images.py`) is the same layer
+  over the pinned Python base; the security tests run against all three.
+- **Test commands** must run pytest or vitest (directly, or through a pnpm
+  script, optionally after `cd` or with `-C`): the verifier judges by their
+  JUnit report, and the spec gate refuses anything else (`--filter`, npm and
+  yarn scripts included). Verifier containers run one at a time
+  (`container.verifier_concurrency` in `configs/vigild.yaml`); raise it only
+  if the Docker VM has the memory (6 GiB each, plus tmpfs).
+- **A task that needs a dependency** blocks with an inbox item listing the
+  packages and the worker's manifest and lockfile diff. Until phase 2's deps
+  job exists, make the dependency change yourself in its own PR (manifest and
+  lockfile only), let it merge, then press **Retry** on the item: the new
+  base changes the dev image key, so vigild builds the new image first.
+- `dev_image_tools` is what a `test_cmd` may use; the spec gate refuses a
+  test that needs anything else. `dev_excluded` says which suites can't run
+  in a Linux container and why: for ParkAgent, the iOS app (Xcode).
+- Builds take Debian packages from `snapshot.debian.org` as of 2026-10-08
+  (the pin rule), which is slow, not broken.
+
+### Check everything
+
+```sh
+uv run python cli/vigil doctor
+```
+
+It prints one `pass`, `fail` or `skip` line per check, never a value. Add
+`--repo <owner/name>` to limit the token checks to some repos.
+
+### Start vigild
+
+```sh
+uv run python -m vigild
+```
+
+- **At start** vigild:
+  - reads each repo's real visibility through the App. It refuses to start
+    if `configs/repos.yaml` says public for a repo that is private, or if it
+    can't check (so the App must be configured). A repo the YAML keeps
+    private that is public on GitHub only logs a warning: the YAML's stricter
+    rule stays in force;
+  - migrates an older `vigil.db` in place (`PRAGMA user_version`);
+  - reconciles anything a previous run left behind: tokens revoked, session
+    containers removed, reservations settled, mid-flight jobs blocked with a
+    page in the inbox (retry, re-plan or abandon), a draft whose coord died
+    paged (retry or cancel);
+  - starts approved builds that never began, once the gateway is listening.
+- **When a worker fails**, its job is blocked after its wave with one inbox
+  item: **Retry** runs the failed tasks again on what's left of each task's
+  cap (offered only when there is at least $0.05 left), **Re-plan** sends
+  the job back to its coord with the failures, **Abandon** ends it (any open
+  PRs stay for you to close).
+- The API is at 127.0.0.1:8787, bearer tokens only (the CLI and MCP).
+- The web UI's login exists only on the Mac's Tailscale address
+  (`api.tailscale_host`; unset means no UI login). Behind `tailscale serve`
+  (HTTPS) the session cookie is `Secure` automatically.
+- The gateway is at 127.0.0.1:8788. Containers reach it as
+  `host.docker.internal:8788` through their proxy; Docker Desktop forwards
+  that to the Mac's loopback.
+- Running it under launchd arrives with phase 2, together with the CLI.
