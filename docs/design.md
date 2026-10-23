@@ -505,7 +505,7 @@ How Vigil gets better from its own jobs.
   - **The flow:** a telemetry bundle from the Phoenix spans → a structured diagnosis (anchor, primary cause, behavioural mistake, evidence, bounded confidence) → a gated hint.
   - **Gates on hints:** every hint target traces to evidence. A hint has a target, an operation, a verification signal and a boundary. An infrastructure failure is never turned into a corrective hint.
   - **What it stores:** a recovery playbook and an eval case. Where the cause was a wrong assumption, it also proposes a product-model PR.
-  - **When it runs:** nothing opens an incident automatically. A post-merge regression opens an inbox item with a proposed fix job, and an incident runs when the owner starts one.
+  - **When it runs:** only when the owner starts an incident from an inbox item. Nothing opens an incident automatically; a post-merge regression opens an inbox item with a proposed fix job.
 - **Outer, weekly and per release: replay, which is now phase 7 "Eval"** ("Eval protocol").
   - **What it does:** replays closed jobs and synthesized hard tasks against the current harness, with Opus and the best local model.
   - **What it produces:** **evidence rows only**. Trust-ladder promotion stays on the audit path.
@@ -545,6 +545,7 @@ How Vigil gets better from its own jobs.
 - **The worker's own claim** is logged at zero weight.
 - **The reward's inputs** are hashed onto the Phoenix span.
 - **Who sees `reward.json`.** Reviewers never see it. The auditor sees it only after its own audit is recorded, and the audit's missed rate is computed before that.
+- **What `reward.json` is for.** It is finalised after the audit and is **never an input to any decision about the job itself**. It feeds only the job's learning record and the ladder.
 - **Audit samples.** Top-reward jobs are a **separate audit sample**. The ladder's statistics come from the random sample only. Reward–audit agreement is tracked per component, and a component below its threshold is frozen out of the reward until it is recalibrated.
 
 **Hidden tests.**
@@ -621,7 +622,10 @@ Metrics, in priority order:
 - **Every tool named here is planned, not adopted:** mutmut, Stryker, cargo-mutants, SWE-smith, Change2Task, GEPA/DSPy. When one is adopted, its PR gives it an exact pin at least two weeks old, recorded in `docs/sources.md`, and a one-line reason (the no-new-dependency rule).
 
 **The epic.** It sits after phase 5 (feature map "Learning"). Its first three items run on data from the first ParkAgent run. They run only through vigild, after the owner confirms, and each has its own budget line; no session touches ParkAgent directly.
-1. **Hidden-test validity (#9).** For 20 closed ParkAgent jobs, a fresh Opus session generates hidden tests from the spec plus the product model, and they run against the merged fix.
+1. **Hidden-test validity (#9).** It uses 20 of ParkAgent's past merged PRs, not vigild-run jobs. For each PR:
+   - a fresh session writes the spec from the PR's issue and description, without seeing the diff;
+   - a second fresh Opus session writes hidden tests from that spec plus the product model;
+   - they run against the merged commit.
    - **The metric** is unfiltered: all generated tests. "Fails on base" is reported separately and never filters it.
    - **Below ~80% pass,** the spec stage is the bottleneck and nothing else proceeds first.
 2. **Reward validity (#10).** Compute the full reward on 30 merged and 30 rejected historical PRs. Report each component's AUROC against the human outcome, and drop components under ~0.7.
@@ -654,7 +658,9 @@ Metrics, in priority order:
 22. #11 blocks on phases 4 and 5; ParkAgent gets a local backend when phase 5 lands.
 
 Also decided:
-- **#9:** the metric stays unfiltered, and fails-on-base is reported separately.
+- **#9:** the metric stays unfiltered, and fails-on-base is reported separately. It uses ParkAgent's past merged PRs. A fresh session writes each spec from the PR's issue and description without the diff, and a second fresh session writes the hidden tests from that spec plus the product model.
+- **The middle loop** runs only when the owner starts an incident from an inbox item.
+- **`reward.json`** is finalised after the audit and is never an input to any decision about the job itself. It feeds only the learning record and the ladder.
 - **#8:** it draws more than 50 tasks; tasks 1–50 are the anchor, and tuning uses tasks 51 onward.
 
 ## Tower: local model serving
