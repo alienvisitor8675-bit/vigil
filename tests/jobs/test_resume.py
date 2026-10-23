@@ -160,3 +160,31 @@ def test_a_replan_resumes_the_coord(world: World) -> None:
     assert first.resume is None
     assert second.resume is not None and second.resume.from_session == first.session_id
     assert "outside scope" in second.packet  # the failure, in the new packet
+
+
+def test_a_second_crash_resumes_with_both_sessions_context_and_turns(world: World) -> None:
+    """2a round 2, review B9: a resumed session's stored transcript carries
+    the history it forked (seen live: the second session's store held the
+    first's words), so a second resume keeps the first session's context, and
+    its turn cap is what's left after both."""
+    w = world
+    real = w.standin.run
+    kills: list[str] = []
+
+    def run(spec: SessionSpec, token: str, on_event: EventSink) -> ExecOutcome:
+        if spec.role is Role.WORKER and str(spec.task_id).endswith("w1") and len(kills) < 2:
+            kills.append(spec.session_id)
+            w.standin.specs.append(spec)
+            on_event({"type": "transcript", "data": transcript_lines(spec)})
+            return ExecOutcome("failed", 137, {}, "killed")
+        return real(spec, token, on_event)
+
+    w.standin.run = run  # type: ignore[method-assign]
+    w.runner.cfg.vigild.scheduler.resume_attempts = 3
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "ready"
+    first, second, third = _workers(w, "w1")
+    assert third.resume is not None and third.resume.from_session == second.session_id
+    uuids = {e.get("uuid") for e in third.resume.entries}
+    assert f"a-{first.session_id}" in uuids and f"a-{second.session_id}" in uuids
+    assert third.max_turns == 60 - 2

@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any
 
 WORK = Path("/work")
+HOOK_DIR = Path(os.environ.get("VIGIL_HOOK_DIR", "/run/vigil"))  # root-owned tmpfs (A6)
 PACKET = Path("/vigil/packet.md")
 OUT = Path("/vigil/out")
 AGENT_CLI = "/opt/vigil/agent-cli"  # setpriv down to the agent uid, then the CLI
@@ -372,6 +373,30 @@ def place_resume() -> str | None:
     return sid
 
 
+def _write_read_only(path: Path, doc: dict[str, Any]) -> None:
+    """Replace a file the agent uid can read and nobody but root can write."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(doc))
+    tmp.chmod(0o444)
+    os.replace(tmp, path)
+
+
+def write_hook_inputs(hook_dir: Path, task: dict[str, Any], *, max_turns: int) -> None:
+    """The Stop hook's inputs, from the task vigild wrote before the agent
+    ran, into the root-owned hook dir (review A6): the hook never reads what
+    the agent can rewrite in /work."""
+    _write_read_only(hook_dir / "task.json", {
+        "job_id": task.get("job_id"), "task_id": task.get("task_id"),
+        "test_cmd": str((task.get("spec") or {}).get("test_cmd") or ""),
+        "max_turns": max_turns,
+    })  # fmt: skip
+
+
+def write_stop_blocks(hook_dir: Path, blocks: int) -> None:
+    """The harness keeps the count of blocked stops (review A6, B12)."""
+    _write_read_only(hook_dir / "stop.json", {"blocks": blocks})
+
+
 def stop_hook_event(name: str, subtype: str, data: dict[str, Any]) -> dict[str, Any] | None:
     """A Stop hook's answer as a vigil event (item 6): whether it sent the
     model back, its reason, and whether it let the stop through exhausted."""
@@ -460,6 +485,8 @@ async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
                 result["stop_hook_blocks"] = result.get("stop_hook_blocks", 0) + int(
                     ev["data"]["blocked"]
                 )
+                if ev["data"]["blocked"] and role == "worker" and HOOK_DIR.is_dir():
+                    write_stop_blocks(HOOK_DIR, result["stop_hook_blocks"])
                 if ev["data"]["exhausted"]:
                     result["stop_hook_exhausted"] = True
             continue
@@ -556,6 +583,11 @@ def main() -> int:
     try:
         prepare_session()
         place_resume()
+        if role == "worker" and HOOK_DIR.is_dir():
+            write_hook_inputs(
+                HOOK_DIR, task, max_turns=int(os.environ.get("VIGIL_MAX_TURNS", "60"))
+            )
+            write_stop_blocks(HOOK_DIR, 0)
     except HarnessRefused as e:
         emit("vigil_result", {"status": "failed", "error": f"harness: {e}"})
         return 6

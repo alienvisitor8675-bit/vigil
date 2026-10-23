@@ -29,6 +29,7 @@ from vigild.verifier import MAX_REPORT, REPORT_DIR, RunResult
 LABEL = "dev.vigil.session"
 OUTPUT_SCHEMA = "/vigil/output_schema.json"
 RESUME = "/vigil/resume.jsonl"
+HOOK_DIR = "/run/vigil"  # root-owned tmpfs: the Stop hook's inputs (2a round 2, A6/B12)
 HARNESS_CAPS = ("SETUID", "SETGID", "KILL")
 
 
@@ -69,6 +70,7 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         "VIGIL_REQUIRE_PLUGIN": "guard",
         "VIGIL_AGENT_UID": str(uid),
         "VIGIL_CHECKPOINT_SECONDS": str(cfg.vigild.scheduler.checkpoint_seconds),
+        "VIGIL_HOOK_DIR": HOOK_DIR,
         "PYTHONDONTWRITEBYTECODE": "1",  # no __pycache__ in the worker's tree (round 4)
         "HTTP_PROXY": proxy,
         "HTTPS_PROXY": proxy,
@@ -109,7 +111,11 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         "network": network,
         "environment": env,
         "mounts": mounts,
-        "tmpfs": {"/tmp": f"rw,size=1g,uid={uid},gid={uid},mode=1777"},  # noqa: S108
+        "tmpfs": {
+            "/tmp": f"rw,size=1g,uid={uid},gid={uid},mode=1777",  # noqa: S108
+            # the Stop hook's inputs, the harness's to write (2a round 2, A6/B12)
+            HOOK_DIR: "rw,size=1m,uid=0,gid=0,mode=0755",
+        },
         "stdin_open": True,
         "labels": {LABEL: spec.session_id, "dev.vigil.role": spec.role.value},
         "working_dir": "/work",

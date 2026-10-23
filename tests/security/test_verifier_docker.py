@@ -133,3 +133,15 @@ def test_the_test_cannot_read_the_scripts_memory(
     lines = r.output.splitlines()
     assert lines[:2] == ["10001", "0"], r.output
     assert "MEM=refused" in r.output and "MEM=open" not in r.output
+
+
+def test_the_report_dir_is_made_by_the_agent_uid_not_root(
+    runner: DockerTestRunner, cfg: Config, source: Path
+) -> None:
+    """2a round 2 (review A, untested): the script's `mkdir` of the report dir
+    runs as the agent uid; made by root, the test couldn't write its report."""
+    from vigild.verifier import REPORT_DIR
+
+    r = _run(runner, cfg, source, f"stat -c %u {REPORT_DIR}")
+    assert r.exit == 0, r.output
+    assert r.output.splitlines()[0] == "10001", r.output

@@ -3,19 +3,38 @@ settings. The CLI runs it, as the agent uid, whenever the model tries to end
 the session; a `{"decision": "block", "reason": ...}` answer sends the model
 back with the reason in its transcript.
 
+**It is advisory.** It saves turns by catching a stop that would fail, but it
+decides nothing about acceptance: the verifier, on vault commits in fresh
+containers, is the only source of test results (B33). The agent can write
+what the hook reads from the workspace (the report, `ask_coord.json`) and the
+transcript the CLI writes as it; at worst that lets it stop early, and the
+verifier still judges the work.
+
 A worker may stop only when:
 - `.vigil/<job>/<task>/worker_report.json` exists and is valid against the
   worker-report schema (baked into the layer), and
-- the task's `test_cmd`, run here and now with a timeout, passes. No marker
-  file is trusted: the hook runs the test itself.
+- the task's `test_cmd`, run here and now with a timeout, passes. The hook
+  runs the test itself.
 
-A worker that asks its coord (`ask_coord.json`) or reports `needs_deps` may
-stop without a green test. The hook lets the stop through on the task's last
-turn (a block there only ends in the max-turns error), or after three
-blocked stops, and says `stop_hook_exhausted`, which the harness puts on
-the result. It decides nothing about acceptance: the verifier stays the
-only source of test results (B33). Coords, reviewers and auditors are never
-held.
+What it decides with comes from the harness, not the workspace (2a round 2,
+review A6): before the agent starts, the root harness writes the job and task
+ids, `test_cmd` and the turn limit to `/run/vigil/task.json`, in a root-owned
+tmpfs the agent uid can read but not write; it keeps the count of blocked
+stops in `/run/vigil/stop.json` from the hook events it sees. The hook never
+writes state of its own.
+
+**Turns** (review B9): vigild passes this session's remainder of the task's
+turn cap (`VIGIL_MAX_TURNS`), and the hook counts this session's model
+requests only: the CLI writes an `api-request` line per request before the
+hook runs, and a resumed transcript (copied in from vigild's store) carries
+none. A resumed worker at 40 of 60 turns gets about 20 more, checked.
+
+A worker that asks its coord or reports `needs_deps` may stop without a green
+test. A failing stop is let through on the session's last turn (a block there
+only ends in the CLI's max-turns error, which loses the result) or after
+three blocked stops, and says `stop_hook_exhausted`, which the harness puts on
+the result; a stop whose checks pass is never flagged. Coords, reviewers and
+auditors are never held.
 """
 
 from __future__ import annotations
@@ -28,7 +47,7 @@ from pathlib import Path
 from typing import Any
 
 WORK = Path(os.environ.get("VIGIL_WORK", "/work"))
-STATE = Path(os.environ.get("VIGIL_STOP_STATE", "/tmp/vigil-stop-hook.json"))  # noqa: S108
+HOOK_DIR = Path(os.environ.get("VIGIL_HOOK_DIR", "/run/vigil"))  # the harness's, read-only here
 SCHEMA = Path(os.environ.get("VIGIL_REPORT_SCHEMA", "/opt/vigil/worker_report.schema.json"))
 MAX_BLOCKS = 3
 TIMEOUT = int(os.environ.get("VIGIL_STOP_HOOK_TIMEOUT", "600"))
@@ -41,40 +60,36 @@ def allow(note: str = "") -> int:
     return 0
 
 
-def block(reason: str, state: dict[str, Any]) -> int:
-    state["blocks"] = int(state.get("blocks", 0)) + 1
-    STATE.write_text(json.dumps(state))
+def block(reason: str) -> int:
     print(json.dumps({"decision": "block", "reason": f"vigil stop hook: {reason}"}))
     return 0
 
 
+def _read(path: Path) -> dict[str, Any]:
+    try:
+        doc = json.loads(path.read_text())
+    except OSError, json.JSONDecodeError:
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
 def turns_used(transcript: str | None) -> int:
-    """The session's turns so far, from its own transcript: its assistant
-    messages, or its model requests if that is more. CLI 2.1.306 writes the
-    turn's assistant entry only after the Stop hook runs, but its `api-request`
-    line before (seen live). A side request counted too only releases the
-    hook a turn early; the verifier decides acceptance either way."""
+    """This session's turns so far: its `api-request` lines (see the module
+    docstring). A transcript the hook can't read counts none."""
     if not transcript:
         return 0
-    ids: set[str] = set()
-    requests = 0
     try:
         lines = Path(transcript).read_text(errors="replace").splitlines()
     except OSError:
         return 0
+    n = 0
     for line in lines:
         try:
             e = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(e, dict):
-            continue
-        if e.get("type") == "assistant":
-            msg = e.get("message") or {}
-            ids.add(str(msg.get("id") or e.get("uuid")))
-        elif e.get("type") == "api-request":
-            requests += 1
-    return max(len(ids), requests)
+        n += isinstance(e, dict) and e.get("type") == "api-request"
+    return n
 
 
 TYPES: dict[str, Any] = {
@@ -138,40 +153,20 @@ def report_errors(path: Path) -> list[str]:
     return [f"{rel} is invalid: " + "; ".join(errs[:10])] if errs else []
 
 
-def main() -> int:
-    try:
-        hook = json.loads(sys.stdin.read() or "{}")
-    except json.JSONDecodeError:
-        hook = {}
-    if os.environ.get("VIGIL_ROLE", "worker") != "worker":
-        return allow()
-    try:
-        state = json.loads(STATE.read_text())
-    except OSError, json.JSONDecodeError:
-        state = {}
-    if int(state.get("blocks", 0)) >= MAX_BLOCKS:
-        return allow(f"vigil: stop allowed after {MAX_BLOCKS} blocked stops (stop_hook_exhausted)")
-    limit = int(os.environ.get("VIGIL_MAX_TURNS", "60"))
-    # a block buys one more turn; on the last one it only ends in the CLI's
-    # max-turns error, and the session's result is lost
-    if turns_used(hook.get("transcript_path")) + 1 >= limit:
-        return allow(f"vigil: stop allowed on the last turn of {limit} (stop_hook_exhausted)")
-    try:
-        task = json.loads((WORK / ".vigil" / "task.json").read_text())
-    except OSError, json.JSONDecodeError:
-        return allow()  # not a task vigild set up: nothing to hold it to
+def failed_check(task: dict[str, Any]) -> str | None:
+    """Why this stop would fail, or None when the worker may stop."""
     art = WORK / ".vigil" / str(task.get("job_id")) / str(task.get("task_id"))
     if (art / "ask_coord.json").is_file():
-        return allow()  # a question for the coord ends the session by design
+        return None  # a question for the coord ends the session by design
     errors = report_errors(art / "worker_report.json")
     if errors:
-        return block("; ".join(errors), state)
+        return "; ".join(errors)
     report = json.loads((art / "worker_report.json").read_text())
     if report.get("needs_deps"):
-        return allow()  # the test can't pass without the dependency; vigild takes it from here
-    test_cmd = str((task.get("spec") or {}).get("test_cmd") or "").strip()
+        return None  # the test can't pass without the dependency; vigild takes it from here
+    test_cmd = str(task.get("test_cmd") or "").strip()
     if not test_cmd:
-        return allow()
+        return None
     try:
         p = subprocess.run(
             ["bash", "-o", "pipefail", "-o", "errexit", "-c", test_cmd],
@@ -183,15 +178,38 @@ def main() -> int:
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return block(f"`{test_cmd}` took over {TIMEOUT} s; make it pass, then stop", state)
+        return f"`{test_cmd}` took over {TIMEOUT} s; make it pass, then stop"
     if p.returncode != 0:
         tail = (p.stdout + p.stderr)[-TAIL:]
-        return block(
+        return (
             f"`{test_cmd}` is red (exit {p.returncode}). Fix the code (never the test) until it "
-            f"passes, update your report, commit, then stop. Its output:\n{tail}",
-            state,
+            f"passes, update your report, commit, then stop. Its output:\n{tail}"
         )
-    return allow()
+    return None
+
+
+def main() -> int:
+    try:
+        hook = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        hook = {}
+    if os.environ.get("VIGIL_ROLE", "worker") != "worker":
+        return allow()
+    task = _read(HOOK_DIR / "task.json")
+    if not task.get("task_id"):
+        return allow()  # not a task the harness set up: nothing to hold it to
+    why = failed_check(task)
+    if why is None:
+        return allow()
+    blocks = int(_read(HOOK_DIR / "stop.json").get("blocks") or 0)
+    if blocks >= MAX_BLOCKS:
+        return allow(f"vigil: stop allowed after {MAX_BLOCKS} blocked stops (stop_hook_exhausted)")
+    limit = int(task.get("max_turns") or os.environ.get("VIGIL_MAX_TURNS") or 60)
+    # a block buys one more turn; on the last one it only ends in the CLI's
+    # max-turns error, and the session's result is lost
+    if turns_used(hook.get("transcript_path")) + 1 >= limit:
+        return allow(f"vigil: stop allowed on the last turn of {limit} (stop_hook_exhausted)")
+    return block(why)
 
 
 if __name__ == "__main__":

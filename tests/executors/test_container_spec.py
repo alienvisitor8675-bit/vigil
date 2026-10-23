@@ -51,7 +51,7 @@ def test_hardening_flags(cfg: Config, spec: SessionSpec) -> None:
     assert "no-new-privileges" in kw["security_opt"]
     assert kw["pids_limit"] == 512
     assert kw["mem_limit"] == "4g"
-    assert set(kw["tmpfs"]) == {"/tmp"}
+    assert set(kw["tmpfs"]) == {"/tmp", "/run/vigil"}
     assert kw["network"] == "vigil-s-abc123"
     assert kw["stdin_open"] is True and kw["privileged"] is False
 
@@ -155,6 +155,7 @@ def test_the_verifier_container_has_no_network_and_a_read_only_checkout(
     assert f'{drop} bash -o pipefail -o errexit -c "$0"' in PREPARE
     assert f"{drop} /usr/local/bin/vigil-prepare" in PREPARE
     assert f"{drop} cp -a /src/. /work/" in PREPARE
+    assert f"{drop} mkdir -p /tmp/vigil-report" in PREPARE  # never root (2a round 2)
     assert '[ -f "$f" ] && [ ! -L "$f" ]' in PREPARE  # root never follows a planted link
     assert kw["environment"]["PYTEST_ADDOPTS"].startswith("--junitxml=/tmp/vigil-report/")
     assert kw["mem_limit"] == cfg.vigild.container.verifier_memory
@@ -337,3 +338,14 @@ def test_a_finished_log_stream_is_closed(cfg: Config, tmp_path: Path) -> None:
 
     DockerTestRunner(cfg, Client()).run("img", tmp_path, "true", timeout_s=5, max_output=1000)
     assert closed == [True, True]  # the attach response, then the log stream
+
+
+def test_the_stop_hooks_inputs_live_in_a_root_owned_tmpfs(cfg: Config, spec: SessionSpec) -> None:
+    """2a round 2, review A6/B12: the harness writes the hook's inputs and
+    block count where the agent uid can read but not write or rename."""
+    from vigild.executors.runtime import HOOK_DIR
+
+    kw = worker_kwargs(cfg, spec, network="n")
+    opts = kw["tmpfs"][HOOK_DIR]
+    assert HOOK_DIR == "/run/vigil" and "uid=0" in opts and "mode=0755" in opts
+    assert kw["environment"]["VIGIL_HOOK_DIR"] == HOOK_DIR
