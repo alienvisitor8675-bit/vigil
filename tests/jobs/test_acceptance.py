@@ -265,3 +265,56 @@ def test_repo_runner_config_covers_the_round4_gaps() -> None:
         "server/test/setup/reasonsGate.ts",
     ):
         assert in_scope(f, pa), f
+
+
+# --- phase 1 run, finding #2: a runner-file task passes only on its hidden tests -------------
+
+FLAGGED = {**TESTS_OK, "runner_files": ["conftest.py"], "runner_file_changed": True}
+HIDDEN_OK = {"ok": True, "files": 1, "failed_on_base": True, "passed_on_head": True}
+
+
+def test_an_unflagged_task_needs_no_hidden_tests(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _result(ws, tmp_path)
+    assert _check(ws, base, head, tests={**TESTS_OK, "runner_files": []}) == []
+
+
+def test_visible_tests_are_not_enough_for_a_runner_file_task(ws: Workspace, tmp_path: Path) -> None:
+    from vigild.jobs.acceptance import escalates
+
+    base, head = _result(ws, tmp_path)
+    errors = _check(ws, base, head, tests=FLAGGED)  # visible: fail then pass; no hidden record
+    assert any("no hidden tests" in e for e in errors), errors
+    assert escalates(FLAGGED)
+    absent = {**FLAGGED, "hidden": {"present": False, "reason": "no session"}}
+    assert escalates(absent) and _check(ws, base, head, tests=absent)
+
+
+def test_hidden_tests_that_pass_let_a_runner_file_task_pass(ws: Workspace, tmp_path: Path) -> None:
+    from vigild.jobs.acceptance import escalates
+
+    base, head = _result(ws, tmp_path)
+    ok = {**FLAGGED, "hidden": HIDDEN_OK}
+    assert _check(ws, base, head, tests=ok) == []
+    assert not escalates(ok)
+
+
+@pytest.mark.parametrize(
+    ("hidden", "want"),
+    [
+        ({**HIDDEN_OK, "passed_on_head": False, "ok": False}, "pass on the head"),
+        ({**HIDDEN_OK, "failed_on_base": False, "ok": False}, "fail on the base"),
+        ({**HIDDEN_OK, "tampered": ["x"], "ok": False}, "hidden directory"),
+        ({**HIDDEN_OK, "ran": {"checked": True, "ok": False}, "ok": False}, "head ran less"),
+    ],
+)
+def test_failing_hidden_tests_reject_a_task_whose_visible_tests_pass(
+    ws: Workspace, tmp_path: Path, hidden: dict[str, Any], want: str
+) -> None:
+    from vigild.jobs.acceptance import escalates
+
+    base, head = _result(ws, tmp_path)
+    errors = _check(ws, base, head, tests={**FLAGGED, "hidden": hidden})
+    assert any(want in e for e in errors), errors
+    assert not escalates({**FLAGGED, "hidden": hidden})  # they exist; the task just fails
+    # and the failure names no hidden test: it can reach the coord's replan context
+    assert "test_hidden" not in " ".join(errors)

@@ -39,6 +39,40 @@ def weakened_tests(ws: Workspace, repo: str, base_sha: str, head: str) -> list[s
     return out
 
 
+NO_HIDDEN = "runner file task: no hidden tests, so it cannot pass"
+
+
+def escalates(tests: dict[str, Any] | None) -> bool:
+    """A runner-file task whose hidden tests don't exist: it is built and
+    reported, never accepted; the owner decides (owner ruling, 2026-10-23)."""
+    if not tests or not tests.get("runner_files"):
+        return False
+    return not (tests.get("hidden") or {}).get("files")
+
+
+def hidden_errors(tests: dict[str, Any]) -> list[str]:
+    """For a task whose scope names a runner file, the hidden tests decide:
+    they failed on the base, pass on the head, head ran no fewer. The messages
+    carry counts and reasons, never a test's name or output: they reach the
+    owner's page and a re-plan's context."""
+    if not tests.get("runner_files"):
+        return []
+    hidden = tests.get("hidden") or {}
+    if escalates(tests):
+        return [f"{NO_HIDDEN}: {hidden.get('reason') or 'none were written'}"]
+    errors: list[str] = []
+    if hidden.get("tampered"):
+        errors.append("the branch has files in the hidden directory; hidden tests didn't run")
+    elif not hidden.get("failed_on_base"):
+        errors.append("hidden tests must fail on the base; they didn't")
+    if not hidden.get("tampered") and not hidden.get("passed_on_head"):
+        errors.append("hidden tests must pass on the head; they didn't")
+    ran = hidden.get("ran") or {}
+    if ran.get("checked") and not ran.get("ok"):
+        errors.append("head ran less than base in the hidden tests' own run")
+    return errors
+
+
 def check_tests(spec: dict[str, Any], tests: dict[str, Any] | None) -> list[str]:
     if not str(spec.get("test_cmd") or "").strip():
         return ["the contract has no test_cmd, so nothing can be accepted"]
@@ -74,7 +108,7 @@ def check_tests(spec: dict[str, Any], tests: dict[str, Any] | None) -> list[str]
             f"missing ids {ran.get('missing_ids')}, missing files {ran.get('missing_files')}, "
             f"skipped {ran.get('skipped')}, xfail {ran.get('xfail')}"
         )
-    return errors
+    return [*errors, *hidden_errors(tests)]
 
 
 def runner_config_changes(
