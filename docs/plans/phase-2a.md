@@ -299,6 +299,55 @@ gets its own plan file and done-when.
     `circuit.py` (Apache-2.0), and list any invariant vigil is missing.
   - Take ideas only, and copy no code. Any adapted text goes in
     `docs/sources.md` with its licence.
+- **Token efficiency** (owner, 2026-10-23). The order follows the pa-0002
+  audit.
+  - **The audit:** pa-0002 spent $1.97 over 36 metered calls. The 11
+    calls of the first coord attempt went unmetered (before #16).
+    - The coord accounted for $1.48, 75% of the total: 14 Opus calls over 2
+      sessions, with cache-hit rates of 89% and 77%.
+    - The workers accounted for $0.50: 22 Sonnet calls with cache-hit
+      rates of 81–91%.
+    - Prefix cache writes cost about $0.89, 45% of the total. Every
+      session wrote its whole prefix fresh: 79–98k tokens for a coord and
+      39–43k for a worker. Nothing was reused across sessions.
+    - The gateway passes `cache_control` through unchanged. It only refuses
+      block types, and its one rewrite, the #15 `max_tokens` clamp,
+      re-serialises the same keys.
+    - The prefix varies between sessions for two reasons:
+      - `packets.fence()` draws a random nonce per assembly, so the same
+        job's packet differs byte for byte between the coord's draft and
+        its redraft, and between a worker's attempts;
+      - the 5-minute cache write expires between attempts that are hours
+        apart.
+    - Packet section sizes aren't logged. The `packet` event records only
+      `dropped`, so the largest section can't be named from the record.
+  1. **Coord model by change type:** Sonnet for docs, tests and refactors;
+     Opus for money, auth and consent paths, and on escalation. The rule
+     goes in `configs/routing.yaml`. It's the biggest lever: Sonnet costs
+     half Opus per token, and the coord is 75% of the spend.
+  2. **Caching:**
+     - a stable prefix (tools, then system, then the fixed packet; see
+       "Context engineering");
+     - a deterministic fence nonce per job, derived with a host key and
+       still checked not to occur in the content, so a redraft or retry
+       reuses the cache;
+     - a caching check in CI;
+     - the cache-hit rate on the Run page.
+
+     On pa-0002 alone, a shared prefix would have saved about $0.38 on the
+     coord's redraft and $0.10 on w1's retry.
+  3. **Packet maps:** paths plus one-line summaries instead of full
+     documents. Per-role packet budgets are enforced, and **every packet
+     logs its section sizes**, which closes the audit's gap.
+  4. **Per-role output and thinking budgets,** with terse output
+     templates. Output was 25% of the coord's cost.
+  5. **Tool-output trimming in the harness:** keep the head, the tail and
+     the failure lines, capped. The harness logged 43 tool results on
+     pa-0002, with sizes not recorded; record them first.
+  6. **Retries without caching** start from the spec, the plan and the
+     failure categories, not the full history.
+  7. **Batch API** for seeded-defect runs, benchmark validation, scorers
+     and nightly audits.
 - **Hardening for unattended runs** (owner, 2026-10-23):
   - **Kill switch:** a host-side flag outside any repo, not in `configs/`.
     - `vigil stop` sets it and `vigil resume` clears it.
