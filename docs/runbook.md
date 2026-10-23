@@ -358,6 +358,13 @@ uv run python -m vigild
 - **Midnight.** Work still running at UTC midnight counts against the new
   day (and month) until it settles, since its whole cost books to the day it
   settles; the new day's room is $5 less that.
+- **Money held after a session ended.** A reservation stays open (and
+  counted) while a call made against it is still in flight, up to the
+  upstream timeout (10 minutes) plus 2; then it settles with what the call
+  cost. Every 10 minutes vigild settles anything nothing holds
+  (`reservation_swept` events), so held money never outlives its work.
+- **Dismiss** on a breaker's page is refused while it holds a job: press
+  **Reset**, or **Abandon** each job it holds.
 - **Budget pages.** A job whose workers don't fit what the day has left gets
   its own page, "the budget can't fit this work now": retry later, re-plan
   with smaller `max_cost_usd`, or abandon. Each worker in a wave reserves its

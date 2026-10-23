@@ -576,10 +576,7 @@ class JobService:
             # a breaker that then holds nothing resolves its page but stays
             # open: only its own condition reopens dispatch (owner, 2026-10-23);
             # one that still holds a job keeps its page for it (2a round 7)
-            for b in breakers.unhold(job.id):
-                page = breakers.empty_page(b)
-                if page is not None:
-                    self.store.resolve_inbox_item(page, Actor.OWNER.value)
+            breakers.unhold(job.id, by=Actor.OWNER.value)
         failed = getattr(self.runner, "job_failed", None)
         if failed is not None:
             failed(job)  # an abandoned job counts toward the repo's breaker (item 4)
@@ -621,8 +618,17 @@ class JobService:
         self.runner.on_rebuild(str(item.body["repo"]), str(item.body["base_sha"]))
 
     def dismiss(self, item_id: int) -> None:
+        """Resolve a page with nothing to act on. A breaker's page that still
+        holds jobs can't be dismissed: they would wait with no page (2a
+        round 9); reset the breaker or abandon them."""
+        from vigild.breakers import Breakers
+
         with self.store.tx():
             item = self._question(item_id)
+            if item.body.get("kind") == "breaker":
+                held = Breakers(self.store, self.cfg).held_by(int(item.body.get("breaker") or 0))
+                if held:
+                    raise Conflict(f"breaker page {item_id} holds {held}: reset it or abandon them")
             self.store.add_event(
                 "dismiss", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=item.job_id
             )

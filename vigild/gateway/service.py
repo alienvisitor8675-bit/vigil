@@ -24,7 +24,8 @@ import re
 import secrets
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -108,7 +109,11 @@ METERED_PATHS = ("/v1/messages",)
 FREE_PATHS = ("/v1/messages/count_tokens",)
 CHARS_PER_TOKEN = 3  # deliberately low, so the input estimate errs high
 DEFAULT_MAX_TOKENS = 4096
-UPSTREAM_TIMEOUT = httpx2.Timeout(600.0, connect=10.0)
+UPSTREAM_READ_S = 600.0  # the longest an upstream call waits for its next bytes
+UPSTREAM_TIMEOUT = httpx2.Timeout(UPSTREAM_READ_S, connect=10.0)
+# a call in flight keeps its reservation live (2a round 9) until nothing of it
+# has moved for the read timeout plus this: httpx has given up on it by then
+LIVE_MARGIN_S = 120.0
 
 
 def _refuse_block(where: str, why: str) -> GatewayError:
@@ -217,6 +222,9 @@ class Gateway:
         self._inflight_lock = threading.Lock()
         self._drained = threading.Condition(self._inflight_lock)  # a session's holds all gone
         self._after_drain: dict[str, list[Callable[[], Any]]] = {}  # session -> settle
+        self._seen: dict[str, float] = {}  # session -> when one of its calls last moved
+        self._own: dict[int, float] = {}  # vigild's own call's reservation -> when it began
+        self._now: Callable[[], float] = time.monotonic
         # vigild's circuit breakers (plan 2a, item 4): every upstream answer
         # counts for or against the preset's backend breaker
         self.breakers: Any = None
@@ -398,7 +406,26 @@ class Gateway:
                     f"${headroom:.4f} of its reservation left after calls in flight",
                 )
             self._inflight[session_id] = held + amount
+            self._seen[session_id] = self._now()
             return amount
+
+    def _touch(self, session_id: str) -> None:
+        """A streamed call's bytes arrived: it is alive (2a round 9)."""
+        self._seen[session_id] = self._now()
+
+    def holds(self, session_id: str | None, reservation_id: int) -> bool:
+        """Whether a call is still in flight against this reservation (2a
+        round 9): one of the session's calls, a settle waiting for one, or
+        vigild's own call. Bounded: a call nothing of which has moved for the
+        upstream read timeout plus a margin is over, whatever its hold says.
+        The runner's liveness rule asks this first."""
+        stale = self._now() - (UPSTREAM_READ_S + LIVE_MARGIN_S)
+        with self._inflight_lock:
+            if reservation_id in self._own:
+                return self._own[reservation_id] > stale
+            if session_id and (session_id in self._inflight or session_id in self._after_drain):
+                return self._seen.get(session_id, 0.0) > stale
+        return False
 
     def _over_cap_ok(self, session_id: str, shortfall: float) -> bool:
         """A reviewer or auditor call past its session cap goes on (owner,
@@ -431,6 +458,7 @@ class Gateway:
                 self._inflight[hold.session_id] = left
             else:
                 self._inflight.pop(hold.session_id, None)
+                self._seen.pop(hold.session_id, None)
                 self._drained.notify_all()
                 later = self._after_drain.pop(hold.session_id, [])
         for fn in later if left <= 1e-12 else []:
@@ -579,6 +607,7 @@ class Gateway:
                         chunk
                     ) in resp.aiter_bytes():  # decoded: no content-encoding is passed on
                         tap.feed(chunk)
+                        self._touch(gs.session_id)
                         yield chunk
                 finally:
                     # book the call, then let go of its hold (review round 2, N7)
@@ -655,13 +684,8 @@ class Gateway:
                              tokens_in=math.ceil(body_chars / CHARS_PER_TOKEN), tokens_out=1024)
         ) if self.prices.has(model) else 0.0  # fmt: skip
         amount = max(self.cfg.budgets.decider_call_usd, worst)
-        try:
-            rid = self.budget.reserve(session_id=None, task_id=None, amount=amount, purpose=purpose)
-        except BudgetExceeded as e:
-            raise GatewayError(403, "permission_error", str(e)) from e
-        started = time.monotonic()
-        cost = 0.0
-        try:
+        with self._own_call(amount, purpose) as cost:
+            started = time.monotonic()
             payload = run()
             result = payload.get("result", payload) if isinstance(payload, dict) else {}
             usage = (
@@ -669,7 +693,7 @@ class Gateway:
                 or payload.get("usage")
                 or {}
             )
-            cost = record_call(
+            cost[0] = record_call(
                 self.store,
                 self.prices,
                 session_id=None,
@@ -689,15 +713,37 @@ class Gateway:
                 repo=repo,
             )
             return payload
+
+    @contextmanager
+    def _own_call(self, amount: float, purpose: str) -> Iterator[list[float]]:
+        """One of vigild's own calls (Jev through `metered`, Haiku through
+        `call`): reserve its worst case, keep that reservation live while the
+        call is in flight (2a round 9), then settle it at the call's cost,
+        never past what was reserved. A cost past it is recorded
+        (`settle_excess`) and trips the daily breaker (2a rounds 8-9), on
+        both paths. The caller sets the yielded list's one item to the cost."""
+        try:
+            rid = self.budget.reserve(session_id=None, task_id=None, amount=amount, purpose=purpose)
+        except BudgetExceeded as e:
+            raise GatewayError(403, "permission_error", str(e)) from e
+        with self._inflight_lock:
+            self._own[rid] = self._now()
+        cost = [0.0]
+        try:
+            yield cost
         finally:
-            self.budget.settle(rid, cost)  # never more than `amount`
-            if cost > amount + 1e-9 and self.breakers is not None:
+            try:
+                self.budget.settle(rid, cost[0])  # first: the sweep never sees it unheld
+            finally:
+                with self._inflight_lock:
+                    self._own.pop(rid, None)
+            if cost[0] > amount + 1e-9 and self.breakers is not None:
                 from vigild.breakers import GLOBAL, Kind
 
                 self.breakers.trip(
                     Kind.DAILY, GLOBAL,
-                    {"why": "a metered call cost more than its reservation",
-                     "reserved_usd": round(amount, 6), "cost_usd": round(cost, 6)},
+                    {"why": "a call vigild made cost more than its reservation",
+                     "reserved_usd": round(amount, 6), "cost_usd": round(cost[0], 6)},
                 )  # fmt: skip
 
     def _fallback_today(self, repo: str) -> float:
@@ -784,12 +830,8 @@ class Gateway:
         purpose: str,
         job_id: str | None,
     ) -> dict[str, Any]:
-        try:
-            rid = self.budget.reserve(session_id=None, task_id=None, amount=amount, purpose=purpose)
-        except BudgetExceeded as e:
-            raise GatewayError(403, "permission_error", str(e)) from e
-        started = time.monotonic()
-        try:
+        with self._own_call(amount, purpose) as cost:
+            started = time.monotonic()
             try:
                 resp = self.sync_client.post(
                     p.base_url.rstrip("/") + "/v1/messages",
@@ -807,7 +849,7 @@ class Gateway:
                     "api_error",
                     f"upstream {resp.status_code}: {payload.get('error')}",
                 )
-            cost = self._record(
+            cost[0] = self._record(
                 gs=None,
                 preset_name=preset,
                 preset=p,
@@ -818,8 +860,4 @@ class Gateway:
                 job_id=job_id,
                 repo=repo,
             )
-            self.budget.settle(rid, cost)
             return payload
-        except BaseException:
-            self.budget.settle(rid, 0.0)
-            raise

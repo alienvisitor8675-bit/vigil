@@ -268,6 +268,8 @@ def test_a_deps_job_abandoned_during_its_review_keeps_no_queued_task(
     assert w.store.get_job(child).state is JobState.ABANDONED
     left = {t.state for t in w.store.list_tasks(child)}
     assert not left & {"fix", "queued", "running"}, left
+    # 2a round 9: the deps guard on its own: no PR of the dead job is closed
+    assert not [e for e in w.store.events() if e.type == "deps_review_closed"]
 
 
 # --- R4(a): a call that outlives the drain wait still lands in the ledger -----------------------

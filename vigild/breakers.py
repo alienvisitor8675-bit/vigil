@@ -284,10 +284,12 @@ class Breakers:
         if held and self.on_close is not None:
             self.on_close(held, item_id)
 
-    def unhold(self, job_id: str) -> list[Breaker]:
+    def unhold(self, job_id: str, *, by: str) -> list[Breaker]:
         """The job no longer waits on any breaker: the owner abandoned it, or
-        its own page holds it now (2a round 3). Returns the breakers that
-        then hold nothing."""
+        its own page holds it now (2a round 3). A breaker that then holds
+        nothing resolves its page (`by` resolves it) but stays open (owner,
+        2026-10-23; 2a round 9: both callers, one rule). Returns those
+        breakers."""
         emptied = []
         with self.store.lock:
             for b in self.open_breakers():
@@ -296,6 +298,10 @@ class Breakers:
                     self._set(b, held=rest)
                     if not rest:
                         emptied.append(b)
+            for b in emptied:
+                page = self.empty_page(b)
+                if page is not None:
+                    self.store.resolve_inbox_item(page, by)
         return emptied
 
     def empty_page(self, b: Breaker) -> int | None:

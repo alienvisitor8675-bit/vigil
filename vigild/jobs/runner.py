@@ -36,6 +36,7 @@ import functools
 import json
 import logging
 import math
+import sqlite3
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -326,8 +327,13 @@ class JobRunner:
             out["containers"] = self.reaper()
         failed_coord: set[str] = set()
         live = [s for s in self.store.list_sessions() if s.status in LIVE_SESSION]
-        for rid in self.budget.open_reservation_ids():
-            self.budget.settle(rid)  # first: what's left of each task's cap is known
+        for r in self.store.q("SELECT * FROM reservations WHERE status='open'"):
+            # first: what's left of each task's cap is known. Nothing of the
+            # last process runs, so only the liveness rule's gateway part can
+            # hold one (2a round 9)
+            if self._reservation_live(r, set(), restarted=True):
+                continue
+            self.budget.settle(int(r["id"]))
             out["reservations"] += 1
         safe = {s.job_id for s in live if s.job_id and self._safe_to_resume(s)}
         for s in live:
@@ -378,13 +384,40 @@ class JobRunner:
         self.store.add_event("reconcile", out, Provenance.HUMAN)
         return out
 
+    def _reservation_live(
+        self, r: sqlite3.Row, stages: set[int], *, restarted: bool = False
+    ) -> bool:
+        """The one rule for whether an open reservation still backs something;
+        the sweep and reconcile both ask it (2a round 9). Live: a call the
+        gateway has in flight against it, or a settle waiting for one (bounded
+        by the upstream read timeout), a session's or vigild's own; then,
+        unless vigild just restarted (nothing of the last process runs), a
+        session still created or running, a review stage whose pass is
+        running, a worker reservation whose task is running."""
+        if self.gateway.holds(r["session_id"], int(r["id"])):
+            return True
+        if restarted:
+            return False
+        if r["session_id"]:
+            try:
+                return self.store.get_session(r["session_id"]).status in LIVE_SESSION
+            except KeyError:
+                return False
+        if r["purpose"] == "review_stage":
+            return int(r["id"]) in stages
+        if r["task_id"]:
+            try:
+                return self.store.get_task(r["task_id"]).state == "running"
+            except KeyError:
+                return False
+        return False
+
     def sweep_reservations(self, grace_seconds: int = 600) -> list[int]:
         """Settle every open reservation nothing live holds (2a round 8): a
         leaked one would otherwise block every later day, since open rows
-        count against today whatever day they began. Live: a session still
-        created or running, a review stage whose pass is running, a worker
-        reservation whose task is running. Anything younger than the grace
-        period is left alone (it may be about to be used). Returns the ids."""
+        count against today whatever day they began. Live is
+        `_reservation_live`'s rule. Anything younger than the grace period is
+        left alone (it may be about to be used). Returns the ids."""
         cutoff = utcnow().timestamp() - grace_seconds
         with self._stage_lock:
             stages = set(self._review_stage_ids.values())
@@ -392,20 +425,7 @@ class JobRunner:
         for r in self.store.q("SELECT * FROM reservations WHERE status='open'"):
             if datetime.fromisoformat(r["created_at"]).timestamp() > cutoff:
                 continue
-            live = False
-            if r["session_id"]:
-                try:
-                    live = self.store.get_session(r["session_id"]).status in LIVE_SESSION
-                except KeyError:
-                    live = False
-            elif r["purpose"] == "review_stage":
-                live = int(r["id"]) in stages
-            elif r["task_id"]:
-                try:
-                    live = self.store.get_task(r["task_id"]).state == "running"
-                except KeyError:
-                    live = False
-            if live:
+            if self._reservation_live(r, stages):
                 continue
             self.budget.settle(int(r["id"]))
             swept.append(int(r["id"]))
@@ -827,16 +847,22 @@ class JobRunner:
             finally:
                 self.gateway.revoke(s.id)
                 if self.gateway.drain(s.id):  # its last calls booked first
-                    self.budget.settle(reservation)
+                    self._settle_checked(reservation)
                 else:
                     # a call outlived the wait: the reservation stays open (and
-                    # counted) until it is booked, then settles (2a round 8)
+                    # counted, and live to the sweep) until it is booked, then
+                    # settles (2a rounds 8-9)
                     log.warning("%s: a call was still in flight at settling", s.id)
                     self.gateway.after_drain(
-                        s.id, functools.partial(self.budget.settle, reservation)
+                        s.id, functools.partial(self._settle_checked, reservation)
                     )
                 self.store.update_session(s.id, ended_at=iso())
-                self._spend_check()
+
+    def _settle_checked(self, reservation: int) -> None:
+        """Settle a session's reservation, then the spend check: a late
+        settle can fill the day too (2a round 9)."""
+        self.budget.settle(reservation)
+        self._spend_check()
 
     def _replan_context(self, job_id: str) -> dict[str, Any]:
         """The failures the owner sent back with the latest re-plan, if any."""
@@ -1195,6 +1221,7 @@ class JobRunner:
                     return None
                 for tid in admitted:
                     self.store.update_task(tid, state="running")  # its place in the stack
+            routed_before = {tid: self.store.get_task(tid) for tid in retrying}
             try:
                 for tid in retrying:
                     # another attempt; the third is routed by rule 5 (escalated)
@@ -1202,10 +1229,16 @@ class JobRunner:
                     self._reroute(job_id, tid, attempt=attempt + 1)
             except RoutingError as e:
                 # nothing reserved is left behind (2a round 8): release the
-                # wave, put its tasks back, and page the job
+                # wave, put its tasks back as they were (their attempt and
+                # route too, 2a round 9), and page the job
                 for rid, _amt in held.values():
                     if rid:
                         self.budget.settle(rid, 0.0)
+                for tid, t in routed_before.items():
+                    self.store.update_task(tid, contract=t.contract)
+                    if t.tier and t.tier_reason and t.backend_preset:  # it ran: it was routed
+                        self.store.route_task(tid, tier=t.tier, tier_reason=t.tier_reason,
+                                              backend_preset=t.backend_preset)  # fmt: skip
                 for tid in admitted:
                     self.store.update_task(tid, state="failed" if tid in retrying else "waiting")
                 self._block(job_id, f"routing: {e}")
@@ -1380,8 +1413,9 @@ class JobRunner:
         actions = (["retry"] if can_retry else []) + ["replan", "abandon"]
         self._block(job_id, f"workers failed: {sorted(task_ids)}")
         # its own page holds it now: no breaker resumes it behind that page's
-        # back when it closes (2a round 3)
-        self.breakers.unhold(job_id)
+        # back when it closes (2a round 3); a breaker it leaves holding nothing
+        # resolves its page, as abandoning does (2a round 9)
+        self.breakers.unhold(job_id, by=Actor.VIGILD.value)
         titles = "; ".join(str(t.get("title") or tid) for tid, t in tasks.items())
         self._page(
             job_id,
@@ -2179,11 +2213,7 @@ class JobRunner:
         if self.store.get_job(job_id).state is not JobState.IN_REVIEW:
             # the owner merged (or vigild moved) the job while this ran: its
             # results are moot; nothing more is written (2a round 3)
-            self.store.add_event(
-                "review_dropped",
-                {"state": self.store.get_job(job_id).state.value, "tasks": sorted(outcomes)},
-                Provenance.HUMAN, job_id=job_id,
-            )  # fmt: skip
+            self._drop_review(job_id, {"tasks": sorted(outcomes)})
             return "done"
         failed = {tid: why for tid, (kind, why) in outcomes.items() if kind == "failed"}
         b = self._paused(job)
@@ -2258,20 +2288,25 @@ class JobRunner:
         try:
             transition(self.store, job_id, to, Actor.VIGILD, evidence=evidence)
         except TransitionError:
-            now = self.store.get_job(job_id).state
-            if now is JobState.IN_REVIEW:
+            if self.store.get_job(job_id).state is JobState.IN_REVIEW:
                 raise
-            if now is JobState.ABANDONED:
-                # nothing of the dropped move is left on a dead job (2a round 8)
-                for t in self.store.list_tasks(job_id):
-                    if t.state in ("fix", "queued", "running", "waiting"):
-                        self.store.update_task(t.id, state="abandoned")
-            self.store.add_event(
-                "review_dropped", {"state": now.value, "to": to.value, "tasks": tasks},
-                Provenance.HUMAN, job_id=job_id,
-            )  # fmt: skip
+            self._drop_review(job_id, {"to": to.value, "tasks": tasks})
             return False
         return True
+
+    def _drop_review(self, job_id: str, data: dict[str, Any]) -> None:
+        """A review's results on a job that moved on are dropped
+        (`review_dropped`). On an abandoned job nothing the review set going
+        is left (2a rounds 8-9): a task it sent to a fix round, or queued
+        again, is abandoned."""
+        now = self.store.get_job(job_id).state
+        if now is JobState.ABANDONED:
+            for t in self.store.list_tasks(job_id):
+                if t.state in ("fix", "queued", "running", "waiting"):
+                    self.store.update_task(t.id, state="abandoned")
+        self.store.add_event(
+            "review_dropped", {"state": now.value, **data}, Provenance.HUMAN, job_id=job_id
+        )
 
     def _deps_review_failed(self, job_id: str, flagged: dict[str, Any]) -> bool:
         """Owner ruling 3: a deps PR has no worker to fix it. A failed review
@@ -2280,11 +2315,9 @@ class JobRunner:
         parent job stays blocked on this one throughout."""
         job = self.store.get_job(job_id)
         if job.state is not JobState.IN_REVIEW:
-            # the job moved on (abandoned, merged): change nothing (2a round 8)
-            self.store.add_event(
-                "review_dropped", {"state": job.state.value, "tasks": sorted(flagged)},
-                Provenance.HUMAN, job_id=job_id,
-            )  # fmt: skip
+            # the job moved on (abandoned, merged): no PR is closed and no
+            # task queued again (2a round 8)
+            self._drop_review(job_id, {"tasks": sorted(flagged)})
             return False
         again: list[str] = []
         for tid in sorted(flagged):
