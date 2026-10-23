@@ -113,15 +113,28 @@ def check_requests(lockfiles: list[str], deps: list[DepRequest]) -> list[str]:
     return errors
 
 
-def update_command(deps: list[DepRequest]) -> str:
-    """The package manager's lockfile-only update, as one shell line."""
+def uv_exclude_newer(lock_text: str | None) -> str | None:
+    """The cutoff a uv.lock was resolved with (`[options] exclude-newer`)."""
+    try:
+        doc = tomllib.loads(lock_text or "")
+    except tomllib.TOMLDecodeError:
+        return None
+    value = (doc.get("options") or {}).get("exclude-newer")
+    return str(value) if value else None
+
+
+def update_command(deps: list[DepRequest], exclude_newer: str | None = None) -> str:
+    """The package manager's lockfile-only update, as one shell line. A uv
+    lock's own cutoff is passed back, so the lock keeps its options (the 2a
+    done-when's reviewer caught `uv add` dropping it)."""
     import shlex
 
     parts: list[str] = []
     py = [f"{d.package}=={d.version}" for d in deps if d.ecosystem == "pypi"]
     js = [f"{d.package}@{d.version}" for d in deps if d.ecosystem == "npm"]
     if py:
-        parts.append("uv add --no-sync " + " ".join(shlex.quote(x) for x in py))
+        cutoff = f"--exclude-newer {shlex.quote(exclude_newer)} " if exclude_newer else ""
+        parts.append(f"uv add --no-sync {cutoff}" + " ".join(shlex.quote(x) for x in py))
     if js:
         parts.append("pnpm add -w --lockfile-only " + " ".join(shlex.quote(x) for x in js))
     return " && ".join(parts)
@@ -174,7 +187,18 @@ def _strip_pyproject(d: dict[str, Any]) -> dict[str, Any]:
 def manifest_errors(path: str, before: str | None, after: str | None) -> list[str]:
     """A manifest may change its dependency fields and nothing else."""
     name = path.rsplit("/", 1)[-1]
-    if before == after or is_lockfile(path):
+    if before == after:
+        return []
+    if name == UV_LOCK:
+        # a uv lock may gain packages; its resolution options (the cutoff) stay
+        try:
+            same = (tomllib.loads(before or "").get("options") or {}) == (
+                tomllib.loads(after or "").get("options") or {}
+            )
+        except tomllib.TOMLDecodeError:
+            return [f"{path} isn't TOML"]
+        return [] if same else [f"{path}: its resolution options changed"]
+    if is_lockfile(path):
         return []
     if name == "package.json":
         try:
@@ -285,7 +309,15 @@ class DepsExecutor:
             before = {p: (work / p).read_bytes() for p in lockfiles if (work / p).is_file()}
             for p in work.rglob("*"):
                 p.chmod(0o777 if p.is_dir() else 0o666)
-            code, output = self.container(image, work, update_command(deps))
+            cutoff = next(
+                (
+                    uv_exclude_newer(before[p].decode(errors="replace"))
+                    for p in before
+                    if p.rsplit("/", 1)[-1] == UV_LOCK
+                ),
+                None,
+            )
+            code, output = self.container(image, work, update_command(deps, cutoff))
             res = DepsResult(output=output[-4000:])
             if code != 0:
                 res.errors.append(f"the package manager failed (exit {code})")

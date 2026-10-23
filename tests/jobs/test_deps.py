@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from tests.conftest import auth, git
-from tests.jobs.test_coord_loop import REPO, World, _approve, _failure_item, _work
+from tests.jobs.test_coord_loop import CLEAN_REVIEW, REPO, World, _approve, _failure_item, _work
 from tests.jobs.test_coord_loop import world as world
 from vigild.contract.models import DepRequest
 from vigild.executors.base import SessionSpec
@@ -242,3 +242,59 @@ def test_the_parent_resumes_on_the_new_image_key_after_the_deps_job_merges(
     first, second = images[f"{parent}-w1"]
     assert first and second and first != second
     assert w.store.get_task(f"{parent}-w1").state == "reviewed"
+
+
+def test_a_uv_lock_keeps_its_cutoff(tmp_path: Path, fixture_repo: dict[str, Any]) -> None:
+    """The 2a done-when's reviewer caught `uv add` dropping the lock's
+    `[options] exclude-newer`: vigild passes it back, and fails a lock whose
+    options changed."""
+    from vigild.jobs.deps import uv_exclude_newer
+
+    cut = "2026-10-08T23:59:59Z"
+    assert update_command(SIX, cut) == f"uv add --no-sync --exclude-newer {cut} six==1.17.0"
+    with_options = f'version = 1\n\n[options]\nexclude-newer = "{cut}"\n'
+    assert uv_exclude_newer(with_options) == cut
+    assert manifest_errors("uv.lock", with_options, "version = 1\n") == [
+        "uv.lock: its resolution options changed"
+    ]
+    assert (
+        manifest_errors("uv.lock", with_options, with_options + "\n[[package]]\nname = 'six'\n")
+        == []
+    )
+
+
+def test_review_findings_on_a_deps_pr_page_the_owner_without_a_fix_round(
+    world: World, fixture_repo: dict[str, Any]
+) -> None:
+    from tests.review.test_review_stage import CHANGES
+
+    w = world
+    _seed(fixture_repo)
+    w.runner.cfg.repos.repos[REPO].dev_lockfiles = ["pyproject.toml", "uv.lock"]
+    pm = PackageManager(NEW_PY, _lock(("six", "1.17.0")))
+    w.runner.deps = DepsExecutor(
+        w.runner.workspace, pm, Registry({"six": 600}), lambda: NOW, w.runner.cfg.vigild.data_path
+    )
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        d = spec.clone / ".vigil" / spec.job_id / str(spec.task_id)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "worker_report.json").write_text(json.dumps({
+            "task_id": spec.task_id, "job_id": spec.job_id, "files_changed": [],
+            "summary": "needs six", "provenance": "claude",
+            "self_check": {"test_failed_first": True, "outside_scope": [], "not_done": "all",
+                           "reviewer_would_flag": "-", "could_delete": "-"},
+            "needs_deps": [{"ecosystem": "pypi", "package": "six", "version": "1.17.0",
+                            "why": "compat"}]}))  # fmt: skip
+
+    w.standin.worker_edit = edit
+    parent = _approve(w)
+    child = _failure_item(w, parent, "needs_deps")["body"]["deps_job"]
+    w.standin.review = lambda spec: CHANGES if spec.job_id == child else CLEAN_REVIEW
+    (item,) = [x for x in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"]
+               if x["job_id"] == child]  # fmt: skip
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    assert w.store.get_job(child).state.value == "blocked"
+    page = _failure_item(w, child, "deps_review")
+    assert page["body"]["actions"] == ["abandon"]
+    assert len(pm.ran) == 1  # no fix round: the package manager ran once

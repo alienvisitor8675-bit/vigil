@@ -1883,6 +1883,17 @@ class JobRunner:
                 resumable=True,
             )
             return
+        flagged = {tid: f for tid, (kind, f) in outcomes.items() if kind == "deps_findings"}
+        if flagged:
+            self._block(job_id, f"deps review findings: {sorted(flagged)}")
+            self._page(
+                job_id,
+                f"{job_id}: the review flagged the deps PR; it has no worker to fix it",
+                {"kind": "deps_review", "findings": flagged, "actions": ["abandon"],
+                 "next": "abandon it (the job waiting on it stays blocked) and add the "
+                 "dependency by hand, or re-plan the job that needs it"},
+            )  # fmt: skip
+            return
         fixes = sorted(tid for tid, (kind, _) in outcomes.items() if kind == "fix")
         if fixes:
             limit = self.cfg.routing.escalate_review_rounds
@@ -2053,6 +2064,9 @@ class JobRunner:
             Provenance.CLAUDE,
             task_id=t.id,
         )
+        if task.shape is not None and task.shape.value == "deps":
+            # no model wrote it, so no fix round: the owner decides (B39)
+            return "deps_findings", findings
         self._reroute_for_round(job.id, t.id, rnd)
         self.store.update_task(t.id, state="fix")
         return "fix", len(findings)
