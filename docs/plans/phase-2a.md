@@ -251,6 +251,30 @@ gets its own plan file and done-when.
       - A 60k coord budget would also cut both prefix writes.
     - An earlier attempt of the same job (11 calls) went unmetered because
       of the migration bug fixed in #16. It isn't in this baseline.
+- **Hash-chained events** (owner, 2026-10-23, after reviewing Bernstein):
+  - **The column:** `events.prev_hash`, added as a new step at the end of
+    `MIGRATIONS`.
+  - **The hash:** HMAC(host key, the previous row's hash plus this row's
+    canonical JSON).
+  - **The key** lives in `~/.config/vigil/env`. The owner creates it with
+    the runbook's rule for self-generated secrets; no session generates
+    it. Proposed name: `VIGIL_EVENTS_HMAC_KEY`.
+  - **`vigil doctor`** verifies the chain.
+  - **Tests:** an edited row breaks the chain, and so does a deleted or
+    reordered row.
+- **Invariants check before Stage C** (#14 "Factory engineering"; owner,
+  2026-10-23):
+  - Before writing Stage C's proposal rules, read
+    `chernistry/bernstein`'s `src/bernstein/evolution/invariants.py` and
+    `circuit.py` (Apache-2.0), and list any invariant vigil is missing.
+  - Take ideas only, and copy no code. Any adapted text goes in
+    `docs/sources.md` with its licence.
+- **No change to the verifier** (owner, 2026-10-23):
+  - Bernstein runs gates in the agent's worktree, caches verdicts and
+    quarantines flaky tests.
+  - Vigil keeps fresh-checkout verification, with no verdict cache and no
+    quarantine. Unstable test IDs are handled by the double base run from
+    phase 1 run finding #1 (#17).
 - **Done-when:**
   - one task is dispatched from a Claude Code session through `vigil mcp`;
   - `vigil kill` works;
