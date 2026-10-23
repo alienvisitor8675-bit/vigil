@@ -116,9 +116,9 @@ def _m1_gateway_token_binding(conn: sqlite3.Connection) -> None:
     )
 
 
-# Ordered steps; PRAGMA user_version is how many have run (review round 2, N8).
-# Each step is idempotent, since SCHEMA's CREATE IF NOT EXISTS may already
-# have made a table in its newest shape. Append only; never reorder.
+# Ordered steps (review round 2, N8). migrate() runs all of them on every start,
+# so each must be idempotent (SCHEMA's CREATE IF NOT EXISTS may already have
+# made a table in its newest shape). Append only; never reorder or renumber.
 def _m2_dev_image_keys(conn: sqlite3.Connection) -> None:
     """Review round 2: dev images are built per lockfile key and validated by stage."""
     _add_columns(conn, "dev_images", {"key": "TEXT", "stage": "TEXT", "base_sha": "TEXT"})
@@ -143,17 +143,18 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
 
 
 def migrate(conn: sqlite3.Connection) -> int:
-    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-    for n, step in enumerate(MIGRATIONS, start=1):
-        if n > version:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                step(conn)
-                conn.execute(f"PRAGMA user_version = {n}")
-                conn.execute("COMMIT")
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
+    """Run every step, every start. `user_version` is informational: another
+    branch's build may have raised it past steps this build has never run, so
+    it never decides to skip one. Each step is idempotent, so a re-run is free."""
+    for step in MIGRATIONS:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            step(conn)
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    conn.execute(f"PRAGMA user_version = {len(MIGRATIONS)}")
     return len(MIGRATIONS)
 
 

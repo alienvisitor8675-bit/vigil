@@ -80,6 +80,10 @@ def build(
     **gateway_kwargs: Any,
 ) -> Vigild:
     cfg = config.load(config_dir)
+    # VIGIL_DATA_DIR (non-secret) points vigild, `vigil doctor` and `vigil dev-image`
+    # at a scratch dir; only the owner's production vigild uses ~/vigil-data.
+    if data_dir is None and (env := config.env_override("VIGIL_DATA_DIR")):
+        data_dir = Path(env)
     if data_dir is not None:
         cfg.vigild.data_dir = str(data_dir)
     secrets = config.load_secrets(env_file)

@@ -393,6 +393,13 @@ class DockerRuntime:
                 with suppress(docker.errors.APIError):
                     worker.remove(force=True)
 
+    def stop(self, session_id: str) -> None:
+        """Kill a live session's containers (the gateway calls this when
+        metering fails); `run` then sees the worker exit and cleans up."""
+        for c in self.client.containers.list(filters={"label": f"{LABEL}={session_id}"}):
+            with contextlib.suppress(Exception):
+                c.kill()
+
     def reap(self) -> int:
         """At startup: remove every container and network a session left behind."""
         n = 0

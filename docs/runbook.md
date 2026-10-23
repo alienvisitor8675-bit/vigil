@@ -234,6 +234,14 @@ uv run python cli/vigil doctor
 It prints one `pass`, `fail` or `skip` line per check, never a value. Add
 `--repo <owner/name>` to limit the token checks to some repos.
 
+### Keep development off the production data
+
+Only the owner's production vigild uses `~/vigil-data`. Build sessions and
+branch work (vigild, `vigil doctor`, `vigil dev-image`) set `VIGIL_DATA_DIR`
+to a scratch dir, e.g. `VIGIL_DATA_DIR=$(mktemp -d) uv run python cli/vigil doctor`.
+It overrides `data_dir` in `configs/vigild.yaml`. Opening the live DB from
+another branch's code can migrate it past steps main has never run.
+
 ### Start vigild
 
 ```sh
@@ -246,7 +254,9 @@ uv run python -m vigild
     can't check (so the App must be configured). A repo the YAML keeps
     private that is public on GitHub only logs a warning: the YAML's stricter
     rule stays in force;
-  - migrates an older `vigil.db` in place (`PRAGMA user_version`);
+  - migrates an older `vigil.db` in place: every `MIGRATIONS` step runs on
+    every start (all are idempotent), so a DB another branch advanced repairs
+    itself on restart;
   - reconciles anything a previous run left behind: tokens revoked, session
     containers removed, reservations settled, mid-flight jobs blocked with a
     page in the inbox (retry, re-plan or abandon), a draft whose coord died

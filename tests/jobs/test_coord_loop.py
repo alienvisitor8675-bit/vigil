@@ -1400,3 +1400,28 @@ def test_a_third_worker_waits_for_the_day_then_runs(world: World) -> None:
     assert _no_failure_pages(w)
     assert w.store.get_job(job).state.value == "in_review"
     assert w.budget.open_today() == 0
+
+
+def test_a_failed_end_of_session_settle_fails_closed(world: World) -> None:
+    """If the runner's settle raises, the session is not done, its reservation is
+    booked at the amount reserved (not released at $0), and the owner is paged."""
+    w = world
+    real = w.budget.settle
+
+    def settle(rid: int, amount: float | None = None) -> float:
+        if amount is None:
+            raise RuntimeError("ledger write failed")
+        return real(rid, amount)
+
+    w.budget.settle = settle  # type: ignore[method-assign]
+    _request(w)
+    pages = json.dumps(w.client.get("/api/inbox", headers=auth(w.tokens.read)).json())
+    assert "metering failed: " in pages and "ledger write failed" in pages
+    assert w.store.q("SELECT 1 FROM events WHERE type='metering_failed'")
+    booked = w.store.q(
+        "SELECT r.amount_usd a, SUM(l.amount_usd) l FROM reservations r"
+        " JOIN ledger l ON l.reservation_id = r.id WHERE r.session_id IS NOT NULL"
+        " GROUP BY r.id"
+    )
+    assert booked and all(b["l"] == pytest.approx(b["a"]) and b["a"] > 0 for b in booked)
+    assert not w.store.q("SELECT 1 FROM sessions WHERE status='done'")

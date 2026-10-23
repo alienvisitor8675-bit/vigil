@@ -121,7 +121,11 @@ Regenerate `schemas/*.json` after changing a contract model:
 - Secrets are scrubbed by one function, `vigild.redact.redact`; use it for
   anything a session or model produced that vigild stores or publishes.
 - A new DB column is a new step at the end of `vigild/db.py` `MIGRATIONS`
-  (idempotent, append only), not just an edit to `SCHEMA`.
+  (append only), not just an edit to `SCHEMA`. `migrate()` runs **every**
+  step on every start, whatever `user_version` says, so each must be
+  idempotent. Never renumber or skip one.
+- Build sessions and branch work set `VIGIL_DATA_DIR` to a scratch dir; only
+  the owner's production vigild uses `~/vigil-data` (runbook).
 - Scope globs are strict (`vigild/intake/paths.py` `in_scope`); money-path
   detection keeps guard's loose rules (`matches`). Don't mix them up.
 - Never bind-mount from the repo into a container; keep data dirs under `~`

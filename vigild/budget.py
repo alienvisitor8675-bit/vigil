@@ -155,6 +155,17 @@ class Budget:
             )
             return spent
 
+    def book_unmetered(self, session_id: str, task_id: str | None, amount: float) -> None:
+        """Book a call's worst case as spent when its real cost couldn't be
+        recorded. Unknown counts as worst case, never zero. The session's own
+        settle later adds only its metered calls, so this is not counted twice."""
+        with self.store.tx() as c:
+            c.execute(
+                "INSERT INTO ledger (reservation_id, session_id, task_id, amount_usd, day, month,"
+                " ts) VALUES (NULL,?,?,?,?,?,?)",
+                (session_id, task_id, amount, self._day(), self._month(), iso(self.clock())),
+            )
+
     def settle_session(self, session_id: str) -> float:
         rows = self.store.q(
             "SELECT id FROM reservations WHERE session_id=? AND status='open'", (session_id,)

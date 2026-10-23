@@ -773,3 +773,49 @@ def test_thinking_boundary_is_exactly_the_answer_room_plus_the_minimum_budget(
         assert _sent(upstream)["thinking"]["budget_tokens"] == 1024
     else:
         assert "thinking" in r.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_metering_failure_fails_closed(
+    client: TestClient,
+    store: Store,
+    budget: Budget,
+    gw: Gateway,
+    upstream: Upstream,
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+) -> None:
+    import sqlite3
+
+    import vigild.gateway.service as svc
+
+    stopped: list[str] = []
+    gw.stop_session = stopped.append
+
+    def boom(*a: Any, **k: Any) -> float:
+        raise sqlite3.OperationalError("table model_calls has no column named truncated")
+
+    monkeypatch.setattr(svc, "record_call", boom)
+    sid, tok = _session(store, budget, gw)
+    before = budget.spent_today()
+    client.post("/v1/messages", json=_msg(stream=stream), headers={"x-api-key": tok})
+    assert len(upstream.requests) == 1
+    # the session is failed and its container told to stop
+    assert store.get_session(sid).status == "failed"
+    assert stopped == [sid]
+    # the owner is paged, with the usage so they can reconcile
+    items = store.list_inbox()
+    assert len(items) == 1
+    assert items[0].title.startswith("metering failed: ")
+    assert "spend for call" in items[0].title and "not booked" in items[0].title
+    assert "no column named truncated" in items[0].title
+    body = items[0].body
+    assert body["session_id"] == sid and body["model"] == "claude-sonnet-5-5"
+    assert body["tokens_out"] in (50, 300)
+    # unknown cost is the worst case, never zero
+    assert body["booked_usd"] > 0
+    assert budget.spent_today() == pytest.approx(before + body["booked_usd"])
+    # nothing more from this session is forwarded
+    r = client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
+    assert r.status_code == 401
+    assert len(upstream.requests) == 1

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import secrets
@@ -168,6 +169,9 @@ def check_content(body: dict[str, Any]) -> None:
         _check_blocks(m.get("content", ""), frozenset(allowed), f"messages[{i}].content")
 
 
+log = logging.getLogger(__name__)
+
+
 class GatewayError(Exception):
     def __init__(self, status: int, kind: str, message: str) -> None:
         super().__init__(message)
@@ -228,6 +232,8 @@ class Gateway:
         self.async_client = httpx2.AsyncClient(transport=async_transport, timeout=UPSTREAM_TIMEOUT)
         self._inflight: dict[str, float] = {}
         self._inflight_lock = threading.Lock()
+        # set by the runner: stops the session's container (metering failed)
+        self.stop_session: Callable[[str], None] | None = None
 
     # --- tokens -------------------------------------------------------------------
 
@@ -403,6 +409,61 @@ class Gateway:
             else:
                 self._inflight.pop(hold.session_id, None)
 
+    def _record_or_fail_closed(self, hold: Hold, gs: GatewaySession, **kw: Any) -> None:
+        """Record a finished upstream call. If that fails the call's spend is
+        unknown: stop the session, book the worst case, page the owner."""
+        try:
+            self._record(gs=gs, **kw)
+        except Exception as e:
+            self._metering_failed(hold, gs, kw["model"], kw["usage"], e)
+
+    def _metering_failed(
+        self, hold: Hold, gs: GatewaySession, model: str, usage: CallUsage, err: Exception
+    ) -> None:
+        """Fail closed. Each step is tried even if an earlier one fails."""
+        log.error("metering failed for session %s: %s", gs.session_id, err)
+        call_id = f"{gs.session_id}:{secrets.token_hex(4)}"
+        reason = redact(f"{type(err).__name__}: {err}")
+        steps: list[Callable[[], Any]] = [
+            lambda: self.revoke(gs.session_id),  # no further call is forwarded
+            lambda: self.budget.book_unmetered(gs.session_id, gs.task_id, hold.amount),
+            lambda: self.store.update_session(gs.session_id, status="failed"),
+            lambda: self.store.add_event(
+                "metering_failed",
+                {"session_id": gs.session_id, "call_id": call_id, "error": reason},
+                Provenance.HUMAN,
+                job_id=gs.job_id,
+                session_id=gs.session_id,
+                task_id=gs.task_id,
+            ),
+            lambda: self.store.create_inbox_item(
+                "questions",
+                "page",
+                gs.job_id,
+                f"metering failed: {reason}; spend for call {call_id} not booked",
+                {
+                    "session_id": gs.session_id,
+                    "call_id": call_id,
+                    "model": model,
+                    "tokens_in": usage.tokens_in,
+                    "tokens_out": usage.tokens_out,
+                    "tokens_cache_read": usage.tokens_cache_read,
+                    "tokens_cache_write_5m": usage.tokens_cache_write_5m,
+                    "tokens_cache_write_1h": usage.tokens_cache_write_1h,
+                    "booked_usd": hold.amount,
+                    "note": "the call's worst-case reservation was booked as spent; "
+                    "reconcile with the provider's usage",
+                    "resumable": False,
+                },
+            ),
+            lambda: self.stop_session(gs.session_id) if self.stop_session else None,
+        ]
+        for step in steps:
+            try:
+                step()
+            except Exception:
+                log.exception("metering-failure step failed for %s", gs.session_id)
+
     def _key(self, preset: Preset) -> str:
         key = self.secrets.get(preset.key_ref)
         if not key:
@@ -535,8 +596,9 @@ class Gateway:
                     # book the call, then let go of its hold (review round 2, N7)
                     try:
                         await resp.aclose()
-                        self._record(
-                            gs=gs,
+                        self._record_or_fail_closed(
+                            hold,
+                            gs,
                             preset_name=gs.preset,
                             preset=preset,
                             model=tap.model or body["model"],
@@ -556,8 +618,9 @@ class Gateway:
                 try:
                     payload = json.loads(data)
                     usage = payload.get("usage") or {}
-                    self._record(
-                        gs=gs,
+                    self._record_or_fail_closed(
+                        hold,
+                        gs,
                         preset_name=gs.preset,
                         preset=preset,
                         model=payload.get("model") or body["model"],

@@ -47,3 +47,13 @@ def test_on_ready_runs_after_every_listener_started(
     )
     assert seen == [[True] * len(FakeServer.instances)]
     assert len(FakeServer.instances) >= 2  # the API and the gateway
+
+
+def test_vigil_data_dir_points_vigild_at_a_scratch_dir(tmp_path: Any, monkeypatch: Any) -> None:
+    from vigild.server import build
+
+    monkeypatch.setenv("VIGIL_DATA_DIR", str(tmp_path / "scratch"))
+    v = build(env_file=tmp_path / "no-env")
+    assert v.cfg.vigild.data_path == tmp_path / "scratch"
+    assert (tmp_path / "scratch" / "vigil.db").exists()
+    v.store.conn.close()

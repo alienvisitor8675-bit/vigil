@@ -144,6 +144,9 @@ class JobRunner:
         self.budget = budget
         self.gateway = gateway
         self.executor = executor
+        stop = getattr(executor, "stop", None)
+        if stop is not None:  # the gateway stops a session whose metering failed
+            self.gateway.stop_session = stop
         self.workspace = workspace
         self.publisher = publisher
         self.telemetry = telemetry
@@ -405,6 +408,7 @@ class JobRunner:
         self.store.update_session(
             s.id, status="running", started_at=iso(), clone_path=str(spec.clone)
         )
+        out: ExecOutcome | None = None
         try:
             with self.telemetry.session(s.id, attrs) as tr:
                 spec.traceparent = tr.traceparent
@@ -421,6 +425,13 @@ class JobRunner:
                     )
                     tr.set("vigil.truncated", True)
                     tr.set("vigil.status", out.status)
+                failed_metering = self.store.q(
+                    "SELECT 1 FROM events WHERE session_id=? AND type='metering_failed'", (s.id,)
+                )
+                if failed_metering:  # a call's spend is unbooked: never a finished session
+                    out.status = "failed"
+                    out.error = "metering failed; see the inbox page"
+                    tr.set("vigil.status", out.status)
                 if out.status != "done":
                     refused = self.store.q(
                         "SELECT data FROM events WHERE session_id=? AND type='gateway_refused'"
@@ -436,8 +447,54 @@ class JobRunner:
             return out
         finally:
             self.gateway.revoke(s.id)
-            self.budget.settle(reservation)
+            self._settle_fail_closed(s, spec, reservation, out)
             self.store.update_session(s.id, ended_at=iso())
+
+    def _settle_fail_closed(
+        self, s: SessionRow, spec: SessionSpec, reservation: int, out: ExecOutcome | None
+    ) -> None:
+        """Settle the session's reservation. If that raises, its spend is unknown:
+        book the whole reservation as spent (never $0), fail the session, page."""
+        try:
+            self.budget.settle(reservation)
+            return
+        except Exception as e:
+            err = redact(f"{type(e).__name__}: {e}")
+        log.error("settle failed for session %s: %s", s.id, err)
+        rows = self.store.q("SELECT amount_usd FROM reservations WHERE id=?", (reservation,))
+        reserved = float(rows[0]["amount_usd"]) if rows else 0.0
+        steps: list[Callable[[], Any]] = [
+            lambda: self.budget.settle(reservation, reserved),
+            lambda: self.store.update_session(s.id, status="failed"),
+            lambda: self.store.add_event(
+                "metering_failed",
+                {"session_id": s.id, "error": err, "booked_usd": reserved},
+                Provenance.HUMAN,
+                job_id=spec.job_id,
+                session_id=s.id,
+                task_id=spec.task_id,
+            ),
+            lambda: self.store.create_inbox_item(
+                "questions",
+                "page",
+                spec.job_id,
+                f"metering failed: {err}; spend for session {s.id} not booked",
+                {
+                    "session_id": s.id,
+                    "booked_usd": reserved,
+                    "note": "the whole reservation was booked as spent; reconcile with provider",
+                    "resumable": False,
+                },
+            ),
+        ]
+        for step in steps:
+            try:
+                step()
+            except Exception:
+                log.exception("settle-failure step failed for %s", s.id)
+        if out is not None:
+            out.status = "failed"
+            out.error = "metering failed; see the inbox page"
 
     def _replan_context(self, job_id: str) -> dict[str, Any]:
         """The failures the owner sent back with the latest re-plan, if any."""
