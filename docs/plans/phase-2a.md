@@ -321,32 +321,40 @@ gets its own plan file and done-when.
         apart.
     - Packet section sizes aren't logged. The `packet` event records only
       `dropped`, so the largest section can't be named from the record.
-  1. **Coord model by change type:** Sonnet for docs, tests and refactors;
-     Opus for money, auth and consent paths, and on escalation. The rule
-     goes in `configs/routing.yaml`. It's the biggest lever: Sonnet costs
-     half Opus per token, and the coord is 75% of the spend.
+  1. **Slot 1: coord model by change type, plus packet maps** (owner,
+     2026-10-23: together, because prefix writes are 45% of spend and
+     scale with packet size for both models).
+     - **Coord model:** Sonnet for docs, tests and refactors; Opus for
+       money, auth and consent paths, and on escalation. The rule goes in
+       `configs/routing.yaml`.
+     - **Packet maps:** paths plus one-line summaries instead of full
+       documents. Per-role packet budgets are enforced. **Every packet
+       logs the size of each section.**
+     - **Re-audit after slot 1:** run the token audit again on the next
+       ParkAgent job and compare it with pa-0002's $1.97.
   2. **Caching:**
-     - a stable prefix (tools, then system, then the fixed packet; see
-       "Context engineering");
-     - a deterministic fence nonce per job, derived with a host key and
-       still checked not to occur in the content, so a redraft or retry
-       reuses the cache;
-     - a caching check in CI;
-     - the cache-hit rate on the Run page.
+     - **Packet order:** repo-wide, then job-wide, then task-specific. The
+       prefix is byte-identical across sessions of the same model, so
+       parallel workers share one cache write.
+     - **The fence nonce:** HMAC(host key, job id). It must never be
+       derivable from job metadata alone. The check that content doesn't
+       contain the nonce stays. Test: an issue body can't predict the
+       nonce.
+     - **Redrafts:** a coord redraft continues the existing session while
+       the cache is warm, instead of starting a new one.
+     - **Checks:** a caching check in CI, and the cache-hit rate on the Run
+       page.
 
-     On pa-0002 alone, a shared prefix would have saved about $0.38 on the
+     On pa-0002, a shared prefix would have saved about $0.38 on the
      coord's redraft and $0.10 on w1's retry.
-  3. **Packet maps:** paths plus one-line summaries instead of full
-     documents. Per-role packet budgets are enforced, and **every packet
-     logs its section sizes**, which closes the audit's gap.
-  4. **Per-role output and thinking budgets,** with terse output
+  3. **Per-role output and thinking budgets,** with terse output
      templates. Output was 25% of the coord's cost.
-  5. **Tool-output trimming in the harness:** keep the head, the tail and
+  4. **Tool-output trimming in the harness:** keep the head, the tail and
      the failure lines, capped. The harness logged 43 tool results on
      pa-0002, with sizes not recorded; record them first.
-  6. **Retries without caching** start from the spec, the plan and the
+  5. **Retries without caching** start from the spec, the plan and the
      failure categories, not the full history.
-  7. **Batch API** for seeded-defect runs, benchmark validation, scorers
+  6. **Batch API** for seeded-defect runs, benchmark validation, scorers
      and nightly audits.
 - **Hardening for unattended runs** (owner, 2026-10-23):
   - **Kill switch:** a host-side flag outside any repo, not in `configs/`.
