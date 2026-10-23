@@ -299,6 +299,57 @@ gets its own plan file and done-when.
     `circuit.py` (Apache-2.0), and list any invariant vigil is missing.
   - Take ideas only, and copy no code. Any adapted text goes in
     `docs/sources.md` with its licence.
+- **Hardening for unattended runs** (owner, 2026-10-23):
+  - **Kill switch:** a host-side flag outside any repo, not in `configs/`.
+    - `vigil stop` sets it and `vigil resume` clears it.
+    - The gateway checks it on every call; vigild checks it before every
+      dispatch, push and PR.
+    - Test: a session can neither set nor clear it.
+  - **Canary tokens:** plant fake AWS, `.env` and GitHub credentials in
+    every session container.
+    - Reading one, or trying to send one out, pages the owner and stops the
+      session.
+    - Matching: the egress proxy matches the token values. Every container
+      already reaches only the gateway, so the gateway scans request bodies
+      for them too.
+    - These are fake values, so they don't break "no secret in a
+      container".
+    - Test: reading or exfiltrating a canary pages and stops the session.
+  - **Exactly-once side effects:**
+    - push, PR open and PR comments carry idempotency keys derived from the
+      job, task and attempt;
+    - status is written before the action, and the result is re-read from
+      GitHub afterwards;
+    - a resume never re-fires an irreversible action without re-checking
+      its approval;
+    - rehearsal test: crash mid-commit, resume, and assert the action
+      happened exactly once.
+  - **Failure detectors on traces:** pattern-based only, no LLM.
+    - Tags: `scope_creep`, `success_hallucination` (the worker reports
+      pass, the verifier fails), `tool_misuse`, `cascading_errors` and
+      `context_loss`.
+    - Show the daily tag distribution, and page above 5%.
+  - **Review independence:**
+    - Prefer a reviewer from a different model family from the worker.
+      Every review records the model pair.
+      - Today every role is Claude: Sonnet reviews and Opus audits, by
+        ruling. So until phase 5's local models land, this is recorded
+        but rarely satisfiable.
+    - A random owner audit of 10% of passed PRs arrives as an inbox item,
+      and its results are stored as labelled data.
+  - **Findings taxonomy:** every finding is tagged spec, coordination or
+    verification. Phase 1's run findings:
+    - #1 (unstable test IDs): verification;
+    - #2 (runner-file pin): verification;
+    - #3 (`depends_on` ignored): coordination.
+  - **Fault drill:** scripted, each with an expected outcome, and all run
+    once before the first overnight run:
+    - provider 429 and 500;
+    - the tower offline;
+    - vigild killed mid-job;
+    - disk full.
+  - **Spend-rate alert:** page when hourly spend exceeds 3× the trailing
+    median, separately from the caps.
 - **No change to the verifier** (owner, 2026-10-23):
   - Bernstein runs gates in the agent's worktree, caches verdicts and
     quarantines flaky tests.
