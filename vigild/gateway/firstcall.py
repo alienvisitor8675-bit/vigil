@@ -44,6 +44,8 @@ def first_calls(cfg: Config, repo: str | None = None) -> list[FirstCall]:
         ("fallback", rt.fallback, cfg.budgets.per_task_usd),
         ("reviewer", rt.reviewer, cfg.budgets.per_task_usd),
         ("auditor", rt.auditor, cfg.budgets.per_task_usd),
+        # the hidden-test author runs on the reviewer tier, under its own cap
+        ("hidden_test_author", rt.reviewer, cfg.budgets.hidden_tests_session_usd),
     ]
     out: list[FirstCall] = []
     for role, preset, limit in roles:

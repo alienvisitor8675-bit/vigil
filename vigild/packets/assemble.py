@@ -293,3 +293,50 @@ def assemble_coord(
         },
         dropped,
     )
+
+
+def hidden_dir(job_id: str, task_id: str) -> str:
+    """Where a task's hidden tests are written (and, by the verifier, run):
+    under `.vigil/`, which the harness always commits, and away from the code."""
+    return f".vigil/{job_id}/hidden/{task_id}"
+
+
+def assemble_hidden_test_author(
+    repo: Path,
+    contract: dict[str, Any],
+    spec_md: str,
+    *,
+    feedback: str | None = None,
+) -> Packet:
+    """The packet for a hidden-test author: the approved spec.md and this one
+    task's contract, nothing else (learning ruling 13). Not plan.md, not the
+    coord's notes or session, not the worker's packet or any attempt."""
+    job_id, task_id = contract["job_id"], contract["task_id"]
+    folder = hidden_dir(job_id, task_id)
+    contract_part = (
+        "```json\n" + json.dumps(contract, indent=2, sort_keys=True) + "\n```\n\n"
+        f"Write your tests under `{folder}/` and nowhere else.\n"
+    )
+    if feedback:
+        contract_part += (
+            "\nYour last attempt was rejected by vigild's check against the base:\n"
+            f"- {feedback}\nWrite the tests again so each one fails an assertion on the base.\n"
+        )
+    manifest = f"{folder}.json"
+    output = (
+        f"End by writing `{manifest}` as "
+        '{"test_cmd": "<one command that runs only your tests>", '
+        '"tests": [{"name": "...", "category": "..."}]}, then commit.'
+    )
+    return Packet(
+        Role.HIDDEN_TEST_AUTHOR,
+        {
+            "role_and_rules": _role_and_rules(Role.HIDDEN_TEST_AUTHOR, repo),
+            "context_pack": f"## spec.md (approved)\n\n```\n{spec_md.rstrip()}\n```",
+            "contract": contract_part,
+            "untrusted": "(none)",
+            "output_schema": output,
+            "self_check": "Does every test fail an assertion on the base, and pass for a "
+            "correct implementation? Is the test_cmd runnable as written?",
+        },
+    )

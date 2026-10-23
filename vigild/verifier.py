@@ -16,6 +16,9 @@ After a worker exits and its branch is in the vault, vigild runs the task's
   when the approved spec names them. A worker can't make "after" pass by
   rewriting the runner, and acceptance rejects the attempt unless the spec
   names the path.
+- **A task whose scope names a runner file** (phase 1 run, finding #2): the
+  runner files stay the base's, except the overlapping ones, which are the
+  head's; the task's hidden tests run as their own base/head pair and decide.
 - **What a result means** (round 3, F3): `judge` maps runner exits that aren't
   test results (pytest 2-5, vitest's "no test files", a signal) to `unknown`.
   pytest and a directly invoked vitest are asked for a JUnit report, written
@@ -40,7 +43,7 @@ import re
 import shlex
 import shutil
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -151,6 +154,32 @@ def invoked_scripts(test_cmd: str) -> list[str]:
         if script and not script.startswith("/"):
             out.append(script)
     return sorted({p.removeprefix("./") for p in out})
+
+
+def runner_globs(runner_config: Iterable[str], test_cmd: str) -> list[str]:
+    """What decides how tests run: the repo's `runner_config` globs and the
+    scripts `test_cmd` runs as programs. One list for the verifier's pins and
+    the spec gate's overlap."""
+    return [*runner_config, *invoked_scripts(test_cmd)]
+
+
+def runner_overlap(scope: Iterable[str], runner_config: Iterable[str], test_cmd: str) -> list[str]:
+    """The literal entries in a task's scope that the verifier pins to the base
+    (a glob in scope can't change a runner file: acceptance refuses a changed
+    runner file the spec doesn't name by its exact path)."""
+    globs = runner_globs(runner_config, test_cmd)
+    return sorted({f for f in scope if not set("*?[") & set(f) and in_scope(f, globs)})
+
+
+@dataclass(frozen=True)
+class HiddenSuite:
+    """A task's hidden tests: files in a vault commit that is on no pushed
+    branch (`sha`), under `prefix`, and the command that runs them."""
+
+    sha: str
+    prefix: str
+    files: tuple[str, ...]
+    test_cmd: str
 
 
 PACKAGE_MANAGERS = {"pnpm", "npm", "yarn"}
@@ -454,17 +483,19 @@ class Verifier:
         test_cmd: str,
         must_fail_first: bool,
         runner_config: Iterable[str] = (),
+        runner_overlap: Sequence[str] = (),
+        hidden: HiddenSuite | None = None,
     ) -> dict[str, Any]:
-        """`test_cmd` is the approved spec's, never the worker's tree's."""
+        """`test_cmd` is the approved spec's, never the worker's tree's.
+
+        `runner_overlap` is the runner files the task's scope names (owner
+        ruling, 2026-10-23): those, and only those, are the head's in every
+        run; `hidden` is the task's hidden tests, run on their own."""
         base_files = self.ws.tree_paths(repo, base_sha)
         head_files = self.ws.tree_paths(repo, head)
-        globs = list(runner_config)
-        # The runner files, from the base, in every run (owner direction, round 3):
-        # the repo's runner_config, and any script test_cmd runs that the base has.
-        pinned = sorted(
-            {p for p in base_files | head_files if in_scope(p, globs)}
-            | {p for p in invoked_scripts(test_cmd) if p in base_files}
-        )
+        cfg = list(runner_config)
+        overlap = sorted(set(runner_overlap))
+        pinned = self._pinned(base_files, head_files, cfg, test_cmd, overlap)
         changed = self.ws.changed(repo, base_sha, head)
         changed_paths = {path for _, path in changed}
         tests = sorted(
@@ -475,6 +506,8 @@ class Verifier:
         record: dict[str, Any] = {
             "test_cmd": test_cmd,
             "runner_config": {"pinned_to_base": [p for p in pinned if p in changed_paths]},
+            "runner_files": overlap,
+            "runner_file_changed": bool(set(overlap) & changed_paths),
         }
         command = with_reports(test_cmd, lambda path: self.ws.read_blob(repo, base_sha, path))
         pin = (base_sha, pinned)
@@ -527,6 +560,11 @@ class Verifier:
             }
         if before is not None:
             record["ids"] = self._ids(before, after, tests)
+        if hidden is not None:
+            record["hidden"] = self._hidden_pair(
+                repo, image, task_id, base_sha, head, hidden, cfg, overlap,
+                base_files, head_files,
+            )  # fmt: skip
         record["provenance"] = "human"  # observed by vigild, not reported by the model
         record["source"] = "verifier"
         for run in (base, base2, before, after):
@@ -534,6 +572,140 @@ class Verifier:
                 run.pop("_cases", None)
                 run.pop("_report", None)
         return record
+
+    @staticmethod
+    def _pinned(
+        base_files: set[str],
+        head_files: set[str],
+        runner_config: list[str],
+        test_cmd: str,
+        overlap: Sequence[str],
+    ) -> list[str]:
+        """The runner files that are the base's in every run (owner direction,
+        round 3): the repo's runner_config, and any script `test_cmd` runs that
+        the base has. Not the overlap, which is the head's."""
+        pinned = {p for p in base_files | head_files if in_scope(p, runner_config)} | {
+            p for p in invoked_scripts(test_cmd) if p in base_files
+        }
+        return sorted(pinned - set(overlap))
+
+    def _hidden_run(
+        self,
+        repo: str,
+        image: str,
+        name: str,
+        sha: str,
+        base_sha: str,
+        hidden: HiddenSuite,
+        pinned: list[str],
+    ) -> dict[str, Any]:
+        command = with_reports(
+            hidden.test_cmd, lambda path: self.ws.read_blob(repo, base_sha, path)
+        )
+        take = [(base_sha, pinned), (hidden.sha, list(hidden.files))]
+        run = self._run(repo, image, name, sha, hidden.test_cmd, command, take)
+        if not run["_report"] and run["outcome"] == "pass":
+            run["outcome"] = "unknown"
+            run["note"] = "no test report: that any hidden test ran can't be confirmed"
+        return run
+
+    @staticmethod
+    def base_failure(run: dict[str, Any]) -> dict[str, Any]:
+        """How a hidden run failed on the base. Every hidden test must fail an
+        assertion: a JUnit `<failure>`. An import, collection or setup error
+        (`<error>`), a pass, a skip, a timeout or a missing report is the wrong
+        way, and doesn't count (owner, 2026-10-23)."""
+        cases = run["_cases"] if run["_report"] else []
+        n = {k: sum(1 for c in cases if c.status == k) for k in ("failure", "error", "pass")}
+        wrong = len(cases) - n["failure"]
+        out: dict[str, Any] = {
+            "outcome": run["outcome"], "tests": len(cases), "failing": n["failure"],
+            "errors": n["error"], "passing": n["pass"],
+        }  # fmt: skip
+        out["ok"] = run["outcome"] == "fail" and bool(cases) and wrong == 0
+        if not out["ok"]:
+            if run["outcome"] == "pass" or (n["pass"] and not n["error"]):
+                out["why"] = "the hidden tests pass on the base; they must fail there"
+            elif n["error"]:
+                out["why"] = (
+                    f"{n['error']} hidden test(s) errored (import, collection or setup) on the "
+                    "base instead of failing an assertion"
+                )
+            elif run["outcome"] == "timeout":
+                out["why"] = "the hidden tests timed out on the base"
+            else:
+                out["why"] = (
+                    f"the hidden tests must each fail an assertion on the base, with a report; "
+                    f"the run was {run['outcome']} with {len(cases)} test(s) in its report"
+                )
+        return out
+
+    def check_hidden_on_base(
+        self,
+        *,
+        repo: str,
+        image: str,
+        task_id: str,
+        base_sha: str,
+        hidden: HiddenSuite,
+        runner_config: Iterable[str] = (),
+        overlap: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Spec time: hidden tests must fail on the base, in their own run,
+        each with an assertion failure."""
+        base_files = self.ws.tree_paths(repo, base_sha)
+        pinned = self._pinned(base_files, set(), list(runner_config), hidden.test_cmd, overlap)
+        pinned = [p for p in pinned if p not in hidden.files]
+        run = self._hidden_run(repo, image, f"{task_id}-hspec", base_sha, base_sha, hidden, pinned)
+        return self.base_failure(run)
+
+    def _hidden_pair(
+        self,
+        repo: str,
+        image: str,
+        task_id: str,
+        base_sha: str,
+        head: str,
+        hidden: HiddenSuite,
+        runner_config: list[str],
+        overlap: Sequence[str],
+        base_files: set[str],
+        head_files: set[str],
+    ) -> dict[str, Any]:
+        """The hidden tests as their own run, base against head (learning
+        ruling 14). They decide a runner-file task: they must fail on the base
+        and pass on the head, with a report, and head may run no fewer."""
+        out: dict[str, Any] = {"test_cmd": hidden.test_cmd, "files": len(hidden.files)}
+        planted = sorted(p for p in head_files if p.startswith(hidden.prefix.rstrip("/") + "/"))
+        if planted:
+            # a worker can't put files where the hidden tests run (a conftest.py there)
+            out.update(ok=False, tampered=planted[:20], failed_on_base=False, passed_on_head=False)
+            return out
+        pinned = [
+            p
+            for p in self._pinned(base_files, head_files, runner_config, hidden.test_cmd, overlap)
+            if p not in hidden.files
+        ]
+        b = self._hidden_run(repo, image, f"{task_id}-hbase", base_sha, base_sha, hidden, pinned)
+        h = self._hidden_run(repo, image, f"{task_id}-hhead", head, base_sha, hidden, pinned)
+        failed_on_base = self.base_failure(b)["ok"]
+        passed_on_head = h["outcome"] == "pass" and h["_report"] and h["tests"] > 0
+        ran: dict[str, Any] = {"checked": False}
+        if b["_report"] and h["_report"]:
+            ran = {**compare_runs(b["_cases"], h["_cases"]), "against": "base"}
+        out.update(
+            base=b,
+            head=h,
+            failed_on_base=failed_on_base,
+            base_failure={k: v for k, v in self.base_failure(b).items() if k != "ok"},
+            passed_on_head=bool(passed_on_head),
+            ran=ran,
+            ok=bool(failed_on_base and passed_on_head and (not ran.get("checked") or ran["ok"])),
+        )
+        for run in (b, h):
+            run.pop("_cases", None)
+            run.pop("_report", None)
+        return out
 
     @staticmethod
     def _ids(before: dict[str, Any], after: dict[str, Any], tests: list[str]) -> dict[str, Any]:

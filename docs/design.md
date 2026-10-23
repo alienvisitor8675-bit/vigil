@@ -548,7 +548,7 @@ How Vigil gets better from its own jobs.
 - **What `reward.json` is for.** It is finalised after the audit and is **never an input to any decision about the job itself**. It feeds only the job's learning record and the ladder.
 - **Audit samples.** Top-reward jobs are a **separate audit sample**. The ladder's statistics come from the random sample only. Reward–audit agreement is tracked per component, and a component below its threshold is frozen out of the reward until it is recalibrated.
 
-**Hidden tests.**
+**Hidden tests.** *Implemented for runner-file tasks only (owner ruling 2026-10-23, hotfix 4): `docs/architecture.md` B40. The learning epic extends it to every task.*
 - **Who writes them:** at spec time, a second, fresh-context session writes acceptance tests from the spec and the product model only. The spec author's session is never the worker's session.
 - **They must fail on base.**
 - **Where they live:** vigild stores them. They are **never on the branch**, which makes them the one stage artifact not committed under `.vigil/`, and they run only in the verifier.

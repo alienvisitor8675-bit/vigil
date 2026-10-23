@@ -54,25 +54,28 @@ from vigild.contract.models import (
     WorkerContract,
     WorkerReport,
 )
-from vigild.db import Store, iso
+from vigild.db import SessionRoleError, Store, iso
 from vigild.devimage import DevImages, SessionImages, StaleDevImage, missing_tools
 from vigild.executors.base import ExecOutcome, Executor, SessionSpec
 from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
 from vigild.github.publish import PublishError
-from vigild.jobs.acceptance import check_worker, runner_config_changes
+from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
+from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, entry_suite, load_suite
+from vigild.intake.spec_gate import test_cmd_problem
+from vigild.jobs.acceptance import NO_HIDDEN, check_worker, escalates
 from vigild.jobs.artifacts import parse_plan, render
 from vigild.jobs.deps import infer_deps, is_lockfile
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import JobState, Role, SessionRow
 from vigild.metering.calls import last_call_truncated, session_cost
-from vigild.packets.assemble import assemble_coord, assemble_worker
+from vigild.packets.assemble import assemble_coord, assemble_hidden_test_author, assemble_worker
 from vigild.packets.fence import fence
 from vigild.provenance import Provenance
 from vigild.redact import redact
 from vigild.repos import RepoPolicyError, check_backend
 from vigild.router.rules import RoutingError, route
 from vigild.telemetry.spans import Telemetry
-from vigild.verifier import Verifier
+from vigild.verifier import Verifier, runner_overlap
 from vigild.workspace import Workspace, WorkspaceError
 
 log = logging.getLogger("vigild.runner")
@@ -105,6 +108,8 @@ class Pager(Protocol):
         self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
     ) -> Any: ...
     def file_for_approval(self, job_id: str) -> list[str]: ...
+    def flagged_tasks(self, job_id: str) -> dict[str, list[str]]: ...
+    def file_item(self, job_id: str) -> None: ...
 
 
 class Refused(Exception):
@@ -246,6 +251,10 @@ class JobRunner:
     def on_job_created(self, job_id: str, needs_spec: bool) -> None:
         if needs_spec:
             self._spawn(self.run_coord, job_id)
+        elif self.jobs is not None and self.jobs.flagged_tasks(job_id):
+            # a submitted task that names a runner file: its hidden tests are
+            # written in the background, and then the spec is filed
+            self._spawn(self._finish_spec, job_id)
 
     def on_approved(self, job_id: str) -> None:
         self._spawn(self.build, job_id)
@@ -286,7 +295,7 @@ class JobRunner:
             if s.status in LIVE_SESSION:
                 self.store.update_session(s.id, status="failed", ended_at=iso())
                 out["sessions"] += 1
-                if s.role is Role.COORD and s.job_id:
+                if s.role in (Role.COORD, Role.HIDDEN_TEST_AUTHOR) and s.job_id:
                     failed_coord.add(s.job_id)
         for rid in self.budget.open_reservation_ids():
             self.budget.settle(rid)
@@ -374,14 +383,12 @@ class JobRunner:
         assert self.jobs is not None
         self.jobs.page(job_id, title, body, resumable=resumable)
 
-    def _block(self, job_id: str, reason: str) -> None:
+    def _block(self, job_id: str, reason: str, *, state: JobState = JobState.BLOCKED) -> None:
         try:
             job = self.store.get_job(job_id)
             if job.state in (JobState.BLOCKED, JobState.ESCALATED, JobState.DONE):
                 return
-            transition(
-                self.store, job_id, JobState.BLOCKED, Actor.VIGILD, evidence={"reason": reason}
-            )
+            transition(self.store, job_id, state, Actor.VIGILD, evidence={"reason": reason})
         except TransitionError, KeyError:
             log.warning("could not block %s", job_id)
 
@@ -402,6 +409,10 @@ class JobRunner:
         self, s: SessionRow, spec: SessionSpec, reservation: int, attrs: dict[str, Any]
     ) -> ExecOutcome:
         """Token, telemetry, run, revoke, settle. The reservation is already made."""
+        if s.role is not spec.role:
+            # role separation, enforced at dispatch: a session row never runs as
+            # another role, so an author's session is never a worker or a reviewer
+            raise SessionRoleError(f"session {s.id} is a {s.role.value}, not a {spec.role.value}")
         token = self.gateway.issue_token(
             s.id, spec.repo, spec.preset, ttl_minutes=spec.max_minutes + TOKEN_TTL_MARGIN_MIN
         )
@@ -570,6 +581,7 @@ class JobRunner:
             gate_errors, previous = draft
             if not gate_errors:
                 self.store.update_session(coord.id, status="done")
+                self._finish_spec(job_id)
                 return
             self.store.update_session(coord.id, status="revise")
             self.store.add_event(
@@ -698,6 +710,167 @@ class JobRunner:
         assert self.jobs is not None
         return self.jobs.file_for_approval(job_id), drafts
 
+    # --- stage 1b: hidden tests for a task whose scope names a runner file --------------------
+
+    def _finish_spec(self, job_id: str) -> None:
+        """The spec passed the gate. For each runner-file task a fresh author
+        session writes its hidden tests (the job stays `spec_pending` and no
+        inbox item exists meanwhile); then the spec is filed. An author that
+        fails twice leaves the task marked "hidden tests missing"."""
+        assert self.jobs is not None
+        flagged = self.jobs.flagged_tasks(job_id)
+        if not flagged:
+            return  # file_for_approval already filed an ordinary spec
+        self._author_hidden_tests(job_id, flagged)
+        self.jobs.file_item(job_id)
+
+    def _author_hidden_tests(self, job_id: str, flagged: dict[str, list[str]]) -> None:
+        job = self.store.get_job(job_id)
+        spec = self.store.get_artifact(job_id, "spec.md")
+        plan = self.store.get_artifact(job_id, "plan.md")
+        assert spec is not None and plan is not None
+        tasks: dict[str, Any] = {}
+        for w in parse_plan(plan.content).workers:
+            if w.task_id not in flagged:
+                continue
+            contract = self._task(job_id, job.repo, job.base, job.source, w).model_dump(mode="json")
+            try:
+                entry = self._author_one(job, spec.content, contract, flagged[w.task_id])
+            except Exception as e:  # never leaves the spec unfiled
+                log.exception("hidden-test author failed on %s", w.task_id)
+                entry = {"status": "missing", "reason": f"vigild error: {type(e).__name__}"}
+            tasks[w.task_id] = entry
+            self.store.add_event(
+                "hidden_tests",
+                {
+                    "task": w.task_id,
+                    "status": entry["status"],
+                    "attempts": entry.get("attempts"),
+                    "reason": entry.get("reason"),
+                    "tests": len(entry.get("tests", [])),
+                },
+                Provenance.HUMAN,
+                job_id=job_id,
+            )
+        self.store.add_artifact(
+            job_id,
+            HIDDEN_ARTIFACT,
+            json.dumps({"provenance": "claude", "tasks": tasks}),
+            Provenance.CLAUDE,
+        )
+
+    def _author_one(
+        self, job: Any, spec_md: str, contract: dict[str, Any], overlap: list[str]
+    ) -> dict[str, Any]:
+        """Up to AUTHOR_ATTEMPTS sessions: the second is the one regeneration,
+        after a session that failed or tests that failed the wrong way."""
+        preset = self.cfg.routing.reviewer  # the reviewer tier (Sonnet)
+        try:
+            check_backend(self.cfg, job.repo, preset)
+        except RepoPolicyError as e:
+            return {"status": "missing", "reason": f"backend refused: {e}", "attempts": 0}
+        feedback: str | None = None
+        reason = "no session ran"
+        for attempt in range(1, AUTHOR_ATTEMPTS + 1):
+            got, reason = self._author_attempt(
+                job, spec_md, contract, overlap, preset, attempt, feedback
+            )
+            if got is not None:
+                return {**got, "attempts": attempt}
+            feedback = reason
+        return {"status": "missing", "reason": reason, "attempts": AUTHOR_ATTEMPTS}
+
+    def _author_attempt(
+        self,
+        job: Any,
+        spec_md: str,
+        contract: dict[str, Any],
+        overlap: list[str],
+        preset: str,
+        attempt: int,
+        feedback: str | None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        job_id, task_id = job.id, str(contract["task_id"])
+        s = self.store.create_session(
+            job_id,
+            Role.HIDDEN_TEST_AUTHOR,
+            backend_preset=preset,
+            branch=f"vigil/{task_id}-hidden{attempt}",
+        )  # no parent: a fresh context, never the coord's or a worker's
+        # the task has no row yet at spec time, so the session names it in its detail
+        self.store.update_session(s.id, detail={"for_task": task_id, "attempt": attempt})
+        try:
+            rid = self._reserve_queued(
+                job_id, "hidden_test_author", session_id=s.id, task_id=None,
+                amount=self.cfg.budgets.hidden_tests_session_usd, purpose="hidden_tests",
+            )  # fmt: skip
+        except BudgetExceeded as e:
+            self.store.update_session(s.id, status="refused")
+            return None, f"{e.cap} cap reached"
+        clone_id, branch = f"{task_id}-ht{attempt}", f"vigil/{task_id}-hidden{attempt}"
+        try:
+            clone = self.workspace.clone(job.repo, clone_id, branch=branch, base=job.base)
+            base_sha = self.workspace.base_sha(clone_id)
+            image = self.dev_images.ensure_fresh(job.repo, base_sha)
+            session_image = self._session_image(job.repo, base_sha)
+            self.workspace.write_task(clone, {**contract, "branch": branch, "base_sha": base_sha})
+            packet = assemble_hidden_test_author(clone, contract, spec_md, feedback=feedback)
+            self.store.add_event(
+                "packet",
+                {"role": "hidden_test_author", "attempt": attempt, "dropped": packet.dropped},
+                Provenance.HUMAN, job_id=job_id, session_id=s.id,
+            )  # fmt: skip
+            spec = SessionSpec(
+                session_id=s.id, role=Role.HIDDEN_TEST_AUTHOR, job_id=job_id, task_id=task_id,
+                repo=job.repo, preset=preset, model=self.cfg.preset(preset).model or "",
+                clone=clone, session_dir=self._session_dir(s.id), max_turns=40,
+                max_minutes=COORD_MINUTES,
+                max_budget_usd=self.cfg.budgets.hidden_tests_session_usd,
+                mounts=self.workspace.overlays(clone), packet=packet.text, image=session_image,
+                max_output_tokens=self.cfg.budgets.session_max_output_tokens,
+            )  # fmt: skip
+        except Exception as e:
+            self.budget.settle(rid, 0.0)
+            self.store.update_session(s.id, status="failed")
+            return None, f"setup failed: {type(e).__name__}"
+        out = self._run_session(
+            s, spec, rid,
+            {"vigil.job_id": job_id, "vigil.task_id": task_id, "vigil.role": "hidden_test_author",
+             "vigil.repo": job.repo, "vigil.attempt": attempt},
+        )  # fmt: skip
+        if out.status != "done":
+            self.store.update_session(s.id, status="failed")
+            return None, f"the author session {out.status}"
+        try:
+            sha = self.workspace.import_result(
+                job.repo, clone_id, spec.session_dir / "out", branch, base_sha,
+                head=str(out.result.get("head") or ""),
+            )  # fmt: skip
+            suite, manifest = load_suite(
+                self.workspace, job.repo, sha, base_sha, job_id, task_id, test_cmd_problem
+            )
+        except (WorkspaceError, HiddenError) as e:
+            self.store.update_session(s.id, status="failed")
+            return None, str(e)[:300]
+        check = self.verifier.check_hidden_on_base(
+            repo=job.repo, image=image, task_id=task_id, base_sha=base_sha, hidden=suite,
+            runner_config=self.cfg.repo(job.repo).runner_config, overlap=overlap,
+        )  # fmt: skip
+        if not check["ok"]:
+            self.store.update_session(s.id, status="failed")
+            return None, str(check.get("why") or "the hidden tests did not fail on the base")
+        self.store.update_session(s.id, status="done")
+        return {
+            "status": "ok",
+            "sha": suite.sha,
+            "prefix": suite.prefix,
+            "files": list(suite.files),
+            "test_cmd": suite.test_cmd,
+            "tests": [t.model_dump() for t in manifest.tests],
+            "author_session": s.id,
+            "base_check": {k: v for k, v in check.items() if k != "why"},
+        }, ""
+
     # --- stages 2-3: planning and building -----------------------------------------------
 
     def _task(self, job_id: str, repo: str, base: str, source: str, w: WorkerContract) -> Task:
@@ -725,6 +898,9 @@ class JobRunner:
             depends_on=w.depends_on,
             labels=w.labels,
             size=w.size,
+            runner_file_change=runner_overlap(
+                w.files_in_scope, self.cfg.repo(repo).runner_config, w.test_cmd
+            ),
         )
 
     def build(self, job_id: str) -> None:
@@ -893,13 +1069,25 @@ class JobRunner:
                 resumable=can_retry,
             )
             return
+        escalated = [t for t, v in tasks.items() if v.get("escalate")]
+        if escalated:
+            # a retry would build the same thing; only a new plan (and new hidden tests) helps
+            can_retry = False
         actions = (["retry"] if can_retry else []) + ["replan", "abandon"]
-        self._block(job_id, f"workers failed: {sorted(task_ids)}")
+        self._block(
+            job_id,
+            f"workers failed: {sorted(task_ids)}",
+            state=JobState.ESCALATED if escalated else JobState.BLOCKED,
+        )
         titles = "; ".join(str(t.get("title") or tid) for tid, t in tasks.items())
         self._page(
             job_id,
             f"{job_id}: {len(task_ids)} worker(s) need you: {titles}"[:300],
-            {"kind": "worker_failed", "tasks": tasks, "actions": actions},
+            {
+                "kind": "escalated" if escalated else "worker_failed",
+                "tasks": tasks,
+                "actions": actions,
+            },
             resumable=can_retry,
         )
 
@@ -985,6 +1173,34 @@ class JobRunner:
             self._why[task_id] = why
         self.store.add_event("task_failed", why, Provenance.HUMAN, job_id=job_id, task_id=task_id)
         return False
+
+    def _hidden_entry(self, job_id: str, task_id: str) -> dict[str, Any] | None:
+        art = self.store.get_artifact(job_id, HIDDEN_ARTIFACT)
+        if art is None:
+            return None
+        entry = json.loads(art.content).get("tasks", {}).get(task_id)
+        return entry if isinstance(entry, dict) else None
+
+    def _runner_note(
+        self, repo: str, base_sha: str, head: str, overlap: list[str], tests: dict[str, Any] | None
+    ) -> str:
+        """The PR body's plain statement for a runner-file task: the class is
+        durable (`runner_file_change`), the owner looks, hidden tests decided."""
+        if not overlap:
+            return ""
+        changed = {path for _, path in self.workspace.changed(repo, base_sha, head)}
+        moved = [p for p in overlap if p in changed]
+        files = ", ".join(f"`{p}`" for p in moved or overlap)
+        what = "runner file changed" if moved else "runner file in scope, unchanged"
+        hidden = (tests or {}).get("hidden") or {}
+        count = (hidden.get("head") or {}).get("tests")
+        return (
+            f"**Owner review required: {what}: {files}.** The verifier ran the head's copy of "
+            "only that file and the base's copy of every other runner file. Hidden tests "
+            "(kept by vigild, not on this branch) failed on the base and pass on the head "
+            f"({count} test(s)); they decide, and the visible test is reported but is not "
+            "enough.\n\n"
+        )
 
     def _run_worker(self, job_id: str, task_id: str, reservation: int, amount: float) -> bool:
         held: dict[str, SessionRow] = {}
@@ -1165,6 +1381,14 @@ class JobRunner:
             return False
         tests = None
         test_cmd = str(contract["spec"].get("test_cmd") or "")
+        # owner ruling, 2026-10-23: vigild computes the class itself; the contract's
+        # marker is the durable copy, not the authority
+        overlap = runner_overlap(
+            contract["spec"].get("files_in_scope") or [],
+            self.cfg.repo(job.repo).runner_config,
+            test_cmd,
+        )
+        hidden_entry = self._hidden_entry(job_id, task_id) if overlap else None
         if test_cmd.strip():
             try:
                 tests = self.verifier.verify(
@@ -1176,12 +1400,17 @@ class JobRunner:
                     test_cmd=test_cmd,  # the approved spec's, never the worker's tree
                     must_fail_first=bool(contract["spec"].get("must_fail_first", True)),
                     runner_config=self.cfg.repo(job.repo).runner_config,
+                    runner_overlap=overlap,
+                    hidden=entry_suite(hidden_entry),
                 )
             except Exception as e:  # docker or git trouble: no verdict, nothing accepted
                 log.exception("verifier failed on %s", task_id)
                 return self._fail(
                     job_id, s, task_id, f"{task_id}: verifier error", {"error": str(e)[:1000]}
                 )
+            if overlap and "hidden" not in tests:
+                reason = (hidden_entry or {}).get("reason") or "none were written"
+                tests["hidden"] = {"present": False, "reason": reason}
             self.store.add_artifact(
                 job_id, "tests.json", json.dumps(redact(tests)), Provenance.HUMAN, task_id=task_id
             )
@@ -1210,25 +1439,28 @@ class JobRunner:
             cost=session_cost(self.store, s.id),
             runner_config=self.cfg.repo(job.repo).runner_config,
         )
+        if errors and escalates(tests) and all(e.startswith(NO_HIDDEN) for e in errors):
+            # built and verified, but with no hidden tests it can never pass
+            self.store.add_event(
+                "escalated",
+                {"task": task_id, "runner_files": overlap, "reason": errors[0]},
+                Provenance.HUMAN,
+                job_id=job_id,
+                task_id=task_id,
+            )
+            return self._fail(
+                job_id,
+                s,
+                task_id,
+                f"{task_id}: escalated: runner file task without hidden tests",
+                {"escalate": errors[0], "runner_files": overlap},
+                state="escalated",
+            )
         if errors:
             return self._fail(
                 job_id, s, task_id, f"{task_id}: stage 3 acceptance failed", {"errors": errors}
             )
-        _, changed_cfg = runner_config_changes(
-            self.workspace,
-            job.repo,
-            base_sha,
-            head,
-            contract,
-            self.cfg.repo(job.repo).runner_config,
-        )
-        runner_note = (
-            "**This task changes how tests run:** "
-            + ", ".join(f"`{p}`" for p in changed_cfg)
-            + ". The spec names each path; the verifier ran the base's copies.\n\n"
-            if changed_cfg
-            else ""
-        )
+        runner_note = self._runner_note(job.repo, base_sha, head, overlap, tests)
         body = (
             f"{report.summary}\n\n{runner_note}Job `{job_id}`, task `{task_id}` (tier `{t.tier}`: "
             f"{t.tier_reason}).\n\nTest: `{contract['spec']['test_cmd']}` "
@@ -1253,7 +1485,7 @@ class JobRunner:
         self.store.update_task(task_id, state="pr_open")
         self.store.add_event(
             "pr_open",
-            {"pr_url": url, "branch": branch, "head": head},
+            {"pr_url": url, "branch": branch, "head": head, "runner_file_change": overlap},
             Provenance.HUMAN,
             job_id=job_id,
             session_id=s.id,

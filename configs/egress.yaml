@@ -24,3 +24,4 @@ roles:
   worker:   [pypi.org, files.pythonhosted.org]
   reviewer: []
   auditor:  []
+  hidden_test_author: []
