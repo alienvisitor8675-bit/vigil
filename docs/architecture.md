@@ -452,6 +452,11 @@ file (runbook). The Cloudflare token is optional, because Haiku covers.
 
 ### Phase 2: Review ladder, fleet, CLI and MCP, session proxy (worker: Opus)
 
+The full plan, with the owner's 2026-10-22/23 additions (resume, circuit
+breakers, the Stop hook, the product model, and the phase 1 carry-overs), is
+`docs/plans/phase-2.md`. It is dispatched only after the phase 1 done-when
+run on ParkAgent completes against `main`.
+
 - **Review:**
   - reviewer (Sonnet) and auditor (Opus) sessions;
   - rung 0 with a 100% audit;
