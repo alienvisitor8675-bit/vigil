@@ -47,3 +47,13 @@ def test_on_ready_runs_after_every_listener_started(
     )
     assert seen == [[True] * len(FakeServer.instances)]
     assert len(FakeServer.instances) >= 2  # the API and the gateway
+
+
+def test_vigil_data_dir_overrides_the_data_dir(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A second vigild (a done-when run) keeps its own database and clones."""
+    from vigild.server import build
+
+    monkeypatch.setenv("VIGIL_DATA_DIR", str(tmp_path / "other"))
+    v = build(env_file=tmp_path / "no-env")
+    assert v.cfg.vigild.data_path == tmp_path / "other"
+    assert (tmp_path / "other" / "vigil.db").is_file()

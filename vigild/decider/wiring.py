@@ -18,6 +18,7 @@ from vigild.decider.backends.haiku import HaikuBackend
 from vigild.decider.backends.jev import JevCloudflare, JevOpenRouter
 from vigild.decider.policy import Backend, Decider
 from vigild.gateway.service import Gateway
+from vigild.telemetry.spans import Telemetry
 
 
 def available_routes(secrets: Secrets) -> set[str]:
@@ -31,15 +32,24 @@ def available_routes(secrets: Secrets) -> set[str]:
 
 
 def build_decider(
-    cfg: Config, store: Store, gateway: Gateway, secrets: Secrets, client: httpx2.Client
+    cfg: Config,
+    store: Store,
+    gateway: Gateway,
+    secrets: Secrets,
+    client: httpx2.Client,
+    telemetry: Telemetry | None = None,
 ) -> Decider:
     backends: dict[str, Backend] = {"haiku": HaikuBackend(gateway)}
     routes = available_routes(secrets)
     account, cf_token = secrets.get("CLOUDFLARE_ACCOUNT_ID"), secrets.get("CLOUDFLARE_API_TOKEN")
     if "jev-cloudflare" in routes and account and cf_token:
         backends["jev-cloudflare"] = JevCloudflare(
-            client, account_id=account, token=cf_token, meter=gateway.metered
-        )
+            client, account_id=account, token=cf_token, meter=gateway.metered,
+            version_pin=cfg.backends.decider_routes["jev-cloudflare"].version_pin,
+        )  # fmt: skip
     if "jev-openrouter" in routes and (or_key := secrets.get("OPENROUTER_API_KEY")):
-        backends["jev-openrouter"] = JevOpenRouter(client, token=or_key, meter=gateway.metered)
-    return Decider(cfg, store, backends)
+        backends["jev-openrouter"] = JevOpenRouter(
+            client, token=or_key, meter=gateway.metered,
+            version_pin=cfg.backends.decider_routes["jev-openrouter"].version_pin,
+        )  # fmt: skip
+    return Decider(cfg, store, backends, breakers=gateway.breakers, telemetry=telemetry)

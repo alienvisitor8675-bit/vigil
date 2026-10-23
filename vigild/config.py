@@ -42,6 +42,8 @@ class DeciderRoute(_M):
     model: str | None = None
     key_ref: str | None = None
     live: bool = True
+    # Jev: the exact version its responses must report (owner, 2026-10-23)
+    version_pin: str | None = None
 
 
 class BackendsFile(_M):
@@ -50,7 +52,8 @@ class BackendsFile(_M):
 
 
 class RepoPolicy(_M):
-    visibility: Literal["public", "private"]
+    # No `visibility`: GitHub's live answer is the only source (owner,
+    # 2026-10-23; vigild/repos.py `live_private`).
     decider: list[str]
     backends: list[str]
     worker_overflow: list[str] = Field(default_factory=list)
@@ -224,6 +227,7 @@ class Scheduler(_M):
     intake_poll_seconds: int = Field(default=300, ge=10)  # the vigil:ready label
     pr_poll_seconds: int = Field(default=120, ge=10)  # merged PRs (deps auto-resume)
     resume_attempts: int = Field(default=2, ge=0)  # crash resumes per task
+    checkpoint_seconds: int = Field(default=30, ge=1)  # a worker's checkpoints, at most this often
 
 
 class BreakerLimits(_M):

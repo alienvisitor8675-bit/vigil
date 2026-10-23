@@ -377,3 +377,16 @@ def test_a_checkpoint_bundles_the_work_without_touching_the_branch(tmp_path: Pat
     assert _run(work, "show", f"{commit}:a.txt") == "changed"
     heads = _run(work, "bundle", "list-heads", str(ep.OUT / "checkpoint.bundle"))
     assert heads == f"{commit} refs/vigil/checkpoint"
+
+
+def test_a_review_caps_each_calls_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gateway holds a call's worst case (max_tokens of output) against the
+    reservation; a reviewer's cap keeps that inside a review's reservation."""
+    ep = _entrypoint()
+    monkeypatch.setenv("VIGIL_GATEWAY_URL", "http://gw")
+    monkeypatch.setenv("VIGIL_MAX_OUTPUT_TOKENS", "8192")
+    assert (
+        ep.agent_options("reviewer", TOKEN, print)["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "8192"
+    )
+    monkeypatch.delenv("VIGIL_MAX_OUTPUT_TOKENS")
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in ep.agent_options("worker", TOKEN, print)["env"]

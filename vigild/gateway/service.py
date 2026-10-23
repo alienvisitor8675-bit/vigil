@@ -38,7 +38,7 @@ from vigild.metering.calls import CallUsage, SSEUsageTap, record_call, usage_fro
 from vigild.metering.prices import PriceTable
 from vigild.provenance import Provenance
 from vigild.redact import redact
-from vigild.repos import RepoPolicyError, check_backend, check_decider_route
+from vigild.repos import RepoPolicyError, check_backend, check_decider_route, live_private
 
 FORWARD_HEADERS = ("anthropic-version", "anthropic-beta", "content-type", "accept")
 # Review round 1, item 5: only plain Messages requests pass. Server tools and
@@ -173,6 +173,7 @@ class GatewaySession:
     task_id: str | None
     job_id: str | None
     model: str = ""
+    private: bool = True  # read live when the token was issued (fail closed)
 
 
 @dataclass
@@ -234,13 +235,16 @@ class Gateway:
 
     def issue_token(self, session_id: str, repo: str, preset: str, *, ttl_minutes: int = 60) -> str:
         """A session's token: its repo, its preset's model, and a life of the
-        session's own limit plus a margin (review round 1, item 7)."""
-        check_backend(self.cfg, repo, preset)
+        session's own limit plus a margin (review round 1, item 7). The repo's
+        visibility is read live here, at dispatch, and kept with the token for
+        the session's per-call checks (owner, 2026-10-23)."""
+        private = live_private(repo)
+        check_backend(self.cfg, repo, preset, private=private)
         token = "vgw_" + secrets.token_urlsafe(32)
         expires = utcnow() + timedelta(minutes=ttl_minutes)
         self.store.x(
             "INSERT INTO gateway_tokens (token_hash, session_id, repo, backend_preset, model,"
-            " created_at, expires_at) VALUES (?,?,?,?,?,?,?)",
+            " created_at, expires_at, private) VALUES (?,?,?,?,?,?,?,?)",
             (
                 _hash(token),
                 session_id,
@@ -249,6 +253,7 @@ class Gateway:
                 self.cfg.preset(preset).model or "",
                 iso(),
                 iso(expires),
+                int(private),
             ),
         )
         return token
@@ -270,7 +275,7 @@ class Gateway:
             raise GatewayError(401, "authentication_error", "missing session token")
         rows = self.store.q(
             "SELECT g.session_id, g.repo, g.backend_preset, g.revoked_at, g.model, g.expires_at,"
-            " s.task_id, s.job_id"
+            " g.private, s.task_id, s.job_id"
             " FROM gateway_tokens g LEFT JOIN sessions s ON s.id = g.session_id"
             " WHERE g.token_hash=?",
             (_hash(token),),
@@ -281,14 +286,15 @@ class Gateway:
         if r["expires_at"] and datetime.fromisoformat(r["expires_at"]) <= utcnow():
             raise GatewayError(401, "authentication_error", "session token expired")
         return GatewaySession(
-            r["session_id"], r["repo"], r["backend_preset"], r["task_id"], r["job_id"], r["model"]
-        )
+            r["session_id"], r["repo"], r["backend_preset"], r["task_id"], r["job_id"], r["model"],
+            private=r["private"] is None or bool(r["private"]),
+        )  # fmt: skip
 
     # --- checks ---------------------------------------------------------------------
 
-    def _preset(self, repo: str, preset_name: str) -> Preset:
+    def _preset(self, repo: str, preset_name: str, *, private: bool) -> Preset:
         try:
-            check_backend(self.cfg, repo, preset_name)
+            check_backend(self.cfg, repo, preset_name, private=private)
         except RepoPolicyError as e:
             raise GatewayError(403, "permission_error", str(e)) from e
         preset = self.cfg.preset(preset_name)
@@ -398,7 +404,7 @@ class Gateway:
         if path not in METERED_PATHS + FREE_PATHS:
             raise GatewayError(404, "not_found_error", f"{path} is not served")
         try:
-            preset = self._preset(gs.repo, gs.preset)
+            preset = self._preset(gs.repo, gs.preset, private=gs.private)
             try:
                 body = json.loads(raw or b"{}")
             except json.JSONDecodeError as e:
@@ -545,9 +551,11 @@ class Gateway:
         run: Callable[[], dict[str, Any]],
     ) -> dict[str, Any]:
         """A non-Anthropic call vigild makes itself (Jev): the same route check,
-        reservation and per-call row as everything through the gateway (item 11)."""
+        reservation and per-call row as everything through the gateway (item 11).
+        The repo's visibility is read again right before the call: a repo that
+        went private since dispatch never reaches OpenRouter (owner, 2026-10-23)."""
         try:
-            check_decider_route(self.cfg, repo, route)
+            check_decider_route(self.cfg, repo, route, private=live_private(repo))
         except RepoPolicyError as e:
             raise GatewayError(403, "permission_error", str(e)) from e
         try:
@@ -594,7 +602,7 @@ class Gateway:
     def call(
         self, *, repo: str, preset: str, body: dict[str, Any], purpose: str, job_id: str | None
     ) -> dict[str, Any]:
-        p = self._preset(repo, preset)
+        p = self._preset(repo, preset, private=live_private(repo))
         body = {**body, "model": p.model}
         raw = json.dumps(body).encode()
         model = self._check_model(repo, p, p.model)

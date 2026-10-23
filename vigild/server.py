@@ -81,8 +81,9 @@ def build(
     **gateway_kwargs: Any,
 ) -> Vigild:
     cfg = config.load(config_dir)
-    if data_dir is not None:
-        cfg.vigild.data_dir = str(data_dir)
+    override = data_dir if data_dir is not None else config.env_override("VIGIL_DATA_DIR")
+    if override is not None:
+        cfg.vigild.data_dir = str(override)  # a second vigild (a test run) keeps its own data
     secrets = config.load_secrets(env_file)
     data = cfg.vigild.data_path
     data.mkdir(parents=True, exist_ok=True)
@@ -270,7 +271,7 @@ def start_pollers(v: Vigild, app: Any, runner: JobRunner) -> threading.Event:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    from vigild.repos import RepoPolicyError, verify_visibility
+    from vigild.repos import RepoPolicyError, set_visibility_source, verify_visibility
 
     v = build()
     app = _github_app(v)
@@ -280,9 +281,12 @@ def main() -> None:
             "verified; refusing to start (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)"
         )
     try:
-        verify_visibility(v.cfg, app.is_private)
+        seen = verify_visibility(v.cfg, app.is_private)
     except RepoPolicyError as e:
         raise SystemExit(f"vigild: {e}") from e
+    log.info("visibility (live): %s", {r: "private" if p else "public" for r, p in seen.items()})
+    # every later read (dispatch, each Jev call) asks GitHub again
+    set_visibility_source(app.is_private)
     runner = build_runner(v, app)
     v.services.jobs.runner = runner
     # Hold every job a restart interrupted. Approved builds start only once the

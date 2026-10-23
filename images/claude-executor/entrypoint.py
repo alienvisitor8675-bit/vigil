@@ -226,7 +226,7 @@ def stage(task: dict[str, Any], env: dict[str, str] | None = None) -> list[str]:
 
 
 CHECKPOINT_REF = "refs/vigil/checkpoint"
-CHECKPOINT_SECONDS = 30.0
+CHECKPOINT_SECONDS = float(os.environ.get("VIGIL_CHECKPOINT_SECONDS", "30"))
 
 
 def checkpoint(task: dict[str, Any], turns: int) -> str:
@@ -399,6 +399,9 @@ def agent_options(role: str, token: str, stderr: Any) -> dict[str, Any]:
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-5-5",
         "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-5-5",
     }
+    if os.environ.get("VIGIL_MAX_OUTPUT_TOKENS", "").isdigit():
+        # each call's output cap: the gateway holds a call's worst case against the reservation
+        child_env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = os.environ["VIGIL_MAX_OUTPUT_TOKENS"]
     opts: dict[str, Any] = {
         "cwd": str(WORK),
         # as root, the CLI goes through setpriv to the agent uid with no capabilities

@@ -144,6 +144,7 @@ def test_reviewers_get_read_only_sessions_of_the_head(world: World) -> None:
     assert len(reviewers) == 2
     for s in reviewers:
         assert s.output_schema is not None
+        assert s.max_output_tokens == 8192  # the gateway's worst case fits the reservation
         assert "<<<UNTRUSTED diff" in s.packet  # the diff is data, not instructions
         assert "Fixture rules" in s.packet  # the base's CLAUDE.md
         assert (s.clone / "tests").is_dir()  # the worker's head, checked out

@@ -259,13 +259,11 @@ One repo covers both public and private targets. `vigil` is a single private rep
 
 ```yaml
 repos:
-  thomasbardhi01/parkagent:
-    visibility: public
-    decider: [jev-openrouter, haiku, lfm-tower]
+  thomasbardhi01/parkagent:           # visibility: read live from GitHub (as built, phase 2a)
+    decider: [jev, haiku, lfm-tower]   # jev: OpenRouter while public, Cloudflare while private
     worker_overflow: [runpod]          # hosted eval/overflow allowed
   thomasbardhi01/hearth:               # example only; no repos after ParkAgent yet
-    visibility: private
-    decider: [lfm-tower, jev-cloudflare-zdr]   # drop the second entry to keep it fully local
+    decider: [lfm-tower, jev]          # private: jev-cloudflare; drop it to keep it fully local
     backends: [tower-qwen, tower-fast]
     worker_overflow: []                # tower only
 ```

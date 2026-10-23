@@ -319,7 +319,6 @@ def world(
     cfg: Config, tmp_path: Path, fixture_repo: dict[str, Path], tokens: Tokens
 ) -> Iterator[World]:
     cfg.repos.repos[REPO] = RepoPolicy(
-        visibility="public",
         decider=["haiku"],
         backends=["claude-sonnet", "claude-opus", "claude-haiku"],
         dev_dockerfile="images/dev/vigil.Dockerfile",

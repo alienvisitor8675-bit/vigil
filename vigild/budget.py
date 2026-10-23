@@ -170,6 +170,16 @@ class Budget:
             return 0.0
         return held - session_cost(self.store, session_id)
 
+    def spent_today_by_purpose(self) -> dict[str, float]:
+        """Today's metered spend per purpose: a Haiku decider call made because
+        Jev failed or drifted books `decider_fallback`, apart from `decider`
+        (owner, 2026-10-23), so a drift can't quietly eat the day."""
+        rows = self.store.q(
+            "SELECT purpose, SUM(cost_usd) n FROM model_calls WHERE ts LIKE ? GROUP BY purpose",
+            (f"{self._day()}%",),
+        )
+        return {str(r["purpose"]): round(float(r["n"] or 0), 6) for r in rows}
+
     def summary(self) -> dict[str, float]:
         return {
             "daily_cap": self.cfg.daily_usd,
@@ -178,4 +188,6 @@ class Budget:
             "spent_today": round(self.spent_today(), 6),
             "reserved_open": round(self.open_today(), 6),
             "spent_month": round(self.spent_month(), 6),
+            "decider_today": self.spent_today_by_purpose().get("decider", 0.0),
+            "decider_fallback_today": self.spent_today_by_purpose().get("decider_fallback", 0.0),
         }

@@ -71,6 +71,29 @@ feature: vigild logs `config: <feature> is off`, `/api/health` lists it in
 | `OPENROUTER_API_KEY` | Jev on OpenRouter's Decisions API: **the decider for public repos** (owner, 2026-10-23), with Haiku as the escalation; later the OpenRouter preset (phase 4). | openrouter.ai → Keys, with a **credit limit**. Set. | Never for a private repo: vigild refuses to start if `repos.yaml` lists it for one. | 2a | `GET /api/v1/key` → 200, and one `decider:` line per repo naming its route |
 | `LLAMA_API_KEY` | llama-server's `--api-key`. In **both** the env file and the tower's `/etc/vigil/llama.env`. | **You generate it** (below), then copy the same line to the tower. | Tower only, over Tailscale. | 5 | — |
 
+### The decider: Jev (owner, 2026-10-23)
+
+- **Routes.** A repo's `decider:` lists `jev`: Jev on OpenRouter while the
+  repo is public, on Cloudflare while it's private (read live, every call;
+  unreadable means private). Haiku is the escalation where it's allowed.
+- **Cloudflare credit.** Cloudflare bills Jev through AI Gateway credit:
+  $0.042 per million input tokens, output free, plus a 5% fee when you buy
+  credit (vigild meters $0.0441/M). When the credit runs out Cloudflare
+  answers error 2021, "Insufficient balance": vigild trips the
+  `decider_credit` breaker and pages "breaker tripped: decider_credit
+  (route:jev-cloudflare)". Buy credit in the Cloudflare dashboard (AI
+  Gateway), then press **Reset**; until then that route is off.
+- **Version pin.** Each Jev route has a `version_pin` in
+  `configs/backends.yaml` (Cloudflare `jev-1.13.0`, OpenRouter
+  `typesafe/jev-1.13-20260917`). A reply with another version, or none, pages
+  once per new version: "Jev version drift: <route> returned <version>,
+  pinned <pin>; decisions now on Haiku fallback" (or "waiting for the
+  owner"), with today's fallback spend. **A version bump happens only by PR,
+  after the decider eval set has been replayed against the new version.**
+  OpenRouter stays pinned to `typesafe/jev-1.13`; Cloudflare's
+  `typesafe/jev` is a floating alias, held by the pin; never
+  `typesafe/jev-1.14.0` (beta).
+
 ### Secrets you generate (owner, 2026-10-23)
 
 **You create every self-generated secret yourself; an agent never does.** No
@@ -266,11 +289,12 @@ uv run python -m vigild
 ```
 
 - **At start** vigild:
-  - reads each repo's real visibility through the App. It refuses to start
-    if `configs/repos.yaml` says public for a repo that is private, or if it
-    can't check (so the App must be configured). A repo the YAML keeps
-    private that is public on GitHub only logs a warning: the YAML's stricter
-    rule stays in force;
+  - reads each repo's visibility live through the App (there is no YAML
+    field: nothing to edit when a repo changes visibility; vigild follows
+    GitHub) and checks the private-repo rule against it. A repo it can't
+    read counts as private. It refuses to start when a private repo's
+    entries break the rule, and later refuses a dispatch the same way, with
+    a page;
   - migrates an older `vigil.db` in place (`PRAGMA user_version`);
   - reconciles anything a previous run left behind: tokens revoked, session
     containers removed, reservations settled, mid-flight jobs blocked with a

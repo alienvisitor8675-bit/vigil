@@ -112,3 +112,15 @@ def fixture_repo(tmp_path: Path) -> dict[str, Any]:
     git(seed, "remote", "add", "origin", str(bare))
     git(seed, "push", "-q", "origin", "main")
     return {"bare": bare, "seed": seed}
+
+
+@pytest.fixture(autouse=True)
+def public_repos() -> Iterator[None]:
+    """vigild reads visibility live from GitHub (owner, 2026-10-23); tests see
+    every repo as public unless they set their own source. Without one,
+    vigild treats a repo as private."""
+    from vigild.repos import set_visibility_source
+
+    set_visibility_source(lambda repo: False)
+    yield
+    set_visibility_source(None)

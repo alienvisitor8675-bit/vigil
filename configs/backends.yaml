@@ -11,9 +11,15 @@ presets:
   tower-fast:    {kind: openai_compatible, base_url: "http://tower:8080/v1", model: gpt-oss-20b, key_ref: LLAMA_API_KEY, locality: local, provider: tower, live: false}  # phase 5
   openrouter:    {kind: openrouter, base_url: "https://openrouter.ai/api/v1", model: null, key_ref: OPENROUTER_API_KEY, locality: hosted, provider: openrouter, live: false}  # phase 4
 
-# Decider routes (B21). Same locality rule as backends.
+# Decider routes (B21). Same locality rule as backends. A repo lists the
+# logical `jev`; vigild resolves it per call from the repo's live GitHub
+# visibility: public -> jev-openrouter, private (or unknown) -> jev-cloudflare
+# (vigild/repos.py `jev_route`). `version_pin` is the exact version each
+# route's responses report for Jev 1.13 (checked live 2026-10-22); anything
+# else, or none, is drift: the answer is refused and the owner paged once per
+# version. A bump is a PR, after the decider eval set is replayed.
 decider_routes:
   haiku:          {backend: haiku, provider: anthropic, locality: hosted, preset: claude-haiku}
-  jev-cloudflare: {backend: jev_cloudflare, provider: cloudflare, locality: hosted, model: typesafe/jev, key_ref: CLOUDFLARE_API_TOKEN}
-  jev-openrouter: {backend: jev_openrouter, provider: openrouter, locality: hosted, model: typesafe/jev-1.13, key_ref: OPENROUTER_API_KEY}
+  jev-cloudflare: {backend: jev_cloudflare, provider: cloudflare, locality: hosted, model: typesafe/jev, key_ref: CLOUDFLARE_API_TOKEN, version_pin: jev-1.13.0}
+  jev-openrouter: {backend: jev_openrouter, provider: openrouter, locality: hosted, model: typesafe/jev-1.13, key_ref: OPENROUTER_API_KEY, version_pin: typesafe/jev-1.13-20260917}
   lfm-tower:      {backend: lfm_tower, provider: tower, locality: local, preset: tower-fast, live: false}  # phase 5

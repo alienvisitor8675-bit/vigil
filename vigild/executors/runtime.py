@@ -68,6 +68,7 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         "VIGIL_MAX_BUDGET_USD": str(spec.max_budget_usd),
         "VIGIL_REQUIRE_PLUGIN": "guard",
         "VIGIL_AGENT_UID": str(uid),
+        "VIGIL_CHECKPOINT_SECONDS": str(cfg.vigild.scheduler.checkpoint_seconds),
         "PYTHONDONTWRITEBYTECODE": "1",  # no __pycache__ in the worker's tree (round 4)
         "HTTP_PROXY": proxy,
         "HTTPS_PROXY": proxy,
@@ -78,6 +79,8 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
     }
     if spec.traceparent:
         env["TRACEPARENT"] = spec.traceparent
+    if spec.max_output_tokens:
+        env["VIGIL_MAX_OUTPUT_TOKENS"] = str(spec.max_output_tokens)
     mounts = [
         _mount(str(spec.clone), "/work", read_only=False),
         _mount(str(spec.session_dir / "packet.md"), "/vigil/packet.md", read_only=True),

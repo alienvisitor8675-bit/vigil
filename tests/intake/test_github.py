@@ -40,7 +40,7 @@ ISSUE = {
 @pytest.fixture
 def intake(cfg: Config, store: Store, runner: RecordingRunner) -> tuple[LabelIntake, FakeIssues]:
     cfg.repos.repos[REPO] = RepoPolicy(
-        visibility="public", decider=["haiku"], backends=["claude-sonnet"],
+        decider=["haiku"], backends=["claude-sonnet"],
         dev_dockerfile="images/dev/vigil.Dockerfile", dev_lockfiles=["uv.lock"],
         dev_suites={"smoke": "true"}, dev_image_tools=["pytest"], intake=True,
     )  # fmt: skip

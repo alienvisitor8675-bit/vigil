@@ -81,7 +81,7 @@ from vigild.packets.assemble import (
 from vigild.packets.fence import fence
 from vigild.provenance import Provenance
 from vigild.redact import redact
-from vigild.repos import RepoPolicyError, check_backend
+from vigild.repos import RepoPolicyError, check_backend, live_private, repo_rule_errors
 from vigild.review.ladder import Ladder, LadderChange, classify_shape
 from vigild.router.rules import RoutingError, route
 from vigild.scheduler import wip
@@ -96,6 +96,9 @@ COORD_MINUTES = 30
 WORKER_MINUTES = 40
 REVIEW_MINUTES = 20
 REVIEW_TURNS = 30
+# A review or an audit answers in a few thousand tokens. Capping each call's
+# output keeps the gateway's worst-case hold inside the session's reservation.
+REVIEW_OUTPUT_TOKENS = 8192
 LIVE_SESSION = ("created", "running")
 DEAD_TASK = ("superseded", "abandoned")  # out of the job: re-planned away or given up
 PUBLISHED = ("pr_open", "reviewed")  # a task whose draft PR is open (reviewed: clean at its head)
@@ -421,6 +424,23 @@ class JobRunner:
             repo=job.repo, task=task, tree=self._tree_root(job), wip=building
         )
 
+    def _refused_by_visibility(self, job: Job) -> bool:
+        """The private-repo rule on the repo's live visibility, read at every
+        dispatch (owner, 2026-10-23). A repo that went private while its
+        backends break the rule is refused and paged: no fallback."""
+        private = live_private(job.repo)
+        errors = repo_rule_errors(self.cfg, job.repo, private)
+        if not errors:
+            return False
+        self._block(job.id, "the private-repo rule: " + "; ".join(errors)[:300])
+        self._page(
+            job.id,
+            f"{job.repo} is private now; its backends break the private-repo rule",
+            {"kind": "repo_policy", "repo": job.repo, "errors": errors,
+             "actions": ["abandon"]},
+        )  # fmt: skip
+        return True
+
     def _hold_for(self, job_id: str, b: Breaker) -> None:
         """Pause a job for a breaker: blocked, with no page of its own (the
         breaker paged once); resetting the breaker resumes it."""
@@ -663,6 +683,8 @@ class JobRunner:
 
     def run_coord(self, job_id: str) -> None:
         job = self.store.get_job(job_id)
+        if self._refused_by_visibility(job):
+            return
         b = self._paused(job)
         if b is not None:
             self._hold_for(job_id, b)
@@ -677,7 +699,7 @@ class JobRunner:
             session_image = self._session_image(
                 job.repo, self.workspace.head_sha(job.repo, job.base)
             )
-            check_backend(self.cfg, job.repo, preset)
+            check_backend(self.cfg, job.repo, preset, private=live_private(job.repo))
         except (StaleDevImage, RepoPolicyError) as e:
             why = "dev image not fresh" if isinstance(e, StaleDevImage) else "backend refused"
             self._page(
@@ -960,6 +982,8 @@ class JobRunner:
         wip_held: set[str] = set()
 
         def launch(batch: list[str]) -> dict[str, Callable[[], bool]] | None:
+            if self._refused_by_visibility(job):
+                return None
             for tid in batch:
                 b = self._paused(job, tid, building=True)
                 routed = self.store.get_task(tid).backend_preset or self.cfg.routing.fallback
@@ -1832,6 +1856,8 @@ class JobRunner:
         job = self.store.get_job(job_id)
         if job.state is not JobState.IN_REVIEW:
             return
+        if self._refused_by_visibility(job):
+            return
         b = self._paused(job)
         if b is not None:
             self._hold_for(job_id, b)
@@ -2094,7 +2120,7 @@ class JobRunner:
             backend_preset=preset, branch=branch,
         )  # fmt: skip
         try:
-            check_backend(self.cfg, job.repo, preset)
+            check_backend(self.cfg, job.repo, preset, private=live_private(job.repo))
             rid = self.budget.reserve(
                 session_id=s.id, task_id=None, amount=amount, purpose=role.value
             )
@@ -2133,6 +2159,7 @@ class JobRunner:
             packet=packet,
             image=session_image,
             output_schema=model.model_json_schema(),
+            max_output_tokens=REVIEW_OUTPUT_TOKENS,
         )
         attrs = {
             "vigil.job_id": job.id,

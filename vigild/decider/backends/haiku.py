@@ -49,9 +49,13 @@ class HaikuBackend:
             },
         }
 
-    def ask(self, q: Question, state: str, *, repo: str, job_id: str | None) -> Answer:
+    def ask(
+        self, q: Question, state: str, *, repo: str, job_id: str | None, purpose: str = "decider"
+    ) -> Answer:
+        """`purpose` is how the call is booked: `decider`, or `decider_fallback`
+        when Jev failed or drifted (owner, 2026-10-23)."""
         reply = self.caller.call(
-            repo=repo, preset=PRESET, body=self.body(q, state), purpose="decider", job_id=job_id
+            repo=repo, preset=PRESET, body=self.body(q, state), purpose=purpose, job_id=job_id
         )
         texts = [b.get("text", "") for b in reply.get("content", []) if b.get("type") == "text"]
         try:

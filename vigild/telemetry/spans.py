@@ -77,5 +77,13 @@ class Telemetry:
         ) as s:
             yield s  # type: ignore[misc]
 
+    @contextmanager
+    def span_alone(self, name: str, attrs: Mapping[str, Any]) -> Iterator[Span]:
+        """A span of vigild's own outside any session (a decider call)."""
+        with self.tracer.start_as_current_span(
+            name, attributes={**attrs, "openinference.span.kind": "CHAIN"}
+        ) as s:
+            yield s  # type: ignore[misc]
+
     def flush(self) -> None:
         self.provider.force_flush(5000)

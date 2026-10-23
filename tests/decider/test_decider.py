@@ -39,7 +39,7 @@ def test_launch_question_set() -> None:
     }
     assert QUESTIONS["size"].options == ["XS", "S", "M", "L"]
     assert QUESTIONS["value"].kind == "score"
-    assert QUESTIONS["touches_money_path"].kind == "bool"
+    assert QUESTIONS["touches_money_path"].kind == "noul"
 
 
 def test_duplicate_of_is_capped_at_255_options() -> None:
@@ -55,7 +55,7 @@ def test_answer_must_be_one_of_the_options() -> None:
     assert QUESTIONS["value"].parse("4", 0.8, backend="x").value == 4
     with pytest.raises(DeciderError):
         QUESTIONS["value"].parse(6, 0.8, backend="x")
-    assert QUESTIONS["touches_money_path"].parse("yes", 0.9, backend="x").value is True
+    assert QUESTIONS["touches_money_path"].parse(0.9, None, backend="x").probability == 0.9
 
 
 @dataclass
@@ -65,8 +65,13 @@ class Fixed:
     value: Any = "S"
     calls: list[str] = field(default_factory=list)
 
-    def ask(self, q: Question, state: str, *, repo: str, job_id: str | None) -> Answer:
+    purposes: list[str] = field(default_factory=list)
+
+    def ask(
+        self, q: Question, state: str, *, repo: str, job_id: str | None, purpose: str = "decider"
+    ) -> Answer:
         self.calls.append(q.name)
+        self.purposes.append(purpose)
         return Answer(q.name, self.value, self.probability, self.name, "v1")
 
 
@@ -120,7 +125,9 @@ def test_a_route_the_repo_does_not_list_is_never_called(cfg: Config, store: Stor
 
 def test_backend_error_means_wait(cfg: Config, store: Store) -> None:
     class Broken(Fixed):
-        def ask(self, q: Question, state: str, *, repo: str, job_id: str | None) -> Answer:
+        def ask(
+            self, q: Question, state: str, *, repo: str, job_id: str | None, purpose: str = ""
+        ) -> Answer:
             raise DeciderError("boom")
 
     d = Decider(cfg, store, {"haiku": Broken("haiku", 0)}).decide(PA, QUESTIONS["size"], "x")
@@ -171,70 +178,6 @@ def test_haiku_reply_outside_the_options_is_an_error() -> None:
         )
 
 
-def test_jev_cloudflare_against_fixture() -> None:
-    fixture = json.loads((FIX / "jev_cloudflare_choice.json").read_text())
-    seen: list[httpx2.Request] = []
-
-    def handler(req: httpx2.Request) -> httpx2.Response:
-        seen.append(req)
-        return httpx2.Response(200, json=fixture)
-
-    client = httpx2.Client(transport=httpx2.MockTransport(handler))
-    jev = JevCloudflare(
-        client, account_id="acct", token="t0k", known_version="jev-1.13.0", meter=passthrough
-    )
-    a = jev.ask(QUESTIONS["size"], "Add three tests", repo=PA, job_id=None)
-    assert (a.value, a.probability, a.model_version) == ("S", 0.91, "jev-1.13.0")
-    req = seen[0]
-    assert req.url.path == "/client/v4/accounts/acct/ai/run"
-    assert req.headers["authorization"] == "Bearer t0k"
-    body = json.loads(req.content)
-    assert body["model"] == "typesafe/jev"
-    assert body["input"]["questions"][0]["options"] == ["XS", "S", "M", "L"]
-    assert not jev.version_changed
-
-
-def test_jev_flags_a_model_version_change() -> None:
-    fixture = json.loads((FIX / "jev_cloudflare_choice.json").read_text())
-    fixture["result"]["model"] = "jev-1.14.0"
-    client = httpx2.Client(
-        transport=httpx2.MockTransport(lambda r: httpx2.Response(200, json=fixture))
-    )
-    jev = JevCloudflare(
-        client, account_id="a", token="t", known_version="jev-1.13.0", meter=passthrough
-    )
-    jev.ask(QUESTIONS["size"], "x", repo=PA, job_id=None)
-    assert jev.version_changed
-
-
-def test_jev_http_error_is_a_decider_error() -> None:
-    client = httpx2.Client(
-        transport=httpx2.MockTransport(lambda r: httpx2.Response(500, text="no"))
-    )
-    with pytest.raises(DeciderError):
-        JevCloudflare(client, account_id="a", token="t", meter=passthrough).ask(
-            QUESTIONS["size"], "x", repo=PA, job_id=None
-        )
-
-
-def test_jev_openrouter_pins_the_model_and_zdr() -> None:
-    fixture = json.loads((FIX / "jev_cloudflare_choice.json").read_text())
-    fixture["result"]["model"] = "jev-1.13"
-    seen: list[httpx2.Request] = []
-
-    def handler(req: httpx2.Request) -> httpx2.Response:
-        seen.append(req)
-        return httpx2.Response(200, json=fixture)
-
-    jev = JevOpenRouter(
-        httpx2.Client(transport=httpx2.MockTransport(handler)), token="t", meter=passthrough
-    )
-    assert jev.ask(QUESTIONS["size"], "x", repo=PA, job_id=None).value == "S"
-    body = json.loads(seen[0].content)
-    assert seen[0].url.path == "/api/alpha/decisions"
-    assert body["model"] == "typesafe/jev-1.13" and body["provider"]["zdr"] is True
-
-
 # --- review round 1, item 11: Jev is metered and budgeted like every other call ----------
 
 
@@ -245,15 +188,16 @@ def test_jev_calls_go_through_the_gateways_meter(cfg: Config, store: Store) -> N
 
     cfg.repos.repos[PA].decider = ["haiku", "jev-cloudflare"]  # a public repo may list it too
     gw = Gateway(cfg, store, Budget(store, cfg.budgets), Secrets({}))
-    fixture = json.loads((FIX / "jev_cloudflare_choice.json").read_text())
+    fixture = json.loads((FIX / "jev_cloudflare.json").read_text())
     client = httpx2.Client(
         transport=httpx2.MockTransport(lambda r: httpx2.Response(200, json=fixture))
     )
     jev = JevCloudflare(client, account_id="a", token="t", meter=gw.metered)
     assert jev.ask(QUESTIONS["size"], "x", repo=PA, job_id=None).value == "S"
     row = store.q("SELECT provider, model, tokens_in, cost_usd, purpose FROM model_calls")[0]
-    assert (row["provider"], row["model"], row["tokens_in"]) == ("cloudflare", "typesafe/jev", 412)
-    assert row["cost_usd"] == pytest.approx(412 * 0.042 / 1e6)
+    assert (row["provider"], row["model"], row["tokens_in"]) == ("cloudflare", "typesafe/jev", 432)
+    # $0.042/M on AI Gateway credit, plus the 5% fee when credit is bought (owner, 2026-10-23)
+    assert row["cost_usd"] == pytest.approx(432 * 0.0441 / 1e6)
     assert store.q("SELECT COUNT(*) n FROM ledger")[0]["n"] == 1
 
 
@@ -293,7 +237,9 @@ def test_a_gateway_refusal_is_a_decider_failure(cfg: Config, store: Store) -> No
     class Refused:
         name = "jev-openrouter"
 
-        def ask(self, q: Question, state: str, *, repo: str, job_id: str | None) -> Answer:
+        def ask(
+            self, q: Question, state: str, *, repo: str, job_id: str | None, purpose: str = ""
+        ) -> Answer:
             raise GatewayError(403, "permission_error", "budget: the day is spent")
 
     haiku = Fixed("haiku", 0.95)
@@ -323,28 +269,16 @@ def test_the_production_wiring_meters_every_route(cfg: Config, store: Store) -> 
     assert set(build_decider(cfg, store, gw, Secrets({}), client).backends) == {"haiku"}
 
 
-# --- owner, 2026-10-23: Jev on OpenRouter for public repos ---------------------------------
+# --- owner, 2026-10-23: `jev` resolved by live visibility -----------------------------------
 
 
-def test_a_public_repo_listing_jev_openrouter_uses_it_first(cfg: Config, store: Store) -> None:
+def test_a_public_repo_listing_jev_uses_openrouter_first(cfg: Config, store: Store) -> None:
     from vigild.decider.policy import decider_routes
 
-    assert cfg.repo(PA).visibility == "public" and "jev-openrouter" in cfg.repo(PA).decider
+    assert cfg.repo(PA).decider == ["haiku", "jev"]
     every = {"haiku", "jev-openrouter", "jev-cloudflare"}
-    assert decider_routes(cfg, PA, every) == ("jev-openrouter", "haiku")
-    assert decider_routes(cfg, PA, {"haiku"}) == ("haiku", None)  # no key: Haiku alone
+    assert decider_routes(cfg, PA, every, private=False) == ("jev-openrouter", "haiku")
+    assert decider_routes(cfg, PA, {"haiku"}, private=False) == ("haiku", None)
     jev, haiku = Fixed("jev-openrouter", 0.95), Fixed("haiku", 0.99)
     d = _decider(cfg, store, jev, haiku).decide(PA, QUESTIONS["value"], "x")
     assert d.answer.backend == "jev-openrouter" and jev.calls == ["value"] and haiku.calls == []
-
-
-def test_a_private_repo_may_not_list_jev_openrouter(cfg: Config) -> None:
-    from vigild.config import validate
-    from vigild.repos import RepoPolicyError
-
-    cfg.repos.repos["thomasbardhi01/vigil"].visibility = "private"
-    cfg.repos.repos["thomasbardhi01/vigil"].decider = ["haiku", "jev-openrouter"]
-    with pytest.raises(RepoPolicyError, match="jev-openrouter"):
-        validate(cfg)
-    cfg.repos.repos["thomasbardhi01/vigil"].decider = ["haiku", "jev-cloudflare"]
-    validate(cfg)

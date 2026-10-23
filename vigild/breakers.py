@@ -17,6 +17,7 @@ success closes it.
 | backend_errors | backend:<preset> | N 5xx or timeouts in a row; routes fall to the next preset |
 | repo_failures | repo:<name> | K consecutive failed or abandoned jobs |
 | verifier_unknowns | repo:<name> | M `unknown` verdicts in a row |
+| decider_credit | route:jev-cloudflare | Cloudflare answers 2021: the route is off until reset |
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ class Kind(StrEnum):
     BACKEND = "backend_errors"
     REPO_FAILURES = "repo_failures"
     VERIFIER_UNKNOWNS = "verifier_unknowns"
+    DECIDER_CREDIT = "decider_credit"  # Cloudflare's 2021: the AI Gateway credit is empty
 
 
 GLOBAL = "global"

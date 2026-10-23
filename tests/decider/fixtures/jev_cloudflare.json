@@ -1,0 +1,52 @@
+{
+  "_fixture_note": "RECORDED 2026-10-22 from Cloudflare Workers AI (typesafe/jev) by vigild's probe, redacted (no account id, no token). Three questions, one of each type.",
+  "result": {
+    "state": "Completed",
+    "result": {
+      "model": "jev-1.13.0",
+      "answers": {
+        "size": {
+          "type": "choice",
+          "choice": "S",
+          "probabilities": {
+            "XS": 0.4,
+            "S": 0.59,
+            "M": 0.01,
+            "L": 0
+          },
+          "confidence": 0.45
+        },
+        "value": {
+          "type": "score",
+          "score": 2.76,
+          "legend": {
+            "0": "1 (lowest)",
+            "1": "2",
+            "2": "3",
+            "3": "4",
+            "4": "5 (highest)"
+          },
+          "probabilities": {
+            "0": 0,
+            "1": 0.02,
+            "2": 0.24,
+            "3": 0.7,
+            "4": 0.04
+          },
+          "confidence": 0.73
+        },
+        "touches_money_path": {
+          "type": "noul",
+          "noul": 0.16
+        }
+      },
+      "usage": {
+        "input_tokens": 432,
+        "output_tokens": 79
+      }
+    }
+  },
+  "success": true,
+  "errors": [],
+  "messages": []
+}

@@ -77,7 +77,6 @@ def world(
     git(seed, "commit", "-qm", "lock")
     git(seed, "push", "-q", "origin", "main")
     cfg.repos.repos[REPO] = RepoPolicy(
-        visibility="public",
         decider=["haiku"],
         backends=["claude-haiku"],
         dev_dockerfile="images/dev/vigil.Dockerfile",

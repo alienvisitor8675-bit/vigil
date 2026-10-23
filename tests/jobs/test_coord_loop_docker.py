@@ -56,7 +56,6 @@ def live(
     cfg.budgets.coord_session_usd = 0.30
     cfg.budgets.per_task_usd = 0.30
     cfg.repos.repos[REPO] = RepoPolicy(
-        visibility="public",
         decider=["haiku"],
         backends=["claude-haiku"],
         dev_dockerfile="images/dev/fixture.Dockerfile",

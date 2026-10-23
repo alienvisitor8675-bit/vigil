@@ -186,6 +186,18 @@ def _m7_breakers(conn: sqlite3.Connection) -> None:
     _create(conn, BREAKER_DDL)
 
 
+JEV_DRIFT_DDL = """CREATE TABLE IF NOT EXISTS jev_drift (
+  route TEXT NOT NULL, version TEXT NOT NULL, pin TEXT NOT NULL, item_id INTEGER,
+  first_seen TEXT NOT NULL, PRIMARY KEY (route, version))"""
+
+
+def _m8_live_visibility(conn: sqlite3.Connection) -> None:
+    """Owner, 2026-10-23: a session's token keeps the visibility read live at
+    dispatch; each Jev version drift pages once."""
+    _add_columns(conn, "gateway_tokens", {"private": "INTEGER"})
+    _create(conn, JEV_DRIFT_DDL)
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
@@ -194,6 +206,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m5_label_intake,
     _m6_transcripts,
     _m7_breakers,
+    _m8_live_visibility,
 ]
 
 

@@ -8,7 +8,10 @@ from typing import Any, Literal
 
 MAX_OPTIONS = 255
 
-Kind = Literal["choice", "score", "bool"]
+# TypeSafe Jev's three question types (owner, 2026-10-23): a choice, a 1-5
+# score, and a noul, a single float from 0 to 1 (how likely "yes" is). A
+# noul's float is its own probability: act at >= 0.85, escalate at >= 0.6.
+Kind = Literal["choice", "score", "noul"]
 
 
 class DeciderError(RuntimeError):
@@ -43,7 +46,7 @@ class Question:
         elif self.kind == "score":
             answer = {"type": "integer", "enum": [1, 2, 3, 4, 5]}
         else:
-            answer = {"type": "boolean"}
+            answer = {"type": "number", "minimum": 0, "maximum": 1}
         return {
             "type": "object",
             "properties": {"answer": answer, "probability": {"type": "number"}},
@@ -54,6 +57,8 @@ class Question:
     def parse(
         self, raw: Any, probability: Any, *, backend: str, model_version: str | None = None
     ) -> Answer:
+        if self.kind == "noul":
+            probability = raw  # a noul is its own probability; any other number is ignored
         try:
             p = float(probability)
         except (TypeError, ValueError) as e:
@@ -73,14 +78,12 @@ class Question:
             if not 1 <= value <= 5:
                 raise DeciderError(f"{self.name}: score {value} is outside 1-5")
         else:
-            if isinstance(raw, bool):
-                value = raw
-            elif str(raw).lower() in ("yes", "true"):
-                value = True
-            elif str(raw).lower() in ("no", "false"):
-                value = False
-            else:
-                raise DeciderError(f"{self.name}: {raw!r} is not yes/no")
+            if isinstance(raw, bool) or not isinstance(raw, int | float):
+                raise DeciderError(f"{self.name}: noul {raw!r} is not a number")
+            value = float(raw)
+            if not 0.0 <= value <= 1.0:
+                raise DeciderError(f"{self.name}: noul {value} is outside 0-1")
+            p = value  # a noul is its own probability (owner, 2026-10-23)
         return Answer(self.name, value, p, backend, model_version)
 
 
@@ -98,14 +101,14 @@ QUESTIONS: dict[str, Question] = {
         Question("risk", "score", "How risky is this change (1 low, 5 high)?", []),
         Question(
             "touches_money_path",
-            "bool",
+            "noul",
             "Does this touch billing, payments, auth or consent code?",
             [],
         ),
-        Question("worth_proposing", "bool", "Is this finding worth proposing as a task?", []),
+        Question("worth_proposing", "noul", "Is this finding worth proposing as a task?", []),
         Question(
             "needs_escalation",
-            "bool",
+            "noul",
             "Do these review findings need escalation to a stronger model?",
             [],
         ),

@@ -47,6 +47,10 @@ class SessionSpec:
     # SDK for structured output and puts it on the result line (phase 2a).
     output_schema: dict[str, Any] | None = None
     resume: Resume | None = None  # its transcript, resumed or forked (items 2-3)
+    # A cap on each model call's output (the CLI's CLAUDE_CODE_MAX_OUTPUT_TOKENS).
+    # The gateway holds every call's worst case against the reservation, so a
+    # review's small answers keep its reservation small.
+    max_output_tokens: int | None = None
 
 
 @dataclass
