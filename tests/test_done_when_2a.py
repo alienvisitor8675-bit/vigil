@@ -4,16 +4,19 @@ A uv project in a local bare repo stands in for GitHub ("the test repo");
 vigild publishes to it from the host. Workers are Haiku; reviews are Sonnet
 and audits Opus, as the review ladder has them. Nothing touches ParkAgent.
 
-1. Three batch tasks run in parallel through the scheduler, and are reviewed
-   and audited at rung 0 (one of them is sent back once by the Stop hook).
-2. The WIP breaker trips, pages once, pauses dispatch, and is reset from the
-   inbox after a merge.
-3. That job's worker is killed mid-task and resumes from its last commit.
+1. Four batch tasks run through the scheduler, three at once (the peak is
+   asserted), and are reviewed by Sonnet and audited by Opus at rung 0, by
+   model id (one of them is sent back once by the Stop hook).
+2. The WIP breaker (the production limit, 4) trips on a fifth, pages once,
+   pauses dispatch, and is reset from the inbox after a merge.
+3. That job's worker is killed mid-task and resumes from its last commit,
+   within what was left of its budget.
 4. A Stop-hook block shows up in a transcript (from step 1).
 5. A deps job opens its PR on the test repo, and its parent resumes after it
    merges.
-6. One real decider call: Jev on OpenRouter (Haiku the escalation).
-`vigil doctor` is run apart, against a vigild started for it."""
+6. Real decider calls on both Jev routes: a choice and a noul each.
+7. `vigil doctor --repo thomasbardhi01/vigil`, against this vigild's API.
+Budgets are the production caps from configs/budgets.yaml (2a round 2)."""
 
 from __future__ import annotations
 
@@ -117,9 +120,10 @@ class Live:
 
 @pytest.fixture
 def live(tmp_path: Path, tokens: Tokens) -> Iterator[Live]:
-    with socket.socket() as s:
-        if s.connect_ex(("127.0.0.1", 8788)) == 0:
-            pytest.skip("port 8788 is in use")
+    for port in (8787, 8788):
+        with socket.socket() as s:
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                pytest.skip(f"port {port} is in use (stop vigild first)")
     import docker
 
     repo = _seed(tmp_path)
@@ -131,10 +135,9 @@ def live(tmp_path: Path, tokens: Tokens) -> Iterator[Live]:
     for tier in cfg.routing.tiers:
         cfg.routing.tiers[tier] = "claude-haiku"
     cfg.routing.coord = cfg.routing.fallback = "claude-haiku"
-    cfg.budgets.per_task_usd = 0.40
-    cfg.budgets.review_session_usd = 0.50
-    cfg.budgets.audit_session_usd = 0.90
-    cfg.budgets.wip_per_repo = 3
+    # the production caps and WIP limit (configs/budgets.yaml), as they are
+    assert (cfg.budgets.per_task_usd, cfg.budgets.daily_usd, cfg.budgets.wip_per_repo) == (
+        2.0, 5.0, 4)  # fmt: skip
     cfg.vigild.scheduler.checkpoint_seconds = 3
     cfg.repos.repos[REPO] = RepoPolicy(
         decider=["haiku", "jev"],
@@ -186,20 +189,28 @@ def live(tmp_path: Path, tokens: Tokens) -> Iterator[Live]:
     images.on_failure = runner.dev_image_failed
     runner.session_images.on_failure = runner.dev_image_failed  # type: ignore[union-attr]
     v.services.jobs.runner = runner
+    from vigild.services import Services
+
+    # vigild's own API on its port, with its own token, for `vigil doctor` (step 7)
+    api = Services(cfg=cfg, store=v.store, tokens=v.services.tokens, jobs=v.services.jobs)
     v.services.tokens = tokens
     runner.jobs = v.services.jobs
-    server = uvicorn.Server(
-        uvicorn.Config(create_gateway_app(v.gateway), host="127.0.0.1", port=8788,
-                       log_level="warning")
-    )  # fmt: skip
-    t = threading.Thread(target=server.run, daemon=True)
-    t.start()
-    while not server.started:
+    servers = [
+        uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+        for app, port in ((create_gateway_app(v.gateway), 8788),
+                          (create_app(api), cfg.vigild.api.port))
+    ]  # fmt: skip
+    threads = [threading.Thread(target=s.run, daemon=True) for s in servers]
+    for t in threads:
+        t.start()
+    while not all(s.started for s in servers):
         time.sleep(0.1)
     with TestClient(create_app(v.services)) as c:
         yield Live(v, runner, publisher, c, tokens, repo["bare"], tmp_path, client)
-    server.should_exit = True
-    t.join(timeout=10)
+    for s in servers:
+        s.should_exit = True
+    for t in threads:
+        t.join(timeout=10)
 
 
 def spend(lv: Live) -> float:
@@ -224,7 +235,7 @@ def task(
             "files_in_scope": files,
             "must_fail_first": True,
         },
-        "limits": {"max_cost_usd": 0.40, "max_turns": 30},
+        "limits": {"max_turns": 30},  # the default cost cap; reservations are sized to the day
     }
 
 
@@ -285,10 +296,13 @@ def test_phase_2a_done_when(live: Live) -> None:
         submit(lv, task("charlie", "charlie", "Add a line containing the word charlie to "
                         "docs/charlie.md, with a pytest test tests/test_charlie.py that reads the "
                         "file and asserts it.")),
+        submit(lv, task("foxtrot", "foxtrot", "Add a line containing the word foxtrot to "
+                        "docs/foxtrot.md, with a pytest test tests/test_foxtrot.py that reads the "
+                        "file and asserts it.")),
     ]  # fmt: skip
     for j in jobs:
         approve(lv, j)
-    wait(lv, lambda: all(state(lv, j) in ("ready", "blocked") for j in jobs), "three jobs")
+    wait(lv, lambda: all(state(lv, j) in ("ready", "blocked") for j in jobs), "four jobs")
     log("step 1:", {j: state(lv, j) for j in jobs}, f"spend ${spend(lv) - t0:.4f}", pages(lv))
     assert all(state(lv, j) == "ready" for j in jobs), pages(lv)
     log("session slots peak:", lv.runner.slots.peak)
@@ -301,7 +315,16 @@ def test_phase_2a_done_when(live: Live) -> None:
         "overlaps",
         overlap,
     )
-    assert lv.runner.slots.peak >= 2 and overlap >= 1
+    assert lv.runner.slots.peak == 3 and overlap >= 1  # three at once: the fleet's limit
+    sonnet = lv.v.cfg.preset("claude-sonnet").model
+    opus = lv.v.cfg.preset("claude-opus").model
+    by_role: dict[str, set[str]] = {"reviewer": set(), "auditor": set()}
+    for s in store.list_sessions():
+        if s.job_id in jobs and s.role.value in by_role:
+            rows = store.q("SELECT model FROM model_calls WHERE session_id=?", (s.id,))
+            by_role[s.role.value] |= {str(r["model"]) for r in rows}
+    log("models by role:", by_role, "presets:", sonnet, opus)
+    assert by_role == {"reviewer": {sonnet}, "auditor": {opus}}
     for j in jobs:
         rv = json.loads(store.get_artifact(j, "review.json", f"{j}-w1").content)  # type: ignore[union-attr]
         au = json.loads(store.get_artifact(j, "audit.json", f"{j}-w1").content)  # type: ignore[union-attr]
@@ -325,7 +348,7 @@ def test_phase_2a_done_when(live: Live) -> None:
     assert blocked and shown
     t1 = spend(lv)
 
-    # 2. the WIP breaker: three open PRs; a fourth task waits, one page, dispatch paused
+    # 2. the WIP breaker: four open PRs; a fifth task waits, one page, dispatch paused
     delta = task("delta", "delta",
                  "Create docs/d1.md, docs/d2.md and docs/d3.md, each with a line containing the "
                  "word delta, one file at a time, and run `pytest -q tests/test_delta.py` after "
@@ -378,6 +401,21 @@ def test_phase_2a_done_when(live: Live) -> None:
         and forks[0]["from_session"] == crashed.id
         and forks[0]["start"] == killed["checkpoint"]
     )
+    # within what was left of its budget: its reservation was the remainder, and
+    # its metered spend stayed under it
+    (held,) = store.q("SELECT amount_usd FROM reservations WHERE session_id=?", (resumed.id,))
+    cap = float(store.get_task(f"{d}-w1").contract["limits"]["max_cost_usd"])
+    before = sum(
+        float(r["cost_usd"])
+        for r in store.q("SELECT cost_usd FROM model_calls WHERE session_id=?", (crashed.id,))
+    )
+    after = sum(
+        float(r["cost_usd"])
+        for r in store.q("SELECT cost_usd FROM model_calls WHERE session_id=?", (resumed.id,))
+    )
+    log(f"resumed budget: cap ${cap:.2f}, spent before ${before:.4f}, "
+        f"held ${held['amount_usd']:.4f}, spent ${after:.4f}")  # fmt: skip
+    assert held["amount_usd"] <= cap - before + 1e-6 and after <= held["amount_usd"]
     t2 = spend(lv)
 
     # 5. a deps job: the echo worker needs six; the child job opens its PR; the parent resumes
@@ -439,10 +477,16 @@ def test_phase_2a_done_when(live: Live) -> None:
     decider = build_decider(lv.v.cfg, store, lv.v.gateway, lv.v.secrets, httpx2.Client(timeout=30))
     state_text = "Add three unit tests for the rate limiter in tests/test_rate_limit.py."
     decisions = {r: decider.decide(r, QUESTIONS["size"], state_text) for r in (REPO, private_repo)}
+    # owner ruling 5: the noul criteria shape, live on both routes; P(true) is its probability
+    nouls = {
+        r: decider.decide(r, QUESTIONS["touches_money_path"], state_text)
+        for r in (REPO, private_repo)
+    }
     rows = [
         dict(r)
         for r in store.q(
-            "SELECT question, answer, probability, backend, model_version, action FROM decisions"
+            "SELECT question, kind, answer, probability, backend, model_version, action"
+            " FROM decisions"
         )
     ]
     errs = [ev.data for ev in store.events() if ev.type == "decision"]
@@ -451,12 +495,35 @@ def test_phase_2a_done_when(live: Live) -> None:
         " WHERE provider IN ('openrouter', 'cloudflare')"
     )
     log("step 6:", {r: (d.action.value, d.answer) for r, d in decisions.items()})
+    log("step 6 noul:", {r: (d.action.value, d.answer) for r, d in nouls.items()})
     log("step 6 decisions rows:", rows)
     log("step 6 decider errors:", errs)
     log("step 6 metered Jev calls:", [dict(r) for r in jev])
     assert {r["provider"] for r in jev} == {"openrouter", "cloudflare"}
+    noul_rows = {r["backend"] for r in rows if r["kind"] == "noul" and r["backend"] != "haiku"}
+    assert noul_rows == {"jev-openrouter", "jev-cloudflare"}, (rows, errs)
+    t4 = spend(lv)
+
+    # 7. vigil doctor, as the owner runs it from a build session, against this
+    # vigild's API: live calls only about thomasbardhi01/vigil (review A1). Its
+    # dev-image lines read the data dir `vigil dev-image` built into
+    # (VIGIL_DOCTOR_DATA_DIR), since this test's own has none.
+    import os
+
+    from vigild import config as config_mod
+    from vigild.doctor import render, run_checks
+
+    dcfg = config_mod.load()
+    data = os.environ.get("VIGIL_DOCTOR_DATA_DIR")
+    if data:
+        dcfg.vigild.data_dir = data
+    with httpx2.Client(timeout=30) as http:
+        checks = run_checks(dcfg, lv.v.secrets, http=http, docker=lv.docker,
+                            repos=["thomasbardhi01/vigil"])  # fmt: skip
+    log("step 7: vigil doctor --repo thomasbardhi01/vigil\n" + render(checks))
+    assert all(c.ok is not False for c in checks), render(checks)
 
     log(
         f"SPEND: step 1 ${t1 - t0:.4f}; steps 2-3 ${t2 - t1:.4f}; step 5 ${t3 - t2:.4f}; "
-        f"step 6 ${spend(lv) - t3:.4f}; total ${spend(lv) - t0:.4f}"
+        f"step 6 ${t4 - t3:.4f}; total ${spend(lv) - t0:.4f}"
     )

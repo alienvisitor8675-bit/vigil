@@ -174,11 +174,13 @@ def test_two_workers_build_in_their_own_containers(
     coord = [r for r in tree["sessions"] if r["role"] == "coord"][-1]
     workers = coord["children"]
     print("workers:", [(w["id"], w["status"], w["pr_url"]) for w in workers])
-    assert len(workers) == 2
-    assert all(w["status"] == "pr_open" for w in workers)
+    # two tasks; a review finding sends one back for a fix round on its PR
+    assert len({w["task_id"] for w in workers}) == 2
+    latest = {w["task_id"]: w for w in workers}
+    assert all(w["status"] == "pr_open" for w in latest.values())
     # phase 2a: each PR reviewed (Sonnet) and audited (Opus, rung 0), then ready
     assert tree["job"]["state"] == "ready", inbox["questions"]
-    for w in workers:
+    for w in latest.values():
         assert v.store.get_artifact(tree["job"]["id"], "review.json", w["task_id"]) is not None
     for p in publisher.prs:
         files = git(fixture_repo["bare"], "ls-tree", "-r", "--name-only", p["head"])
