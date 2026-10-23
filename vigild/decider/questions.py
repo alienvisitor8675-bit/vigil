@@ -90,6 +90,8 @@ class Question:
                 raise DeciderError(f"{self.name}: {raw!r} is not a score") from e
             if not 1.0 <= value <= 5.0:
                 raise DeciderError(f"{self.name}: score {value} is outside 1-5")
+        if probabilities is not None and not isinstance(probabilities, dict):
+            raise DeciderError(f"{self.name}: probabilities {probabilities!r} isn't a mapping")
         try:
             probs = {str(k): float(v) for k, v in probabilities.items()} if probabilities else None
         except (TypeError, ValueError) as e:  # a DeciderError, so the decision falls back

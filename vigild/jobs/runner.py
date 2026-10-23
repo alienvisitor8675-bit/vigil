@@ -2045,6 +2045,25 @@ class JobRunner:
         # the end, and a fix round's re-review reserves again
         bud = self.cfg.budgets
         amount = len(tasks) * (bud.review_session_usd + bud.audit_session_usd)
+        if not tasks:
+            # nothing to review (a restart after the reviews, or only fix
+            # rounds owed): no reserve; straight on to ready or the fix rounds
+            if self._review_pass(job_id, job, tasks):
+                self.dispatch(job_id)
+            return
+        cap = min(bud.daily_usd, bud.monthly_usd)
+        if amount > cap + 1e-9:
+            # can never fit: say so, and offer no retry that can't work
+            # (finding 5 is with the owner; until then, only this page)
+            self._block(job_id, f"review stage needs ${amount:.2f}; the daily cap is ${cap:.2f}")
+            self._page(
+                job_id,
+                f"{job_id}: the review stage needs ${amount:.2f}; the daily cap is ${cap:.2f}",
+                {"kind": "budget", "cap": "daily", "needs_usd": round(amount, 2),
+                 "tasks": [t.id for t in tasks], "actions": ["replan", "abandon"],
+                 "next": "re-plan into fewer tasks, or abandon; a retry can't fit"},
+            )  # fmt: skip
+            return
         try:
             stage = self.budget.reserve(
                 session_id=None, task_id=None, amount=amount, purpose="review_stage"
@@ -2063,13 +2082,19 @@ class JobRunner:
         with self._stage_lock:
             self._review_stage[job_id] = stage
         try:
-            self._review_pass(job_id, job, tasks)
+            redispatch = self._review_pass(job_id, job, tasks)
         finally:
             with self._stage_lock:
                 self._review_stage.pop(job_id, None)
             self.budget.settle(stage, 0.0)  # what no session drew goes back to the day
+        if redispatch:
+            # the pass is over and its stage released (2a round 6): only now
+            # does the fix round (or the deps job's regeneration) build
+            self.dispatch(job_id)
 
-    def _review_pass(self, job_id: str, job: Job, tasks: list[Any]) -> None:
+    def _review_pass(self, job_id: str, job: Job, tasks: list[Any]) -> bool:
+        """One review pass. True when the job goes back to building and the
+        caller dispatches it, once this pass's stage is released."""
         with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as pool:
             outcomes = dict(zip(
                 [t.id for t in tasks],
@@ -2084,12 +2109,12 @@ class JobRunner:
                 {"state": self.store.get_job(job_id).state.value, "tasks": sorted(outcomes)},
                 Provenance.HUMAN, job_id=job_id,
             )  # fmt: skip
-            return
+            return False
         failed = {tid: why for tid, (kind, why) in outcomes.items() if kind == "failed"}
         b = self._paused(job)
         if failed and b is not None:
             self._hold_for(job_id, b)  # a cap tripped mid-review: wait on its breaker
-            return
+            return False
         if failed:
             self._block(job_id, f"review failed: {sorted(failed)}")
             self._page(
@@ -2098,11 +2123,10 @@ class JobRunner:
                 {"kind": "review_failed", "tasks": failed, "actions": ["retry", "abandon"]},
                 resumable=True,
             )
-            return
+            return False
         flagged = {tid: f for tid, (kind, f) in outcomes.items() if kind == "deps_findings"}
         if flagged:
-            self._deps_review_failed(job_id, flagged)
-            return
+            return self._deps_review_failed(job_id, flagged)
         fixes = sorted(tid for tid, (kind, _) in outcomes.items() if kind == "fix")
         # a task a previous pass sent to a fix round, while another's review
         # failed, is still owed its round: it goes with this one (review B2)
@@ -2131,7 +2155,7 @@ class JobRunner:
                         "actions": ["replan", "abandon"],
                     },
                 )
-                return
+                return False
             transition(
                 self.store,
                 job_id,
@@ -2139,13 +2163,24 @@ class JobRunner:
                 Actor.VIGILD,
                 evidence={"findings": {tid: outcomes[tid][1] for tid in fixes}},
             )
-            self.dispatch(job_id)
-            return
-        transition(self.store, job_id, JobState.READY, Actor.VIGILD)
+            return True
+        try:
+            transition(self.store, job_id, JobState.READY, Actor.VIGILD)
+        except TransitionError:
+            # 10: the PR poll merged it between the re-check and this move
+            now = self.store.get_job(job_id).state
+            if now is JobState.IN_REVIEW:
+                raise
+            self.store.add_event(
+                "review_dropped", {"state": now.value, "tasks": sorted(outcomes)},
+                Provenance.HUMAN, job_id=job_id,
+            )  # fmt: skip
+            return False
         self.breakers.success(Kind.REPO_FAILURES, f"repo:{job.repo}")
         self._ready(job_id)
+        return False
 
-    def _deps_review_failed(self, job_id: str, flagged: dict[str, Any]) -> None:
+    def _deps_review_failed(self, job_id: str, flagged: dict[str, Any]) -> bool:
         """Owner ruling 3: a deps PR has no worker to fix it. A failed review
         closes the PR and regenerates the deps job once, on a new branch; a
         second failed review closes that PR too and pages the owner. The
@@ -2186,8 +2221,7 @@ class JobRunner:
                 self.store, job_id, JobState.BUILDING, Actor.VIGILD,
                 evidence={"findings": flagged, "deps_regenerated": again},
             )  # fmt: skip
-            self.dispatch(job_id)
-            return
+            return True  # the caller dispatches, once the pass's stage is released
         self._block(job_id, f"deps review findings, twice: {sorted(flagged)}")
         self._page(
             job_id,
@@ -2196,6 +2230,7 @@ class JobRunner:
              "next": "abandon it (the job waiting on it stays blocked) and add the "
              "dependency by hand, or re-plan the job that needs it"},
         )  # fmt: skip
+        return False
 
     def _ready(self, job_id: str) -> None:
         """Stage 8's queue: the job's PRs, each with its review and audit."""
@@ -2397,23 +2432,28 @@ class JobRunner:
         pages once."""
         b = self.cfg.budgets
         caps = [b.review_session_usd, b.audit_session_usd]
-        self.store.add_event(
-            "review_over_cap",
-            {"shape": shape, "role": role.value, "cap_usd": cap, "cost_usd": round(cost, 6),
-             "overage_usd": round(cost - cap, 6), "caps": caps},
-            Provenance.HUMAN, job_id=job_id, task_id=task_id,
-        )  # fmt: skip
-        n = sum(
-            1
-            for r in self.store.q("SELECT data FROM events WHERE type='review_over_cap'")
-            if (d := json.loads(r["data"])).get("shape") == shape and d.get("caps") == caps
-        )
-        if n == 2:
-            self._page(
-                None, f"Review caps too low for shape {shape}: 2 overages; consider re-sizing",
-                {"kind": "review_caps", "shape": shape, "caps": caps, "actions": ["dismiss"],
-                 "next": "raise review_session_usd or audit_session_usd in configs/budgets.yaml"},
+        # the event, the count and the page in one transaction: sessions
+        # finishing at once can't page twice, or not at all (2a round 6)
+        with self.store.tx():
+            self.store.add_event(
+                "review_over_cap",
+                {"shape": shape, "role": role.value, "cap_usd": cap,
+                 "cost_usd": round(cost, 6), "overage_usd": round(cost - cap, 6), "caps": caps},
+                Provenance.HUMAN, job_id=job_id, task_id=task_id,
             )  # fmt: skip
+            n = sum(
+                1
+                for r in self.store.q("SELECT data FROM events WHERE type='review_over_cap'")
+                if (d := json.loads(r["data"])).get("shape") == shape and d.get("caps") == caps
+            )
+            if n == 2:
+                self._page(
+                    None,
+                    f"Review caps too low for shape {shape}: 2 overages; consider re-sizing",
+                    {"kind": "review_caps", "shape": shape, "caps": caps, "actions": ["dismiss"],
+                     "next": "raise review_session_usd or audit_session_usd in "
+                     "configs/budgets.yaml"},
+                )  # fmt: skip
 
     def _ladder_page(self, change: LadderChange) -> None:
         """You see every promotion and demotion (design, trust ladder)."""

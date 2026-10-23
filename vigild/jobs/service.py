@@ -568,7 +568,10 @@ class JobService:
                 "abandon", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=job.id
             )
             for other in self.store.list_inbox():
-                if other.job_id == job.id and other.queue == "questions":
+                # the job's own pages; a breaker's page stays for its reset
+                # and for the other jobs it holds (2a round 6)
+                if (other.job_id == job.id and other.queue == "questions"
+                        and other.body.get("kind") != "breaker"):  # fmt: skip
                     self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
             breakers.unhold(job.id)
         failed = getattr(self.runner, "job_failed", None)

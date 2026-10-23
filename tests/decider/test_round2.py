@@ -386,3 +386,14 @@ def test_a_non_numeric_option_probability_is_a_decider_error(cfg: Config, store:
         PA, QUESTIONS["size"], "x"
     )
     assert got.answer.backend == "haiku" and haiku.purposes == ["decider_fallback"]
+
+
+@pytest.mark.parametrize("shape", [["S", 0.6], "S=0.6"])
+def test_probabilities_of_the_wrong_shape_are_a_decider_error(shape: Any) -> None:
+    """2a round 6, nit 9: a list or a string raised AttributeError."""
+    with pytest.raises(DeciderError):
+        QUESTIONS["size"].parse("S", 0.6, backend="x", probabilities=shape)
+    bad = json.loads(json.dumps(OR))
+    bad["answers"]["size"]["probabilities"] = shape
+    with pytest.raises(DeciderError):
+        _or(bad).ask(QUESTIONS["size"], "x", repo=PA, job_id=None, private=False)

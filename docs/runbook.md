@@ -360,7 +360,10 @@ uv run python -m vigild
   only: at $5 a day, three workers get about $1.67 each).
 - **Review caps.** A job entering review reserves $1.20 per task under review
   (`review_session_usd` $0.40 + `audit_session_usd` $0.80 in
-  `configs/budgets.yaml`); what isn't used goes back when the pass ends. A
+  `configs/budgets.yaml`); what isn't used goes back when the pass ends,
+  before any fix round builds. A job whose review stage is bigger than the
+  day can never be reviewed as it is: its page says so; re-plan it into
+  fewer tasks or abandon it. A
   review that runs past its cap still completes, charged to the day (the
   daily and monthly caps stay hard). "Review caps too low for shape <shape>:
   2 overages; consider re-sizing" means raise those two values. Re-size

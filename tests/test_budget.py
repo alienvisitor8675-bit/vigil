@@ -148,3 +148,59 @@ def test_review_and_audit_spend_count_toward_the_day_and_the_month(
     with pytest.raises(BudgetExceeded) as e:
         budget.reserve(session_id="rv2", task_id=None, amount=0.5, purpose="reviewer")
     assert e.value.cap == "monthly"
+
+
+# --- 2a round 6: a draw counts against the day and month it happens in ------------------------
+
+
+def _stage_then_draw(budget: Budget, clock: Clock, store: Store, *, before: datetime,
+                     after: datetime) -> int:  # fmt: skip
+    from vigild.jobs.model import Role
+
+    clock.now = before
+    stage = budget.reserve(session_id=None, task_id=None, amount=1.2, purpose="review_stage")
+    s = store.create_session(None, Role.AUDITOR, backend_preset="claude-opus")
+    clock.now = after
+    budget.draw(stage, session_id=s.id, amount=0.80, purpose="auditor")
+    return stage
+
+
+def test_a_draw_after_midnight_counts_against_the_new_day(
+    budget: Budget, clock: Clock, store: Store
+) -> None:
+    """The final review's probe: a stage reserved at 23:50 on day D, an
+    auditor drawing $0.80 at 00:05 on D+1; a coord's $5 must not fit then."""
+    d = datetime(2026, 10, 23, 23, 50, tzinfo=UTC)
+    _stage_then_draw(budget, clock, store, before=d, after=d + timedelta(minutes=15))
+    assert budget.open_today() == pytest.approx(0.80)
+    with pytest.raises(BudgetExceeded) as e:
+        budget.reserve(session_id=None, task_id=None, amount=5.0, purpose="coord")
+    assert e.value.cap == "daily"
+    clock.now = d  # day D: the drawn part isn't counted twice
+    assert budget.open_today() == pytest.approx(0.40)
+
+
+def test_a_draw_after_a_month_boundary_counts_against_the_new_month(
+    budget: Budget, clock: Clock, store: Store, cfg: Config
+) -> None:
+    cfg.budgets.daily_usd, cfg.budgets.monthly_usd = 50.0, 6.0
+    d = datetime(2026, 10, 31, 23, 50, tzinfo=UTC)
+    _stage_then_draw(budget, clock, store, before=d, after=d + timedelta(minutes=15))
+    assert budget.open_month() == pytest.approx(0.80)
+    with pytest.raises(BudgetExceeded) as e:
+        budget.reserve(session_id=None, task_id=None, amount=5.5, purpose="coord")
+    assert e.value.cap == "monthly"
+
+
+def test_a_draws_top_up_that_doesnt_fit_leaves_nothing_behind(budget: Budget, store: Store) -> None:
+    from vigild.jobs.model import Role
+
+    budget.reserve(session_id=None, task_id=None, amount=4.6, purpose="coord")
+    stage = budget.reserve(session_id=None, task_id=None, amount=0.4, purpose="review_stage")
+    s = store.create_session(None, Role.AUDITOR, backend_preset="claude-opus")
+    with pytest.raises(BudgetExceeded):
+        budget.draw(stage, session_id=s.id, amount=0.80, purpose="auditor")  # $0.40 short
+    assert store.q("SELECT COUNT(*) n FROM reservations WHERE session_id=? AND status='open'",
+                   (s.id,))[0]["n"] == 0  # fmt: skip
+    (row,) = store.q("SELECT amount_usd, status FROM reservations WHERE id=?", (stage,))
+    assert (row["amount_usd"], row["status"]) == (pytest.approx(0.4), "open")

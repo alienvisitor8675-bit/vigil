@@ -81,6 +81,8 @@ def parse_answer(q: Question, answers: Any, backend: str, version: str) -> Answe
     if kind != q.kind:
         raise DeciderError(f"{backend}: {q.name} came back as a {kind}, asked as a {q.kind}")
     probs = ans.get("probabilities") or {}
+    if not isinstance(probs, dict):  # a list or a string: a DeciderError, so it falls back
+        raise DeciderError(f"{backend}: {q.name} probabilities aren't a mapping")
     if kind == "choice":
         return q.parse(raw, probs.get(raw), backend=backend, model_version=version,
                        probabilities=probs)  # fmt: skip

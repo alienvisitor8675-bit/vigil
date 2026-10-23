@@ -165,16 +165,22 @@ class Budget:
 
     def draw(self, parent_id: int, *, session_id: str, amount: float, purpose: str) -> int:
         """A session's own reservation, taken out of a job's review-stage
-        reservation (owner, 2026-10-23): the parent shrinks by what the
-        session takes, so the day sees the same total. If the parent has less
-        left than `amount`, the rest is reserved against the day as usual."""
-        rid = 0
+        reservation (owner, 2026-10-23). A draw counts against the day and
+        month it happens in (2a round 6): on the stage's own day and month
+        the stage shrinks by what the session takes and the child carries
+        the same stamp, so the total held doesn't change; after a UTC day or
+        month boundary the child is reserved afresh, with the new day's and
+        month's cap check, and the stage still shrinks so the old day stops
+        counting that part. If the stage has less left than `amount`, the
+        rest is reserved as usual; if that fails, the draw is undone."""
+        day, month = self._day(), self._month()
+        rid, take = 0, 0.0
         with self.store.tx() as c:
             row = c.execute(
                 "SELECT amount_usd, status, day, month FROM reservations WHERE id=?", (parent_id,)
             ).fetchone()
-            take = 0.0
-            if row is not None and row["status"] == "open":
+            open_ = row is not None and row["status"] == "open"
+            if open_ and (row["day"], row["month"]) == (day, month):
                 take = min(amount, float(row["amount_usd"]))
             if take > 0:
                 c.execute(
@@ -184,15 +190,40 @@ class Budget:
                 cur = c.execute(
                     "INSERT INTO reservations (session_id, task_id, purpose, amount_usd, status,"
                     " day, month, created_at) VALUES (?,?,?,?, 'open', ?,?,?)",
-                    (session_id, None, purpose, take, row["day"], row["month"],
-                     iso(self.clock())),
-                )  # fmt: skip
+                    (session_id, None, purpose, take, day, month, iso(self.clock())),
+                )
                 rid = int(cur.lastrowid or 0)
         if take <= 0:
-            return self.reserve(session_id=session_id, task_id=None, amount=amount, purpose=purpose)
+            # another day or month (or nothing left): this day's and month's caps decide
+            rid = self.reserve(session_id=session_id, task_id=None, amount=amount, purpose=purpose)
+            if open_:
+                self._shrink(parent_id, amount)
+            return rid
         if amount - take > EPS:
-            self.reserve(session_id=session_id, task_id=None, amount=amount - take, purpose=purpose)
+            try:
+                self.reserve(
+                    session_id=session_id, task_id=None, amount=amount - take, purpose=purpose
+                )
+            except BudgetExceeded:
+                with self.store.tx() as c:  # undo the draw: nothing is left behind
+                    c.execute(
+                        "UPDATE reservations SET status='released', closed_at=? WHERE id=?",
+                        (iso(self.clock()), rid),
+                    )
+                    c.execute(
+                        "UPDATE reservations SET amount_usd = amount_usd + ? WHERE id=?",
+                        (take, parent_id),
+                    )
+                raise
         return rid
+
+    def _shrink(self, reservation_id: int, amount: float) -> None:
+        with self.store.tx() as c:
+            c.execute(
+                "UPDATE reservations SET amount_usd = MAX(0, amount_usd - ?)"
+                " WHERE id=? AND status='open'",
+                (amount, reservation_id),
+            )
 
     def settle_session(self, session_id: str) -> float:
         rows = self.store.q(
