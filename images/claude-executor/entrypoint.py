@@ -381,15 +381,21 @@ def _write_read_only(path: Path, doc: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def write_hook_inputs(hook_dir: Path, task: dict[str, Any], *, max_turns: int) -> None:
+def write_hook_inputs(
+    hook_dir: Path, task: dict[str, Any], *, max_turns: int, hold_first_stop: bool = False
+) -> None:
     """The Stop hook's inputs, from the task vigild wrote before the agent
     ran, into the root-owned hook dir (review A6): the hook never reads what
-    the agent can rewrite in /work."""
-    _write_read_only(hook_dir / "task.json", {
+    the agent can rewrite in /work. `hold_first_stop` comes from the
+    container's environment, set only by a test (2a round 9)."""
+    doc: dict[str, Any] = {
         "job_id": task.get("job_id"), "task_id": task.get("task_id"),
         "test_cmd": str((task.get("spec") or {}).get("test_cmd") or ""),
         "max_turns": max_turns,
-    })  # fmt: skip
+    }  # fmt: skip
+    if hold_first_stop:
+        doc["hold_first_stop"] = True
+    _write_read_only(hook_dir / "task.json", doc)
 
 
 def write_stop_blocks(hook_dir: Path, blocks: int) -> None:
@@ -585,8 +591,9 @@ def main() -> int:
         place_resume()
         if role == "worker" and HOOK_DIR.is_dir():
             write_hook_inputs(
-                HOOK_DIR, task, max_turns=int(os.environ.get("VIGIL_MAX_TURNS", "60"))
-            )
+                HOOK_DIR, task, max_turns=int(os.environ.get("VIGIL_MAX_TURNS", "60")),
+                hold_first_stop=os.environ.get("VIGIL_HOLD_FIRST_STOP") == "1",
+            )  # fmt: skip
             write_stop_blocks(HOOK_DIR, 0)
     except HarnessRefused as e:
         emit("vigil_result", {"status": "failed", "error": f"harness: {e}"})

@@ -35,6 +35,14 @@ only ends in the CLI's max-turns error, which loses the result) or after
 three blocked stops, and says `stop_hook_exhausted`, which the harness puts on
 the result; a stop whose checks pass is never flagged. Coords, reviewers and
 auditors are never held.
+
+**A test's held first stop** (2a round 9). A live test needs a real block in
+a real session, and a model that finishes in one go never fails a check. So
+when the harness's copy says `hold_first_stop` (only a test sets it, through
+the container's environment; vigild never does), the session's first stop
+is blocked once whatever the checks say, and the model is told to check its
+work and stop again; every later stop is judged as usual. It only ever adds
+a block, so it can't let through a stop that would otherwise be held.
 """
 
 from __future__ import annotations
@@ -198,16 +206,25 @@ def main() -> int:
     task = _read(HOOK_DIR / "task.json")
     if not task.get("task_id"):
         return allow()  # not a task the harness set up: nothing to hold it to
+    blocks = int(_read(HOOK_DIR / "stop.json").get("blocks") or 0)
     why = failed_check(task)
+    held = why is None and task.get("hold_first_stop") is True and blocks == 0
+    if held:
+        why = (
+            "this first stop is held once, for a test (vigild never sets this). Check your "
+            "work against the task: the test passes, your report is written and committed. "
+            "Then stop again."
+        )
     if why is None:
         return allow()
-    blocks = int(_read(HOOK_DIR / "stop.json").get("blocks") or 0)
     if blocks >= MAX_BLOCKS:
         return allow(f"vigil: stop allowed after {MAX_BLOCKS} blocked stops (stop_hook_exhausted)")
     limit = int(task.get("max_turns") or os.environ.get("VIGIL_MAX_TURNS") or 60)
     # a block buys one more turn; on the last one it only ends in the CLI's
     # max-turns error, and the session's result is lost
     if turns_used(hook.get("transcript_path")) + 1 >= limit:
+        if held:
+            return allow()  # its checks passed: nothing to flag
         return allow(f"vigil: stop allowed on the last turn of {limit} (stop_hook_exhausted)")
     return block(why)
 

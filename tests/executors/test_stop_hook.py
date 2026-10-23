@@ -253,3 +253,73 @@ def test_the_harness_writes_the_hooks_inputs_read_only_before_the_agent(tmp_path
     assert stat.S_IMODE((run / "stop.json").stat().st_mode) == 0o444
     ep.write_stop_blocks(run, 3)  # replaced, though read-only
     assert json.loads((run / "stop.json").read_text()) == {"blocks": 3}
+
+
+# --- 2a round 9: a test's held first stop -----------------------------------------------------
+
+
+def _hold(work: Path) -> None:
+    """The harness's copy with the test-only flag (from VIGIL_HOLD_FIRST_STOP)."""
+    run = work.parent / "run"
+    doc = json.loads((run / "task.json").read_text())
+    (run / "task.json").write_text(json.dumps({**doc, "hold_first_stop": True}))
+
+
+def test_a_held_first_stop_is_blocked_once_though_its_checks_pass(work: Path) -> None:
+    _report(work)
+    (work / "ok.txt").write_text("ok")
+    assert _stop(work) == {}  # without the flag: green, it stops
+    _hold(work)
+    out = _stop(work)
+    assert out["decision"] == "block" and out["reason"].startswith("vigil stop hook: ")
+    assert "held once, for a test" in out["reason"]
+    _blocks(work, 1)  # the harness counted it
+    assert _stop(work) == {}  # the second stop is judged as usual: it goes through
+
+
+def test_a_held_first_stop_still_reports_a_failing_check(work: Path) -> None:
+    _hold(work)
+    _report(work)
+    out = _stop(work)
+    assert "`test -f ok.txt` is red" in out["reason"]  # the real reason, not the hold
+    _blocks(work, 1)
+    assert _stop(work)["decision"] == "block"  # and it stays held while red
+
+
+def test_a_held_stop_on_the_last_turn_goes_through_unflagged(work: Path) -> None:
+    _hold(work)
+    _report(work)
+    (work / "ok.txt").write_text("ok")
+    assert _stop(work, requests=59, max_turns=60) == {}
+
+
+def test_the_harness_writes_the_hold_only_when_the_environment_asks(tmp_path: Path) -> None:
+    ep = _entrypoint()
+    task = {"job_id": JOB, "task_id": TASK, "spec": {"test_cmd": "true"}, "hold_first_stop": True}
+    ep.write_hook_inputs(tmp_path, task, max_turns=20)  # the workspace's copy can't ask for it
+    assert "hold_first_stop" not in json.loads((tmp_path / "task.json").read_text())
+    ep.write_hook_inputs(tmp_path, task, max_turns=20, hold_first_stop=True)
+    assert json.loads((tmp_path / "task.json").read_text())["hold_first_stop"] is True
+    src = (ROOT / "images" / "claude-executor" / "entrypoint.py").read_text()
+    assert 'hold_first_stop=os.environ.get("VIGIL_HOLD_FIRST_STOP") == "1"' in src
+
+
+def test_only_a_test_sets_the_hold(cfg: Any, tmp_path: Path) -> None:
+    """The container gets VIGIL_HOLD_FIRST_STOP only from the spec's flag, and
+    nothing in vigild sets that flag."""
+    from vigild.executors.base import SessionSpec
+    from vigild.executors.runtime import worker_kwargs
+    from vigild.jobs.model import Role
+
+    (tmp_path / "s").mkdir()
+    spec = SessionSpec(session_id="s-1", role=Role.WORKER, job_id=JOB, task_id=TASK, repo="o/r",
+                       preset="claude-haiku", model="m", clone=tmp_path, session_dir=tmp_path / "s",
+                       max_turns=10, max_minutes=5, max_budget_usd=1.0)  # fmt: skip
+    assert "VIGIL_HOLD_FIRST_STOP" not in worker_kwargs(cfg, spec, network="n")["environment"]
+    spec.hold_first_stop = True
+    assert worker_kwargs(cfg, spec, network="n")["environment"]["VIGIL_HOLD_FIRST_STOP"] == "1"
+    setters = [
+        str(p.relative_to(ROOT)) for p in (ROOT / "vigild").rglob("*.py")
+        if "hold_first_stop" in p.read_text() and p.name not in ("base.py", "runtime.py")
+    ]  # fmt: skip
+    assert setters == []

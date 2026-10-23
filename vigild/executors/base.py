@@ -51,6 +51,11 @@ class SessionSpec:
     # The gateway holds every call's worst case against the reservation, so a
     # review's small answers keep its reservation small.
     max_output_tokens: int | None = None
+    # Tests only (2a round 9): the Stop hook holds this worker's first stop
+    # once, whatever its checks say, so a live test sees a real block without
+    # depending on the model stopping early. vigild never sets it; it only
+    # adds a block, so it can't weaken the hook.
+    hold_first_stop: bool = False
 
 
 @dataclass

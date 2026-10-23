@@ -6,7 +6,8 @@ and audits Opus, as the review ladder has them. Nothing touches ParkAgent.
 
 1. Four batch tasks run through the scheduler, three at once (the peak is
    asserted), and are reviewed by Sonnet and audited by Opus at rung 0, by
-   model id (one of them is sent back once by the Stop hook).
+   model id (one of them is sent back once by the Stop hook: a test-only
+   flag holds its first stop, 2a round 9).
 2. The WIP breaker (the production limit, 4) trips on a fifth, pages once,
    pauses dispatch, and is reset from the inbox after a merge.
 3. That job's worker is killed mid-task and resumes from its last commit,
@@ -281,17 +282,26 @@ def test_phase_2a_done_when(live: Live) -> None:
     store = lv.v.store
     t0 = spend(lv)
 
-    # 1. three batch tasks, in parallel through the scheduler; reviewed and audited at rung 0
-    hook_nudge = (
-        " Work in two turns. In the first, write only the test, run it (it fails), and end "
-        "your turn with a one-line status; don't write a report yet and don't use ask_coord. "
-        "vigil's stop hook will send you back: that message is your go-ahead. Then write the "
-        "doc line, run the test, write your report and commit, and stop."
-    )
+    # 1. three batch tasks, in parallel through the scheduler; reviewed and audited at rung 0.
+    # Step 4's block is made certain (2a round 9): the alpha worker's container
+    # gets the Stop hook's test-only held first stop, so a real stop in a real
+    # session is blocked once, whatever the model does (run 11 asked Haiku to
+    # stop early instead, and it didn't)
+    held: set[str] = set()
+    run_session = lv.runner.executor.run
+
+    def hold_alpha(spec: Any, token: str, on_event: Any) -> Any:
+        if spec.role is Role.WORKER and spec.job_id in held:
+            spec.hold_first_stop = True
+        return run_session(spec, token, on_event)
+
+    lv.runner.executor.run = hold_alpha  # type: ignore[method-assign]
+    alpha_job = submit(lv, task("alpha", "alpha", "Add a line containing the word alpha to "
+                            "docs/alpha.md, with a pytest test tests/test_alpha.py that reads the "
+                            "file and asserts it."))  # fmt: skip
+    held.add(alpha_job)
     jobs = [
-        submit(lv, task("alpha", "alpha", "Add a line containing the word alpha to docs/alpha.md, "
-                        "with a pytest test tests/test_alpha.py that reads the file and asserts it."
-                        + hook_nudge)),
+        alpha_job,
         submit(lv, task("bravo", "bravo", "Add a line containing the word bravo to docs/bravo.md, "
                         "with a pytest test tests/test_bravo.py that reads the file and asserts it.")),
         submit(lv, task("charlie", "charlie", "Add a line containing the word charlie to "
