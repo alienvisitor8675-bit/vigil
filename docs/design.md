@@ -31,6 +31,8 @@ Oct 22, 2026 · @Thomas Bardhi
 >
 >   The owner's rulings of 2026-10-23 settle every point where the spec and the current design disagreed. The rule is that existing invariants win; the section lists the rulings.
 >
+> - **PR evidence pack (owner request 2026-10-23), design only:** a "PR evidence pack" section after the learning loop, for review before any code.
+>
 > It also corrects the facts the research disproved. How each part is built, the choices picked at build time, the full phase plan and the open decisions are in `docs/architecture.md`; versions and citations are in `docs/sources.md`.
 
 ## Summary
@@ -662,6 +664,109 @@ Also decided:
 - **The middle loop** runs only when the owner starts an incident from an inbox item.
 - **`reward.json`** is finalised after the audit and is never an input to any decision about the job itself. It feeds only the learning record and the ladder.
 - **#8:** it draws more than 50 tasks; tasks 1–50 are the anchor, and tuning uses tasks 51 onward.
+
+## PR evidence pack (owner request 2026-10-23, planned)
+
+What a reviewer gets on a PR beyond the diff. **Design only; nothing in this section is built.** Rows: `docs/feature-map.md` "PR evidence pack"; board row: `docs/ui.md` page 1.
+
+**The owner's request, in short.**
+- Every PR vigild opens gets a generated **footer** of references.
+- A UI change also gets a **recording**, made after the final verify.
+- A diff touching 3+ modules gets one **Mermaid diagram** of the changed call path.
+- None of it feeds the verifier or `reward.json`.
+- The board shows which of the three were produced and why any were skipped.
+
+### The footer
+
+- **Who writes it:** vigild alone. It is built in the one place a PR body is built (`vigild/github/publish.py`, `publish_branch`, which takes `body` at line 84 and passes it to `create_pull` at line 107), by the same mechanism as the PR body written by vigild that links the spec and the `gate.json` digest. It is **not a second mechanism**. The worker never writes a PR body, holds no GitHub token (architecture B25), and has no field in its contract that reaches one.
+- **Fields.** Each shows the literal `pending` until its source exists, and `skipped: <reason>` when it was never going to:
+
+  | Field | Source | Until then |
+  |---|---|---|
+  | spec | `spec.md` artifact, by sha256 | exists (phase 1) |
+  | plan | `plan.md` artifact, by sha256 | exists (phase 1) |
+  | event-log replay | the session's events, as an id range | `pending` (needs a per-attempt log) |
+  | gate results | `gate.json` | `pending` (learning epic) |
+  | hidden-test summary | categories and counts only, as the retry feedback gives them ("hidden 3/7 pass; failing: concurrency, empty-input") | `pending` (learning epic) |
+  | task cost | gateway metering, task total against the $2 cap | exists (phase 1) |
+  | reward seal id | the id of the signed `reward.json`, never its contents | `pending` (learning epic; sealed after the audit) |
+  | recording | the recording artifact, if made | `skipped: <reason>` |
+  | diagram | in the body, in a `<details>` block, if made | `skipped: <reason>` |
+
+- **A reference never holds a host.** A footer link never contains a Tailscale address or hostname: the repo may be public, and every repo is treated as private-first. A footer entry is `vigil:<job>/<task>/<artifact>@<sha256 first 12>`. The UI (`/artifact/<job>/<task>/<artifact>`, tailnet only) and `vigil artifact <ref>` resolve it. On GitHub it is text, not a clickable link; the owner clicks through in the UI.
+- **How to tell the worker never edited it.**
+  - The footer sits between `<!-- vigil:evidence:begin -->` and `<!-- vigil:evidence:end -->`. The first line inside is `footer-sha256: <digest of everything after it>`.
+  - vigild stores the digest of what it rendered as an artifact row (`pr_footer`, provenance `human`: vigild's own code).
+  - vigild strips the two marker strings from any worker text before it enters a body. Any body vigild reads back whose footer doesn't match the stored digest is rewritten and an `evidence_footer_mismatch` event is written.
+  - The footer is regenerated, with a body write by vigild, when a `pending` source appears. In particular the seal id arrives only after the audit.
+- **Redaction.** Every text field passes `vigild.redact.redact` before it is rendered.
+
+### The recording step
+
+For tasks labelled `kind:ui`, or whose diff touches a web surface; skipped when no UI path changed.
+- **A web surface:** a path matching the repo's `ui_paths` in `configs/repos.yaml`, a new key. Scope globs follow `vigild/intake/paths.py` `in_scope` (strict).
+- **When it runs:** after the task's final verify, as a stage that cannot change a gate. It is not part of acceptance and never moves a job's state. If the gate is red it is skipped (`verify_failed`); the gate's failure shows on the board regardless.
+- **What it records:**
+  - headless Chromium, driven over CDP `Page.startScreencast`;
+  - an overlay injected with `Page.addScriptToEvaluateOnNewDocument` that draws clicks and key presses;
+  - **idle cut:** frames with no input and no pixel change for longer than 2 s are dropped, keeping 0.5 s;
+  - **5 min cap** on wall-clock recording; a hit cap ends the recording, keeps what exists and says `truncated`.
+- **Stored** as a vigild artifact, in the vault with its hash, and referenced from the footer. **No third-party upload**, and no GitHub attachment.
+- **Skip reasons** shown on the board: `no_ui_path`, `verify_failed`, `no_flow`, `no_recorder_image`, `budget`, `error`.
+- **Masked.**
+  - Typed text: the overlay shows bullets, never keys; injected CSS sets `-webkit-text-security: disc` on every `input`, `textarea` and `[contenteditable]`.
+  - Also masked: `type=password`, any element with `data-vigil-mask`, and `autocomplete` tokens naming a credential or card.
+  - Not drawn at all: the URL bar (headless frames have none), cookies, storage, console and network.
+  - **Not masked: values the page renders as text.** Nothing can mask what it can't tell is secret. The defence is that the recorder's container holds no secret to render (no key, token or `~/.config/vigil`), so what can appear is fixture and test data.
+- **Who drives the clicks.** The design is a **scripted flow**: a file the coord names in the plan (`evidence.flow`: URL paths, clicks, text to type), run by a fixed driver. It costs no tokens, so the $2 cap is not touched. A model-driven flow is the other option; see the Opens.
+
+### The Mermaid diagram
+
+- **When:** the diff touches 3 or more modules, skipped otherwise (`fewer_than_3_modules`). A module is the directory of a changed non-test source file; a repo may name its own in `configs/repos.yaml`.
+- **Who writes it:** the routine local model, which means the tower (phase 5). Before phase 5 there is no such model, so the diagram is skipped with `no_local_model`.
+- **Input:** the diff and the changed symbol names, fenced with `packets.fence()` as untrusted text.
+- **Output:** one fenced `mermaid` block in a collapsible `<details>` section of the PR body. It is model text in a PR, so it passes `redact`, then a check:
+  - it parses as a flowchart or sequence diagram;
+  - it has no `click` directive, no HTML label and no URL;
+  - a failure is `diagram_invalid` and the diagram is dropped, not retried.
+- **Provenance** is `local`. It is a metered tower call, so its cost is GPU-seconds, not dollars.
+- **It runs for private repos**, since it uses no hosted model.
+
+### The constraints
+
+- **None of these artifacts is an input to the verifier or to `reward.json`.** The verifier reads only the vault checkout and the approved spec (B33). The reward schema has no field that names an evidence artifact. Reviewers may read the pack; the reward must not reference it.
+- **A test enforces this:** `vigild/verifier.py` and the reward assembly import nothing from the evidence code and read no evidence artifact, and `reward.json`'s schema contains no `evidence`, `recording` or `diagram` key.
+- **The recording runs after verify**, so it cannot mask a failing gate.
+- **Cost counts against the task's $2 cap.** A scripted flow costs $0 in tokens, so this only binds a model-driven flow, which reserves from the task's remaining cap like a retry (B35); with under $0.05 left it is skipped as `budget`.
+- **Nothing here gives a worker a key or a token.**
+
+### The board's Evidence row
+
+On the PR board (`docs/ui.md` page 1, phase 3), each PR row has an **Evidence** cell: three marks, `rec`, `diag`, `foot`, each `made`, `skipped` or `pending`, with the reason on hover and in the job detail. It reads the artifact rows and the skip reasons above; it holds no state of its own.
+
+### Phasing
+
+| Piece | Phase | Why |
+|---|---|---|
+| Footer | 2 (the 2b PR body) | It is the PR-body mechanism; its `pending` fields fill in as sources land |
+| Recording | 3 | Needs the UI's artifact route to be reviewable, and the recorder image |
+| Diagram | 5 | Needs the tower's routine model |
+| Board row | 3 | The PR board is a phase 3 page |
+
+### Open (owner to decide)
+
+1. **The 2b plan text isn't in the tree.** Open: the brief cites a 2b plan line "PR body written by vigild linking spec and gate.json digest" and a per-attempt event log planned for 2b. Neither is in `docs/` on `main` or in `docs/plans/phase-2a.md` (the 2b section is lines 178-221 on `feat/phase-2a`), which lists no PR body and no event log. `events` has one global `id` (`vigild/db.py:54-56`), no per-attempt sequence. The footer assumes both; confirm where they are specified. (owner to decide)
+2. **Fields with no source yet.** Open: event-log replay, gate results, hidden-test summary and reward seal id show `pending` (learning epic: `docs/design.md` "Learning loop" lines 539-548; architecture lines 535-551). (owner to decide)
+3. **The seal arrives late.** Open: `reward.json` is finalised after the audit (design.md:548), after the PR is open, so the footer needs a post-audit body write by vigild. (owner to decide)
+4. **Reviewers read the PR, and may read the footer.** Open: "reviewers never see `reward.json`" (design.md:547, stage 5). The seal id and gate results in the body are not the reward's contents, but the board and the auditor's blind-first rule assume the reviewer packet carries the diff, issue and spec only. Either the reviewer packet excludes the footer, or the owner accepts that it doesn't. (owner to decide)
+5. **Recording where.** Open: the request says the worker container. That container is untrusted, so a recording made in it is worker-produced evidence, and by "after verify" it has already exited (B34 bundles, B33 verifies from the vault). The alternative is a vigild-owned container built from the vault checkout, like the verifier: no network, the checkout read-only, the repo's dev image plus a recorder layer. This section assumes the vigild-owned container. (owner to decide)
+6. **Chromium is a new dependency.** Open: exact version and image digest, at least two weeks old, recorded in `docs/sources.md`; one-line reason: "CDP screencast for the evidence recording". Also open: raw CDP over a WebSocket or a library, and a video encoder. Each is another dependency needing its reason. (owner to decide)
+7. **The app server and egress.** Open: the server being recorded runs inside the recorder container on loopback, and Chromium is started with host resolution limited to localhost. The container has no network at all, so there is no new egress rule; a test asserts external connections fail. (owner to decide)
+8. **Scripted or model-driven.** Open: the "counts against the $2 cap" clause only means something for a model-driven flow, which needs a gateway token for a container started after the worker's session. The design picks scripted. (owner to decide)
+9. **What counts as a web surface and a module.** Open: `ui_paths` and the module definition are new `configs/repos.yaml` keys. (owner to decide)
+10. **Where the link goes.** Open: artifacts are served only on the tailnet, so a reference in a GitHub body can't be clicked from GitHub. The alternatives are the opaque `vigil:` reference above or nothing. No host goes in a body in either case. (owner to decide)
+11. **What the body discloses.** Open: hidden-test categories and task cost in a PR body on a repo that is public (the vigil repo is temporarily public). Categories already go to the worker as retry feedback; GitHub readers are a wider audience. (owner to decide)
+12. **The diagram depends on phase 5.** Open: the "routine local model" is not named in `configs/backends.yaml` today. Before phase 5 the Evidence row says `no_local_model`. (owner to decide)
 
 ## Tower: local model serving
 

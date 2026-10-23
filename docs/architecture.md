@@ -492,6 +492,10 @@ file (runbook). The Cloudflare token is optional, because Haiku covers.
     active worker's edits come from;
   - its quality strip needs phase 2's review data (findings per PR);
   - its tower meters show `—` until phase 5.
+- **PR evidence pack** (planned, `docs/design.md` "PR evidence pack"): the
+  board's Evidence row and the recording step, with the footer in phase 2's
+  PR body and the diagram in phase 5. Verifier and reward inputs are
+  unchanged.
 - **Done when:** the list in `docs/ui.md` passes.
 - **Spend:** about $1.
 

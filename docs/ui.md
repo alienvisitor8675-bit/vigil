@@ -187,6 +187,13 @@ One table with every job:
 - turns, elapsed;
 - tokens in/out, $ or GPU-s;
 - PR, CI, review rung, trace link.
+- **Evidence** (planned, `docs/design.md` "PR evidence pack"): three marks,
+  `rec` (recording), `diag` (Mermaid diagram) and `foot` (the PR footer).
+  Each is `made`, `skipped` or `pending`. A skipped mark shows its reason
+  on hover and on `/job/:id`: `no_ui_path`, `verify_failed`, `no_flow`,
+  `no_recorder_image`, `budget`, `error`, `fewer_than_3_modules`,
+  `no_local_model` (before phase 5), `diagram_invalid`. The cell reads
+  artifact rows; it holds no state and never changes a CI or gate column.
 
 Typing filters the table. `Enter` opens `/job/:id`.
 
