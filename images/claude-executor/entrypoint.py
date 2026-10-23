@@ -372,6 +372,24 @@ def place_resume() -> str | None:
     return sid
 
 
+def stop_hook_event(name: str, subtype: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    """A Stop hook's answer as a vigil event (item 6): whether it sent the
+    model back, its reason, and whether it let the stop through exhausted."""
+    if name != "Stop" or subtype != "hook_response":
+        return None
+    out = str(data.get("output") or data.get("stdout") or "")
+    blocked = '"decision": "block"' in out or '"decision":"block"' in out
+    return {
+        "type": "stop_hook",
+        "data": {
+            "blocked": blocked,
+            "exhausted": "stop_hook_exhausted" in out,
+            "outcome": data.get("outcome"),
+            "output": out[-3000:],
+        },
+    }
+
+
 def agent_options(role: str, token: str, stderr: Any) -> dict[str, Any]:
     """The SDK's options for this session, as keyword arguments (pure, so
     tested without the SDK)."""
@@ -393,6 +411,7 @@ def agent_options(role: str, token: str, stderr: Any) -> dict[str, Any]:
         "env": child_env,
         "stderr": stderr,  # piped to the harness, never the container's streams
     }
+    opts["include_hook_events"] = True  # the Stop hook's answers, in the stream (item 6)
     resume_id = os.environ.get("VIGIL_RESUME_SESSION") or None
     opts["session_store"] = TranscriptStore(token)
     opts["session_store_flush"] = "eager"  # a killed session keeps what it said
@@ -430,6 +449,17 @@ async def run_agent(packet: str, role: str, token: str) -> dict[str, Any]:
     turns = 0
     last_checkpoint = time.monotonic()
     async for msg in query(prompt=packet, options=options):
+        hook_name = getattr(msg, "hook_event_name", "")
+        if isinstance(msg, SystemMessage) and hook_name:
+            ev = stop_hook_event(hook_name, msg.subtype, msg.data or {})
+            if ev is not None:
+                emit_event(token, ev)
+                result["stop_hook_blocks"] = result.get("stop_hook_blocks", 0) + int(
+                    ev["data"]["blocked"]
+                )
+                if ev["data"]["exhausted"]:
+                    result["stop_hook_exhausted"] = True
+            continue
         if isinstance(msg, SystemMessage) and msg.subtype == "init":
             plugins = [
                 p.get("name") if isinstance(p, dict) else str(p)

@@ -257,7 +257,7 @@ def test_a_session_image_is_the_executor_layer_over_the_dev_image(layered: Any) 
     assert layer_build["dockerfile"].name == "Dockerfile"
     assert layer_build["dockerfile"].parent.name == "claude-executor"  # one layer definition
     assert layer_build["build_args"] == {"BASE": dev_tag}
-    assert layer_build["contexts"] == ["claude_mods", "vigil_configs"]
+    assert layer_build["contexts"] == ["claude_mods", "vigil_configs", "vigil_schemas"]
     # the image says which layer built it (the threat-row fixture picks by it)
     from vigild.devimage import LAYER_LABEL, layer_digest
 

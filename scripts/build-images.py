@@ -80,6 +80,8 @@ def main() -> int:
                 f"claude_mods={ctx}",
                 "--build-context",
                 f"vigil_configs={ROOT / 'configs'}",
+                "--build-context",
+                f"vigil_schemas={ROOT / 'schemas'}",
                 "-t",
                 cfg.vigild.images.claude_executor,
                 str(ROOT / "images" / "claude-executor"),

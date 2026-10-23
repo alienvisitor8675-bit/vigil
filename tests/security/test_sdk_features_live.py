@@ -89,3 +89,23 @@ def test_a_session_forks_the_transcript_vigild_kept(
     assert "PERIWINKLE" in str(out2.result.get("result_text", "")).upper()
     forked = {e["data"]["session_id"] for e in events2 if e["type"] == "transcript"}
     assert forked and sdk not in forked  # a fork writes under its own session id
+
+
+def test_a_stop_hook_block_shows_up_in_the_transcript(
+    runtime: DockerRuntime, make_spec: Callable[..., SessionSpec], vigild: Vigild
+) -> None:
+    """Plan 2a, item 6: a worker that tries to stop without its report is sent
+    back, with the hook's message in its transcript; the cap lets it go."""
+    spec = make_spec(Role.WORKER)
+    spec.max_turns = 8
+    spec.packet = (
+        "This is a test of a stop check. Do not use any tool. Reply with the single word DONE "
+        "and stop. If you are told you can't stop yet, reply DONE again and stop."
+    )
+    out, events = _run(vigild, runtime, spec)
+    assert out.status == "done", out
+    hooks = [e["data"] for e in events if e["type"] == "stop_hook"]
+    assert any(h["blocked"] for h in hooks), events
+    entries = [x for e in events if e["type"] == "transcript" for x in e["data"]["entries"]]
+    assert "vigil stop hook" in json.dumps(entries)
+    assert out.result.get("stop_hook_blocks", 0) >= 1

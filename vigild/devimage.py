@@ -299,6 +299,7 @@ EXECUTOR_LAYER = ROOT / "images" / "claude-executor"
 LAYER_LABEL = "dev.vigil.layer-digest"
 SESSION_KEY_LABEL = "dev.vigil.session-key"
 MANAGED_SETTINGS = ROOT / "configs" / "managed-settings.json"
+REPORT_SCHEMA = ROOT / "schemas" / "worker_report.schema.json"  # the Stop hook's (item 6)
 # What a session image must have: the CLI at its pin, the harness's Python
 # with the SDK, setpriv for the agent uid, and guard seeded.
 SESSION_CHECK = (
@@ -315,7 +316,7 @@ def layer_digest() -> str:
     files = sorted(
         f for f in EXECUTOR_LAYER.rglob("*") if f.is_file() and "__pycache__" not in f.parts
     )
-    for f in [*files, MANAGED_SETTINGS]:
+    for f in [*files, MANAGED_SETTINGS, REPORT_SCHEMA]:
         h.update(str(f.relative_to(ROOT)).encode() + b"\0" + f.read_bytes() + b"\0")
     return h.hexdigest()
 
@@ -388,7 +389,11 @@ class SessionImages:
             tag,
             timeout_s=BUILD_SECONDS,
             build_args={"BASE": dev_tag},
-            contexts={"claude_mods": self.claude_mods(), "vigil_configs": ROOT / "configs"},
+            contexts={
+                "claude_mods": self.claude_mods(),
+                "vigil_configs": ROOT / "configs",
+                "vigil_schemas": ROOT / "schemas",
+            },
             labels={LAYER_LABEL: layer_digest(), SESSION_KEY_LABEL: key},
         )
         image_id = self.dev.docker.image_id_of(tag) if ok else None

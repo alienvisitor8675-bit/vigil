@@ -10,7 +10,8 @@
 # The verifier never runs this layer: it uses the plain dev image.
 #
 # Build contexts: `claude_mods` (a `git archive` of the pinned SHA, so no token
-# and no clone at build time; B16) and `vigil_configs` (the managed settings).
+# and no clone at build time; B16), `vigil_configs` (the managed settings) and
+# `vigil_schemas` (the worker-report schema the Stop hook checks).
 #
 # Pins: CPython 3.14.8 for the harness (uv-managed, under /opt/vigil-python,
 # whatever the base's own Python); Node 24.21.0 only to install the CLI, which
@@ -89,6 +90,10 @@ RUN chmod 0555 /opt/vigil/hooks/pre-push \
 COPY entrypoint.py /opt/vigil/entrypoint.py
 COPY agent-cli /opt/vigil/agent-cli
 RUN chmod 0555 /opt/vigil/agent-cli
+# The worker's Stop hook (managed settings) and the report schema it checks
+# against (plan 2a, item 6).
+COPY --chmod=0444 stop_hook.py /opt/vigil/stop_hook.py
+COPY --chmod=0444 --from=vigil_schemas worker_report.schema.json /opt/vigil/worker_report.schema.json
 
 # The harness is PID 1 as root (runtime.py adds only SETUID, SETGID and KILL);
 # it runs the CLI, any session-prepare hook the base has, and git as uid 10001

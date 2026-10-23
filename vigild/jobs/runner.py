@@ -1403,6 +1403,11 @@ class JobRunner:
                 job_id, None, task_id, f"{task_id}: worker crashed",
                 {"error": out.error or "", "resumes": self._crashes(task_id)},
             )  # fmt: skip
+        hook: dict[str, Any] = {
+            k: out.result[k] for k in ("stop_hook_blocks", "stop_hook_exhausted") if k in out.result
+        }
+        if hook:
+            self.store.update_session(s.id, detail=hook)  # the Stop hook's record (item 6)
         if out.status != "done":
             return self._fail(
                 job_id,
