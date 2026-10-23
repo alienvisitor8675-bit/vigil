@@ -478,3 +478,60 @@ def test_a_dependency_that_needs_a_source_build_fails_the_deps_job_by_name(
     ex, _ws, base = _executor(tmp_path, fixture_repo, NoWheel(NEW_PY, LOCK), {"six": 600})
     res = ex.run(REPO, base, ["pyproject.toml", "uv.lock"], SIX, "img")
     assert any("source build" in e for e in res.errors)
+
+
+def _deps_child(w: World, fixture_repo: dict[str, Any]) -> tuple[str, str, PackageManager]:
+    _seed(fixture_repo)
+    w.runner.cfg.repos.repos[REPO].dev_lockfiles = ["pyproject.toml", "uv.lock"]
+    pm = PackageManager(NEW_PY, _lock(("six", "1.17.0")))
+    w.runner.deps = DepsExecutor(
+        w.runner.workspace, pm, Registry({"six": 600}), lambda: NOW, w.runner.cfg.vigild.data_path
+    )
+    w.standin.worker_edit = _needs_six
+    parent = _approve(w)
+    child = _failure_item(w, parent, "needs_deps")["body"]["deps_job"]
+    return parent, child, pm
+
+
+def _approve_child(w: World, child: str) -> None:
+    (item,) = [x for x in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"]
+               if x["job_id"] == child]  # fmt: skip
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+
+
+def test_only_the_runners_own_closes_count_as_regenerations(
+    world: World, fixture_repo: dict[str, Any]
+) -> None:
+    """2a round 3, nit 5: the PR poll's `pr_closed` events don't count."""
+    from tests.review.test_review_stage import CHANGES
+    from vigild.provenance import Provenance
+
+    w = world
+    _parent, child, pm = _deps_child(w, fixture_repo)
+    w.store.add_event("pr_closed", {"pr_url": "https://x/1"}, Provenance.HUMAN, job_id=child,
+                      task_id=f"{child}-w1")  # the poll saw an earlier PR closed  # fmt: skip
+    w.standin.review = lambda spec: CHANGES if spec.job_id == child else CLEAN_REVIEW
+    _approve_child(w, child)
+    assert len(pm.ran) == 2  # still regenerated once
+    closes = [e for e in w.store.events(job_id=child) if e.type == "deps_review_closed"]
+    assert len(closes) == 2
+
+
+def test_a_deps_pr_that_wont_close_pages_the_owner(
+    world: World, fixture_repo: dict[str, Any]
+) -> None:
+    from tests.review.test_review_stage import CHANGES
+    from vigild.github.publish import PublishError
+
+    w = world
+    _parent, child, _pm = _deps_child(w, fixture_repo)
+
+    def refuse(repo: str, url: str) -> None:
+        raise PublishError("422: not allowed")
+
+    w.publisher.close = refuse  # type: ignore[method-assign]
+    w.standin.review = lambda spec: CHANGES if spec.job_id == child else CLEAN_REVIEW
+    _approve_child(w, child)
+    pages = [q for q in w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()[
+        "questions"] if q["body"].get("kind") == "deps_pr_left_open"]  # fmt: skip
+    assert pages and "left open" in pages[0]["title"]

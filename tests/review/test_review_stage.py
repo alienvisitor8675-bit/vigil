@@ -91,11 +91,13 @@ def test_a_fix_round_reuses_the_workers_remaining_budget(world: World) -> None:
     job = _approve(w)
     assert w.store.get_job(job).state.value == "ready"
     first, fix = _workers(w, "w1")
-    assert first.max_budget_usd == pytest.approx(2.0)
+    assert first.max_budget_usd == pytest.approx(
+        1.0
+    )  # the wave's share: ($5 - 2 x $1.50 of reviews) / 2 (2a round 3)
     assert fix.max_budget_usd == pytest.approx(1.70)
     held = w.store.q("SELECT amount_usd FROM reservations WHERE task_id=? ORDER BY id",
                      (f"{job}-w1",))  # fmt: skip
-    assert [r["amount_usd"] for r in held] == [2.0, pytest.approx(1.70)]
+    assert [r["amount_usd"] for r in held] == [1.0, pytest.approx(1.70)]
     # reviews and audits are booked against the day, not the task's cap
     assert w.runner.remaining(f"{job}-w1")[1] == pytest.approx(0.60)
 

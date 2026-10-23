@@ -162,6 +162,9 @@ class JobService:
         self.cfg = cfg
         self.store = store
         self.runner = runner
+        # how each job's last resume, retry or re-plan ran: "started", or
+        # "queued" behind its current run (2a round 3), for the API to say
+        self.last_run: dict[str, str | None] = {}
 
     # --- submissions ----------------------------------------------------------
 
@@ -492,7 +495,7 @@ class JobService:
             for other in self.store.list_inbox():
                 if other.job_id == job.id and other.body.get("resumable") and other.id != item_id:
                     self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
-        self.runner.on_resume(job.id)
+        self.last_run[job.id] = self.runner.on_resume(job.id)
         return job
 
     def _offered(self, item_id: int, action: str) -> InboxItem:
@@ -526,17 +529,34 @@ class JobService:
                 job_id=job.id,
             )
             self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
-        self.runner.on_resume(job.id)
+        self.last_run[job.id] = self.runner.on_resume(job.id)
         return job
 
-    def abandon(self, item_id: int) -> Job:
-        """Give the job up: nothing more runs; open PRs stay for you to close."""
+    def abandon(self, item_id: int, job_id: str | None = None) -> Job:
+        """Give the job up: nothing more runs; open PRs stay for you to close.
+        A breaker's page (one page however many jobs it holds) abandons the
+        held job its caller names (2a round 3): any job a breaker holds can
+        be abandoned from the inbox."""
+        from vigild.breakers import Breakers
+
+        breakers = Breakers(self.store, self.cfg)
         with self.store.tx():
-            item = self._offered(item_id, "abandon")
-            assert item.job_id is not None
+            item = self._question(item_id)
+            if "abandon" not in (item.body.get("actions") or []):
+                raise Conflict(f"inbox item {item_id} doesn't offer abandon")
+            target = item.job_id
+            if item.body.get("kind") == "breaker":
+                held = breakers.held_by(int(item.body.get("breaker") or 0))
+                target = job_id or (item.job_id if item.job_id in held else None)
+                if target is None or target not in held:
+                    raise Conflict(f"name a job breaker page {item_id} holds: {held}")
+            elif job_id not in (None, item.job_id):
+                raise Conflict(f"inbox item {item_id} is about {item.job_id}, not {job_id}")
+            if target is None:
+                raise Conflict(f"inbox item {item_id} names no job")
             try:
                 job = transition(
-                    self.store, item.job_id, JobState.ABANDONED, Actor.OWNER,
+                    self.store, target, JobState.ABANDONED, Actor.OWNER,
                     channel="inbox", evidence={"inbox_item_id": item_id, "action": "abandon"},
                 )  # fmt: skip
             except TransitionError as e:
@@ -550,6 +570,7 @@ class JobService:
             for other in self.store.list_inbox():
                 if other.job_id == job.id and other.queue == "questions":
                     self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
+            breakers.unhold(job.id)
         failed = getattr(self.runner, "job_failed", None)
         if failed is not None:
             failed(job)  # an abandoned job counts toward the repo's breaker (item 4)

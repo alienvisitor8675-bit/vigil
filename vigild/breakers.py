@@ -207,7 +207,7 @@ class Breakers:
         detail: dict[str, Any],
         *,
         job_id: str | None = None,
-        actions: tuple[str, ...] = ("reset",),
+        actions: tuple[str, ...] = ("reset", "abandon"),
         title: str | None = None,
     ) -> Breaker:
         """Open the breaker. It pages once: tripping an open breaker again adds
@@ -283,6 +283,20 @@ class Breakers:
                 self._set(b, count=0)
         if held and self.on_close is not None:
             self.on_close(held, item_id)
+
+    def unhold(self, job_id: str) -> None:
+        """The job no longer waits on any breaker: the owner abandoned it, or
+        its own page holds it now (2a round 3)."""
+        with self.store.lock:
+            for b in self.open_breakers():
+                if job_id in b.held:
+                    self._set(b, held=[j for j in b.held if j != job_id])
+
+    def held_by(self, breaker_id: int) -> list[str]:
+        try:
+            return self.get(breaker_id).held
+        except KeyError:
+            return []
 
     def hold(self, b: Breaker, job_id: str) -> None:
         """Note a job this breaker paused; resetting it resumes the job."""

@@ -90,7 +90,12 @@ class Question:
                 raise DeciderError(f"{self.name}: {raw!r} is not a score") from e
             if not 1.0 <= value <= 5.0:
                 raise DeciderError(f"{self.name}: score {value} is outside 1-5")
-        probs = {str(k): float(v) for k, v in probabilities.items()} if probabilities else None
+        try:
+            probs = {str(k): float(v) for k, v in probabilities.items()} if probabilities else None
+        except (TypeError, ValueError) as e:  # a DeciderError, so the decision falls back
+            raise DeciderError(
+                f"{self.name}: probabilities {probabilities!r} aren't numbers"
+            ) from e
         return Answer(self.name, value, p, backend, model_version, self.kind, probs)
 
     def _noul(

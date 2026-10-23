@@ -191,24 +191,26 @@ def approve(
 
 @router.post("/api/inbox/{item_id}/resume", dependencies=[ADMIN])
 def resume(request: Request, item_id: int) -> dict[str, Any]:
+    jobs = _svc(request).jobs
     try:
-        job = _svc(request).jobs.resume(item_id)
+        job = jobs.resume(item_id)
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
         raise HTTPException(409, str(e)) from e
-    return {"job_id": job.id, "state": job.state.value}
+    # `queued`: the job's current run finishes first, then this one (2a round 3)
+    return {"job_id": job.id, "state": job.state.value, "run": jobs.last_run.get(job.id)}
 
 
 def _act(request: Request, item_id: int, action: str) -> dict[str, Any]:
     jobs = _svc(request).jobs
     try:
-        job = {"retry": jobs.retry, "replan": jobs.replan, "abandon": jobs.abandon}[action](item_id)
+        job = {"retry": jobs.retry, "replan": jobs.replan}[action](item_id)
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
         raise HTTPException(409, str(e)) from e
-    return {"job_id": job.id, "state": job.state.value}
+    return {"job_id": job.id, "state": job.state.value, "run": jobs.last_run.get(job.id)}
 
 
 @router.post("/api/inbox/{item_id}/retry", dependencies=[ADMIN])
@@ -224,8 +226,19 @@ def replan(request: Request, item_id: int) -> dict[str, Any]:
 
 
 @router.post("/api/inbox/{item_id}/abandon", dependencies=[ADMIN])
-def abandon(request: Request, item_id: int) -> dict[str, Any]:
-    return _act(request, item_id, "abandon")
+def abandon(
+    request: Request, item_id: int, payload: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
+    """Give a job up. On a breaker's page, `{"job_id": ...}` names which of
+    the jobs it holds (2a round 3)."""
+    job_id = (payload or {}).get("job_id")
+    try:
+        job = _svc(request).jobs.abandon(item_id, str(job_id) if job_id else None)
+    except NotFound as e:
+        raise HTTPException(404, "no such inbox item") from e
+    except Conflict as e:
+        raise HTTPException(409, str(e)) from e
+    return {"job_id": job.id, "state": job.state.value}
 
 
 @router.post("/api/inbox/{item_id}/rebuild", dependencies=[ADMIN])

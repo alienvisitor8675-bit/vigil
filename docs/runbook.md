@@ -349,13 +349,16 @@ uv run python -m vigild
   backend's errors, a repo's failed jobs, the verifier's unknowns, the
   Cloudflare credit, a repo's decider fallback. Fix the cause, then press
   **Reset**: the jobs it held resume (`queued` if one's last run is still
-  finishing; it picks up right after). A backend breaker also closes itself
+  finishing; it picks up right after). Or press **Abandon** on the breaker's
+  page, naming one of the jobs it holds, to give that job up. A backend breaker also closes itself
   after a successful probe five minutes on, resolving its page; meanwhile
   its work goes to the preset's fallback in `configs/routing.yaml`.
 - **Budget pages.** A job whose workers don't fit what the day has left gets
   its own page, "the budget can't fit this work now": retry later, re-plan
   with smaller `max_cost_usd`, or abandon. Each worker in a wave reserves its
-  cap or its share of what's left of the day, whichever is less.
+  cap or its share of what's left of the day, whichever is less, after
+  holding back that wave's reviews and audits ($1.50 a task): at $5 a day,
+  one worker gets up to $2, two $1.00 each, three about $0.17 each.
 - **Deps PRs.** vigild opens them with no source builds (wheels and
   tarballs only) and builds the new dev image only after you merge. A review
   that fails closes the PR and makes it again once; a second failure closes

@@ -907,12 +907,15 @@ def test_fail_blocked_retry_done(world: World) -> None:
     assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
     # the retry ran only w1, under what was left of its $2.00, not a fresh cap
     w1 = [b for b in budgets if b[0].endswith("w1")]
-    assert w1 == [(f"{job}-w1", 2.0), (f"{job}-w1", pytest.approx(1.70))]
+    assert w1 == [
+        (f"{job}-w1", 1.0),
+        (f"{job}-w1", pytest.approx(1.70)),
+    ]  # the wave's share: ($5 - 2 x $1.50 of reviews) / 2 (2a round 3)
     assert sum(1 for b in budgets if b[0].endswith("w2")) == 1
     held = w.store.q(
         "SELECT amount_usd FROM reservations WHERE task_id=? ORDER BY id", (f"{job}-w1",)
     )
-    assert [r["amount_usd"] for r in held] == [2.0, pytest.approx(1.70)]
+    assert [r["amount_usd"] for r in held] == [1.0, pytest.approx(1.70)]
     assert w.budget.open_today() == 0
 
 

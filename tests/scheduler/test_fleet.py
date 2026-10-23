@@ -85,6 +85,7 @@ def _run(w: World, n: int, deps: dict[int, list[int]] | None = None, delay: floa
 
 def test_three_sessions_at_once_across_the_fleet(world: World) -> None:
     w = world
+    w.runner.cfg.budgets.daily_usd = 20.0  # four workers and their reviews: room for all
     job = _run(w, 4, delay=0.3)
     assert w.store.get_job(job).state.value == "ready"
     assert w.standin.max_running == 3
@@ -118,6 +119,7 @@ def test_a_diamond_job_runs_in_order(world: World) -> None:
 def test_a_fifth_pr_waits(world: World) -> None:
     w = world
     assert w.runner.cfg.budgets.wip_per_repo == 4
+    w.runner.cfg.budgets.daily_usd = 20.0  # five workers and their reviews: room for all
     job = _run(w, 5)
     assert w.store.get_job(job).state.value == "blocked"
     assert len(w.publisher.prs) == 4

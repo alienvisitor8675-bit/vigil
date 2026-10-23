@@ -186,7 +186,7 @@ class JobRunner:
         self._running: set[str] = set()
         self._running_lock = threading.Lock()
         # a resume that arrives while the job's run is going: run it after (B4)
-        self._queued: dict[str, Callable[[str], None]] = {}
+        self._queued: dict[str, tuple[Callable[[str], None], JobState | None]] = {}
         # the WIP room check and the move to running, for every job at once (B10)
         self._wip_lock = threading.Lock()
         self.closers: list[Callable[[], None]] = []  # e.g. the docker client (item 0)
@@ -211,16 +211,40 @@ class JobRunner:
         with self._running_lock:
             return sorted(self._running)
 
-    def _spawn(self, fn: Callable[[str], None], job_id: str) -> str:
+    def _spawn(self, fn: Callable[[str], None], job_id: str, expect: JobState | None = None) -> str:
         """One run per job at a time, whatever starts it (round 3, F7). A run
         asked for while one is going is queued, not dropped (review B4): it
-        starts when the current one ends. Returns "started" or "queued"."""
+        starts when the current one ends, and only if the job is still in
+        the state it was asked for (`expect`); otherwise it is dropped with a
+        `queued_run_dropped` event, and the job's own page stays the owner's
+        way to act (2a round 3). Returns "started" or "queued"."""
         with self._running_lock:
             if job_id in self._running:
-                self._queued[job_id] = fn  # the latest ask wins; it reads the job's state then
+                self._queued[job_id] = (fn, expect)  # the latest ask wins
                 log.info("%s is running; its next run is queued", job_id)
                 return "queued"
             self._running.add(job_id)
+
+        def next_run(j: str) -> Callable[[str], None] | None:
+            """The queued run, if the job is still where it was asked for.
+            Called with the running lock held."""
+            while (queued := self._queued.pop(j, None)) is not None:
+                queued_fn, want = queued
+                if want is None:
+                    return queued_fn
+                try:
+                    now = self.store.get_job(j).state
+                except KeyError:
+                    return None
+                if now is want:
+                    return queued_fn
+                self.store.add_event(
+                    "queued_run_dropped",
+                    {"expected": want.value, "state": now.value,
+                     "why": "the job moved while the run waited; its page is the way on"},
+                    Provenance.HUMAN, job_id=j,
+                )  # fmt: skip
+            return None
 
         def safe(j: str) -> None:
             run: Callable[[str], None] | None = fn
@@ -238,7 +262,7 @@ class JobRunner:
                             resumable=True,
                         )  # fmt: skip
                     with self._running_lock:
-                        run = self._queued.pop(j, None)
+                        run = next_run(j)
                         if run is None:
                             self._running.discard(j)  # in the same lock: no ask is lost
             finally:
@@ -255,10 +279,10 @@ class JobRunner:
 
     def on_job_created(self, job_id: str, needs_spec: bool) -> None:
         if needs_spec:
-            self._spawn(self.run_coord, job_id)
+            self._spawn(self.run_coord, job_id, JobState.SPEC_PENDING)
 
     def on_approved(self, job_id: str) -> None:
-        self._spawn(self.build, job_id)
+        self._spawn(self.build, job_id, JobState.APPROVED)
 
     def on_resume(self, job_id: str) -> str | None:
         """Pick a job's work up where its state says. "started", "queued"
@@ -271,7 +295,7 @@ class JobRunner:
             JobState.BUILDING: self.dispatch,
             JobState.IN_REVIEW: self.review,
         }.get(state)
-        return self._spawn(fn, job_id) if fn is not None else None
+        return self._spawn(fn, job_id, state) if fn is not None else None
 
     # --- startup reconcile (item 7) ------------------------------------------------------
 
@@ -1276,6 +1300,9 @@ class JobRunner:
         self.job_failed(self.store.get_job(job_id))
         actions = (["retry"] if can_retry else []) + ["replan", "abandon"]
         self._block(job_id, f"workers failed: {sorted(task_ids)}")
+        # its own page holds it now: no breaker resumes it behind that page's
+        # back when it closes (2a round 3)
+        self.breakers.unhold(job_id)
         titles = "; ".join(str(t.get("title") or tid) for tid, t in tasks.items())
         self._page(
             job_id,
@@ -1285,15 +1312,17 @@ class JobRunner:
         )
 
     def _wave_share(self, task_ids: list[str]) -> float:
-        """What the day (and the month) has left, divided across a wave's
-        workers (review B1), floored to a hundredth of a cent so the shares
-        never sum past it."""
+        """What the day (and the month) has left, less the wave's own review
+        and audit reservations (one of each per worker, at their preset caps;
+        2a round 3), divided across its workers (review B1), floored to a
+        hundredth of a cent so the shares never sum past it."""
         b = self.cfg.budgets
         n = sum(1 for t in task_ids if self.store.get_task(t).contract.get("shape") != "deps")
         left = min(
             b.daily_usd - self.budget.spent_today() - self.budget.open_today(),
             b.monthly_usd - self.budget.spent_month() - self.budget.open_month(),
         )
+        left -= n * (b.review_session_usd + b.audit_session_usd)
         return math.floor(max(0.0, left) / max(1, n) * 1e4) / 1e4
 
     def _reserve_wave(self, job_id: str, task_ids: list[str]) -> dict[str, tuple[int, float]]:
@@ -2004,6 +2033,15 @@ class JobRunner:
                 [f.result() for f in [pool.submit(self._review_task, job, t) for t in tasks]],
                 strict=True,
             ))  # fmt: skip
+        if self.store.get_job(job_id).state is not JobState.IN_REVIEW:
+            # the owner merged (or vigild moved) the job while this ran: its
+            # results are moot; nothing more is written (2a round 3)
+            self.store.add_event(
+                "review_dropped",
+                {"state": self.store.get_job(job_id).state.value, "tasks": sorted(outcomes)},
+                Provenance.HUMAN, job_id=job_id,
+            )  # fmt: skip
+            return
         failed = {tid: why for tid, (kind, why) in outcomes.items() if kind == "failed"}
         b = self._paused(job)
         if failed and b is not None:
@@ -2078,13 +2116,21 @@ class JobRunner:
                 try:
                     self.publisher.close(job.repo, url)
                 except PublishError as e:
-                    log.warning("could not close %s: %s", url, e)
+                    self._page(
+                        job_id, f"{job_id}: deps PR left open after its review failed",
+                        {"kind": "deps_pr_left_open", "pr_url": url, "error": str(e)[:300],
+                         "actions": ["dismiss"],
+                         "next": "close it by hand; vigild won't build from it"},
+                    )  # fmt: skip
+                # the runner's own close, apart from the PR poll's `pr_closed`
+                # events: only these count as regenerations (2a round 3)
                 self.store.add_event(
-                    "pr_closed", {"pr_url": url, "why": "deps review failed"},
+                    "deps_review_closed", {"pr_url": url},
                     Provenance.HUMAN, job_id=job_id, task_id=tid,
                 )  # fmt: skip
             closed = self.store.q(
-                "SELECT COUNT(*) n FROM events WHERE task_id=? AND type='pr_closed'", (tid,)
+                "SELECT COUNT(*) n FROM events WHERE task_id=? AND type='deps_review_closed'",
+                (tid,),
             )[0]["n"]
             if closed >= 2:  # this was the regenerated PR: the owner decides
                 self.store.update_task(tid, state="closed")
@@ -2235,6 +2281,8 @@ class JobRunner:
                 for f in audit.missed()
                 if f.severity in BLOCKING
             ]
+        if self._moved_on(job.id, t.id):
+            return "dropped", "the job moved on during its review"
         if not findings:
             self.store.update_task(t.id, state="reviewed")
             return "clean", 0
@@ -2251,6 +2299,14 @@ class JobRunner:
         self._reroute_for_round(job.id, t.id, rnd)
         self.store.update_task(t.id, state="fix")
         return "fix", len(findings)
+
+    def _moved_on(self, job_id: str, task_id: str) -> bool:
+        """The job left review, or the task's PR merged or closed, while its
+        review ran (2a round 3): its result must not overwrite that."""
+        return (
+            self.store.get_job(job_id).state is not JobState.IN_REVIEW
+            or self.store.get_task(task_id).state != "pr_open"
+        )
 
     def _reroute_for_round(self, job_id: str, task_id: str, rounds: int) -> None:
         """A review round with findings is counted on the contract and the task

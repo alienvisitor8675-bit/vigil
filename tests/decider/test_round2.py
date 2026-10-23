@@ -357,3 +357,32 @@ def test_each_routes_version_pin_is_what_its_recorded_live_response_reports(cfg:
     assert routes["jev-openrouter"].version_pin == OR["model"] == PIN_OR
     assert routes["jev-cloudflare"].version_pin == CF["result"]["result"]["model"] == PIN_CF
     assert "state" in CF["result"]  # Cloudflare's run state sits at result.state
+
+
+# --- 2a round 3 --------------------------------------------------------------------------------
+
+
+def test_cloudflare_is_not_called_while_its_credit_breaker_is_open(
+    cfg: Config, store: Store
+) -> None:
+    breakers = Breakers(store, cfg, _pager([]))
+    breakers.trip(Kind.DECIDER_CREDIT, "route:jev-cloudflare", {"code": 2021})
+    cf, haiku = Fixed("jev-cloudflare", 0.99), Fixed("haiku", 0.99)
+    d = Decider(cfg, store, {"jev-cloudflare": cf, "haiku": haiku}, breakers=breakers,
+                private=lambda r: True)  # fmt: skip
+    got = d.decide(VIGIL, QUESTIONS["size"], "x")
+    assert cf.calls == [] and got.answer.backend == "haiku"
+    assert haiku.purposes == ["decider_fallback"]
+
+
+def test_a_non_numeric_option_probability_is_a_decider_error(cfg: Config, store: Store) -> None:
+    """2a round 3, nit 8: a plain ValueError skipped the fallback."""
+    with pytest.raises(DeciderError):
+        QUESTIONS["size"].parse("S", 0.9, backend="x", probabilities={"S": "high"})
+    bad = json.loads(json.dumps(OR))
+    bad["answers"]["size"]["probabilities"]["XS"] = "n/a"
+    haiku = Fixed("haiku", 0.99)
+    got = Decider(cfg, store, {"jev-openrouter": _or(bad), "haiku": haiku}).decide(
+        PA, QUESTIONS["size"], "x"
+    )
+    assert got.answer.backend == "haiku" and haiku.purposes == ["decider_fallback"]
