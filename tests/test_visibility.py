@@ -51,22 +51,24 @@ def test_a_lookup_error_never_reaches_openrouter(cfg: Config, store: Store) -> N
     assert pub.calls == [] and got.action.value == "wait"
 
 
-def test_a_flip_to_private_between_dispatch_and_the_call_blocks_openrouter(
-    cfg: Config, store: Store
-) -> None:
-    """The gateway reads visibility again right before every Jev call."""
+def test_the_call_is_checked_against_the_decisions_one_read(cfg: Config, store: Store) -> None:
+    """One visibility read per decision (review A10): the gateway checks the
+    route right before the Jev call against that read, without a second one."""
     calls: list[httpx2.Request] = []
     gw = Gateway(cfg, store, Budget(store, cfg.budgets), Secrets({}))
     client = httpx2.Client(
         transport=httpx2.MockTransport(lambda r: calls.append(r) or httpx2.Response(200, json=OR))
     )
-    answers = iter([False, True])  # public at dispatch, private by the call
-    set_visibility_source(lambda r: next(answers))
-    d = Decider(cfg, store, {"jev-openrouter": JevOpenRouter(client, token="t", meter=gw.metered)})
-    got = d.decide(PA, QUESTIONS["size"], "x")
-    assert calls == [] and got.action.value == "wait"
-    errs = [e.data["error"] for e in store.events() if e.type == "decision"]
-    assert any("private" in e for e in errs)
+    reads: list[str] = []
+    set_visibility_source(lambda r: reads.append(r) or True)  # private
+    jev = JevOpenRouter(client, token="t", version_pin="typesafe/jev-1.13-20260917",
+                        meter=gw.metered)  # fmt: skip
+    got = Decider(cfg, store, {"jev-openrouter": jev}).decide(PA, QUESTIONS["size"], "x")
+    assert calls == [] and got.action.value == "wait" and reads == [PA]
+    # a call made with a private read never reaches OpenRouter
+    with pytest.raises(Exception, match="private"):
+        jev.ask(QUESTIONS["size"], "x", repo=PA, job_id=None, private=True)
+    assert calls == []
 
 
 def test_a_repo_that_went_private_is_refused_at_dispatch(world: World) -> None:

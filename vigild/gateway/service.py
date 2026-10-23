@@ -40,6 +40,8 @@ from vigild.provenance import Provenance
 from vigild.redact import redact
 from vigild.repos import RepoPolicyError, check_backend, check_decider_route, live_private
 
+FALLBACK_PURPOSE = "decider_fallback"  # a Haiku decision Jev couldn't give (owner ruling 4)
+
 FORWARD_HEADERS = ("anthropic-version", "anthropic-beta", "content-type", "accept")
 # Review round 1, item 5: only plain Messages requests pass. Server tools and
 # MCP connectors would let Anthropic fetch from or post to hosts the session's
@@ -210,6 +212,7 @@ class Gateway:
         self.sync_client = httpx2.Client(transport=transport, timeout=UPSTREAM_TIMEOUT)
         self.async_client = httpx2.AsyncClient(transport=async_transport, timeout=UPSTREAM_TIMEOUT)
         self._inflight: dict[str, float] = {}
+        self._fallback_pending: dict[str, float] = {}  # repo -> held for fallback calls
         self._inflight_lock = threading.Lock()
         # vigild's circuit breakers (plan 2a, item 4): every upstream answer
         # counts for or against the preset's backend breaker
@@ -441,6 +444,7 @@ class Gateway:
         purpose: str,
         job_id: str | None = None,
         provider_cost: float | None = None,
+        repo: str | None = None,
     ) -> float:
         return record_call(
             self.store,
@@ -457,6 +461,7 @@ class Gateway:
             status=200,
             latency_ms=int((time.monotonic() - started) * 1000),
             provenance=Provenance.LOCAL if preset.locality == "local" else Provenance.CLAUDE,
+            repo=gs.repo if gs else repo,
         )
 
     async def forward(
@@ -549,13 +554,18 @@ class Gateway:
         purpose: str,
         job_id: str | None,
         run: Callable[[], dict[str, Any]],
+        private: bool | None = None,
     ) -> dict[str, Any]:
         """A non-Anthropic call vigild makes itself (Jev): the same route check,
         reservation and per-call row as everything through the gateway (item 11).
-        The repo's visibility is read again right before the call: a repo that
-        went private since dispatch never reaches OpenRouter (owner, 2026-10-23)."""
+        The route is checked against the repo's visibility right before the
+        call: the decision's own read when it passes one (one lookup per
+        decision, review A10), else a fresh one. A repo read as private never
+        reaches OpenRouter (owner, 2026-10-23)."""
+        if private is None:
+            private = live_private(repo)
         try:
-            check_decider_route(self.cfg, repo, route, private=live_private(repo))
+            check_decider_route(self.cfg, repo, route, private=private)
         except RepoPolicyError as e:
             raise GatewayError(403, "permission_error", str(e)) from e
         try:
@@ -594,20 +604,91 @@ class Gateway:
                 provider_cost_usd=usage.get("cost"),
                 latency_ms=int((time.monotonic() - started) * 1000),
                 provenance=Provenance.CLAUDE,
+                repo=repo,
             )
             return payload
         finally:
             self.budget.settle(rid, cost)
 
+    def _fallback_today(self, repo: str) -> float:
+        day = utcnow().strftime("%Y-%m-%d")
+        rows = self.store.q(
+            "SELECT COALESCE(SUM(cost_usd), 0) n FROM model_calls"
+            " WHERE purpose=? AND repo=? AND ts LIKE ?",
+            (FALLBACK_PURPOSE, repo, f"{day}%"),
+        )
+        return float(rows[0]["n"])
+
+    def _fallback_hold(self, repo: str, amount: float) -> None:
+        """Owner ruling 4: a repo's Haiku fallback spend has its own daily cap.
+        A call that would cross it is refused before it is sent; the repo's
+        fallback breaker trips, pages, and holds the repo's dispatch."""
+        from vigild.breakers import Kind
+
+        scope = f"repo:{repo}"
+        cap = self.cfg.budgets.decider_fallback_per_repo_usd
+        with self._inflight_lock:
+            open_ = self.breakers is not None and self.breakers.is_open(
+                Kind.DECIDER_FALLBACK, scope
+            )
+            spent = self._fallback_today(repo) + self._fallback_pending.get(repo, 0.0)
+            if open_ or spent + amount > cap:
+                if self.breakers is not None:
+                    self.breakers.trip(
+                        Kind.DECIDER_FALLBACK, scope,
+                        {"spent_today_usd": round(spent, 6), "cap_usd": cap,
+                         "next": "Jev has drifted or is failing: check the Jev pages, then reset"},
+                    )  # fmt: skip
+                raise GatewayError(
+                    403, "permission_error",
+                    f"decider fallback cap: {repo} has ${spent:.4f} of ${cap:.2f} today",
+                )  # fmt: skip
+            self._fallback_pending[repo] = self._fallback_pending.get(repo, 0.0) + amount
+
+    def _fallback_done(self, repo: str, amount: float) -> None:
+        with self._inflight_lock:
+            self._fallback_pending[repo] = max(0.0, self._fallback_pending.get(repo, 0.0) - amount)
+
     def call(
-        self, *, repo: str, preset: str, body: dict[str, Any], purpose: str, job_id: str | None
+        self,
+        *,
+        repo: str,
+        preset: str,
+        body: dict[str, Any],
+        purpose: str,
+        job_id: str | None,
+        private: bool | None = None,
     ) -> dict[str, Any]:
-        p = self._preset(repo, preset, private=live_private(repo))
+        """vigild's own Anthropic call (the Haiku decider). `private` is the
+        decision's visibility read (review A10); without it, read now."""
+        if private is None:
+            private = live_private(repo)
+        p = self._preset(repo, preset, private=private)
         body = {**body, "model": p.model}
         raw = json.dumps(body).encode()
         model = self._check_model(repo, p, p.model)
         worst = self.worst_case(model, body, len(raw))
         amount = max(worst, self.cfg.budgets.decider_call_usd)
+        fallback = purpose == FALLBACK_PURPOSE
+        if fallback:
+            self._fallback_hold(repo, amount)
+        try:
+            return self._call(repo, preset, p, model, raw, amount, purpose, job_id)
+        finally:
+            if fallback:
+                self._fallback_done(repo, amount)
+
+    def _call(
+        self,
+        repo: str,
+        preset: str,
+        p: Preset,
+        model: str,
+        raw: bytes,
+        amount: float,
+        purpose: str,
+        job_id: str | None,
+    ) -> dict[str, Any]:
         try:
             rid = self.budget.reserve(session_id=None, task_id=None, amount=amount, purpose=purpose)
         except BudgetExceeded as e:
@@ -640,6 +721,7 @@ class Gateway:
                 started=started,
                 purpose=purpose,
                 job_id=job_id,
+                repo=repo,
             )
             self.budget.settle(rid, cost)
             return payload

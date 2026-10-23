@@ -82,14 +82,20 @@ def parse_answer(q: Question, answers: Any, backend: str, version: str) -> Answe
         raise DeciderError(f"{backend}: {q.name} came back as a {kind}, asked as a {q.kind}")
     probs = ans.get("probabilities") or {}
     if kind == "choice":
-        return q.parse(raw, probs.get(raw), backend=backend, model_version=version)
+        return q.parse(raw, probs.get(raw), backend=backend, model_version=version,
+                       probabilities=probs)  # fmt: skip
     if kind == "score":
+        # Jev's `score` is on its anchors' 0-4 index (the legend): +1 puts it on 1-5.
+        # Its probability is the likeliest anchor's.
         try:
             best = max(probs, key=lambda k: float(probs[k]))
-            return q.parse(int(best) + 1, probs[best], backend=backend, model_version=version)
+            return q.parse(float(raw) + 1, probs[best], backend=backend, model_version=version)
         except (ValueError, TypeError) as e:
             raise DeciderError(f"{backend}: unreadable score for {q.name}") from e
-    return q.parse(raw, None, backend=backend, model_version=version)
+    # noul: the live answer is one float, P(true); `probabilities` with true and
+    # false keys wins if a response ever carries it
+    return q.parse(raw, None, backend=backend, model_version=version,
+                   probabilities=probs or None)  # fmt: skip
 
 
 class Meter(Protocol):
@@ -107,6 +113,7 @@ class Meter(Protocol):
         purpose: str,
         job_id: str | None,
         run: Callable[[], dict[str, Any]],
+        private: bool | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -115,13 +122,15 @@ class _Jev:
     provider = ""
     model = ""
 
-    def __init__(self, client: httpx2.Client, version_pin: str | None, *, meter: Meter) -> None:
+    def __init__(self, client: httpx2.Client, version_pin: str, *, meter: Meter) -> None:
+        if not version_pin:
+            raise ValueError(f"{self.name}: a Jev route needs its version_pin (review A8)")
         self.client = client
         self.version_pin = version_pin
         self.meter = meter  # required: no Jev call goes unmetered (review round 2, N9)
 
     def _call(
-        self, repo: str, job_id: str | None, run: Callable[[], dict[str, Any]]
+        self, repo: str, job_id: str | None, run: Callable[[], dict[str, Any]], private: bool
     ) -> dict[str, Any]:
         return self.meter(
             repo=repo,
@@ -131,6 +140,7 @@ class _Jev:
             purpose="decider",
             job_id=job_id,
             run=run,
+            private=private,
         )
 
     def _post(self, url: str, headers: dict[str, str], body: dict[str, Any]) -> dict[str, Any]:
@@ -157,7 +167,7 @@ class _Jev:
 
     def _check_version(self, answer: Answer) -> Answer:
         version = answer.model_version or UNKNOWN
-        if self.version_pin is not None and version != self.version_pin:
+        if version != self.version_pin:
             raise JevVersionDrift(self.name, version, self.version_pin, answer)
         return answer
 
@@ -173,7 +183,7 @@ class JevCloudflare(_Jev):
         *,
         account_id: str,
         token: str,
-        version_pin: str | None = None,
+        version_pin: str,
         meter: Meter,
     ) -> None:
         super().__init__(client, version_pin, meter=meter)
@@ -181,7 +191,14 @@ class JevCloudflare(_Jev):
         self.token = token
 
     def ask(
-        self, q: Question, state: str, *, repo: str, job_id: str | None, purpose: str = "decider"
+        self,
+        q: Question,
+        state: str,
+        *,
+        repo: str,
+        job_id: str | None,
+        private: bool,
+        purpose: str = "decider",
     ) -> Answer:
         # Cloudflare caps context at 32k: duplicate_of gets titles, not bodies (B21).
         body = {
@@ -195,7 +212,7 @@ class JevCloudflare(_Jev):
             inner = (payload.get("result") or {}).get("result") or {}
             return {**payload, "usage": inner.get("usage") or {}}  # for the meter
 
-        payload = self._call(repo, job_id, run)
+        payload = self._call(repo, job_id, run, private)
         outer = payload.get("result") or {}
         if outer.get("state") != "Completed":
             raise DeciderError(f"jev-cloudflare: the run's state is {outer.get('state')!r}")
@@ -214,14 +231,21 @@ class JevOpenRouter(_Jev):
         client: httpx2.Client,
         *,
         token: str,
-        version_pin: str | None = None,
+        version_pin: str,
         meter: Meter,
     ) -> None:
         super().__init__(client, version_pin, meter=meter)
         self.token = token
 
     def ask(
-        self, q: Question, state: str, *, repo: str, job_id: str | None, purpose: str = "decider"
+        self,
+        q: Question,
+        state: str,
+        *,
+        repo: str,
+        job_id: str | None,
+        private: bool,
+        purpose: str = "decider",
     ) -> Answer:
         body = {
             "model": self.model,
@@ -233,6 +257,7 @@ class JevOpenRouter(_Jev):
             repo,
             job_id,
             lambda: self._post(OR_URL, {"Authorization": f"Bearer {self.token}"}, body),
+            private,
         )
         version = str(payload.get("model") or UNKNOWN)
         return self._check_version(parse_answer(q, payload.get("answers"), self.name, version))

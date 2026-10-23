@@ -68,7 +68,14 @@ class Fixed:
     purposes: list[str] = field(default_factory=list)
 
     def ask(
-        self, q: Question, state: str, *, repo: str, job_id: str | None, purpose: str = "decider"
+        self,
+        q: Question,
+        state: str,
+        *,
+        repo: str,
+        job_id: str | None,
+        private: bool = False,
+        purpose: str = "decider",
     ) -> Answer:
         self.calls.append(q.name)
         self.purposes.append(purpose)
@@ -126,7 +133,14 @@ def test_a_route_the_repo_does_not_list_is_never_called(cfg: Config, store: Stor
 def test_backend_error_means_wait(cfg: Config, store: Store) -> None:
     class Broken(Fixed):
         def ask(
-            self, q: Question, state: str, *, repo: str, job_id: str | None, purpose: str = ""
+            self,
+            q: Question,
+            state: str,
+            *,
+            repo: str,
+            job_id: str | None,
+            private: bool = False,
+            purpose: str = "",
         ) -> Answer:
             raise DeciderError("boom")
 
@@ -143,7 +157,14 @@ class FakeCaller:
     bodies: list[dict[str, Any]] = field(default_factory=list)
 
     def call(
-        self, *, repo: str, preset: str, body: dict[str, Any], purpose: str, job_id: str | None
+        self,
+        *,
+        repo: str,
+        preset: str,
+        body: dict[str, Any],
+        purpose: str,
+        job_id: str | None,
+        private: bool | None = None,
     ) -> dict[str, Any]:
         self.bodies.append({"repo": repo, "preset": preset, "body": body, "purpose": purpose})
         return self.reply
@@ -159,7 +180,9 @@ def _haiku_reply(answer: Any, p: float) -> dict[str, Any]:
 
 def test_haiku_uses_structured_outputs_through_the_gateway() -> None:
     caller = FakeCaller(_haiku_reply("M", 0.88))
-    a = HaikuBackend(caller).ask(QUESTIONS["size"], "Add three tests", repo=PA, job_id=None)
+    a = HaikuBackend(caller).ask(
+        QUESTIONS["size"], "Add three tests", repo=PA, job_id=None, private=False
+    )
     assert (a.value, a.probability, a.backend) == ("M", 0.88, "haiku")
     sent = caller.bodies[0]
     assert sent["preset"] == "claude-haiku" and sent["purpose"] == "decider"
@@ -174,7 +197,7 @@ def test_haiku_uses_structured_outputs_through_the_gateway() -> None:
 def test_haiku_reply_outside_the_options_is_an_error() -> None:
     with pytest.raises(DeciderError):
         HaikuBackend(FakeCaller(_haiku_reply("XXL", 0.9))).ask(
-            QUESTIONS["size"], "x", repo=PA, job_id=None
+            QUESTIONS["size"], "x", repo=PA, job_id=None, private=False
         )
 
 
@@ -192,8 +215,10 @@ def test_jev_calls_go_through_the_gateways_meter(cfg: Config, store: Store) -> N
     client = httpx2.Client(
         transport=httpx2.MockTransport(lambda r: httpx2.Response(200, json=fixture))
     )
-    jev = JevCloudflare(client, account_id="a", token="t", meter=gw.metered)
-    assert jev.ask(QUESTIONS["size"], "x", repo=PA, job_id=None).value == "S"
+    jev = JevCloudflare(
+        client, account_id="a", token="t", version_pin="jev-1.13.0", meter=gw.metered
+    )
+    assert jev.ask(QUESTIONS["size"], "x", repo=PA, job_id=None, private=False).value == "S"
     row = store.q("SELECT provider, model, tokens_in, cost_usd, purpose FROM model_calls")[0]
     assert (row["provider"], row["model"], row["tokens_in"]) == ("cloudflare", "typesafe/jev", 432)
     # $0.042/M on AI Gateway credit, plus the 5% fee when credit is bought (owner, 2026-10-23)
@@ -208,9 +233,11 @@ def test_the_meter_refuses_a_route_the_repo_does_not_list(cfg: Config, store: St
 
     gw = Gateway(cfg, store, Budget(store, cfg.budgets), Secrets({}))
     client = httpx2.Client(transport=httpx2.MockTransport(lambda r: httpx2.Response(500)))
-    jev = JevCloudflare(client, account_id="a", token="t", meter=gw.metered)
+    jev = JevCloudflare(
+        client, account_id="a", token="t", version_pin="jev-1.13.0", meter=gw.metered
+    )
     with pytest.raises(GatewayError, match="jev-cloudflare"):
-        jev.ask(QUESTIONS["size"], "x", repo=PA, job_id=None)
+        jev.ask(QUESTIONS["size"], "x", repo=PA, job_id=None, private=False)
 
 
 def test_decider_checks_the_route_before_asking(cfg: Config, store: Store) -> None:
@@ -238,7 +265,14 @@ def test_a_gateway_refusal_is_a_decider_failure(cfg: Config, store: Store) -> No
         name = "jev-openrouter"
 
         def ask(
-            self, q: Question, state: str, *, repo: str, job_id: str | None, purpose: str = ""
+            self,
+            q: Question,
+            state: str,
+            *,
+            repo: str,
+            job_id: str | None,
+            private: bool = False,
+            purpose: str = "",
         ) -> Answer:
             raise GatewayError(403, "permission_error", "budget: the day is spent")
 

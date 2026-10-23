@@ -45,11 +45,11 @@ def build_decider(
     if "jev-cloudflare" in routes and account and cf_token:
         backends["jev-cloudflare"] = JevCloudflare(
             client, account_id=account, token=cf_token, meter=gateway.metered,
-            version_pin=cfg.backends.decider_routes["jev-cloudflare"].version_pin,
+            version_pin=cfg.backends.decider_routes["jev-cloudflare"].version_pin or "",
         )  # fmt: skip
     if "jev-openrouter" in routes and (or_key := secrets.get("OPENROUTER_API_KEY")):
         backends["jev-openrouter"] = JevOpenRouter(
             client, token=or_key, meter=gateway.metered,
-            version_pin=cfg.backends.decider_routes["jev-openrouter"].version_pin,
+            version_pin=cfg.backends.decider_routes["jev-openrouter"].version_pin or "",
         )  # fmt: skip
     return Decider(cfg, store, backends, breakers=gateway.breakers, telemetry=telemetry)

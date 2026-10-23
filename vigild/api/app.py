@@ -263,6 +263,17 @@ def dismiss(request: Request, item_id: int) -> dict[str, Any]:
     return {"item_id": item_id, "status": "resolved"}
 
 
+# --- reports ------------------------------------------------------------------------
+
+
+@router.get("/api/decider/report", dependencies=[READ])
+def decider_report(request: Request) -> dict[str, Any]:
+    """Confidence per question type, and escalations to Haiku (owner ruling 6)."""
+    from vigild.kpis import decider_report as report
+
+    return report(_svc(request).store)
+
+
 # --- sessions -----------------------------------------------------------------------
 
 

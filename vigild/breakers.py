@@ -18,6 +18,8 @@ success closes it.
 | repo_failures | repo:<name> | K consecutive failed or abandoned jobs |
 | verifier_unknowns | repo:<name> | M `unknown` verdicts in a row |
 | decider_credit | route:jev-cloudflare | Cloudflare answers 2021: the route is off until reset |
+| decider_fallback_cap | repo:<name> | a Haiku fallback call would cross the repo's day cap |
+
 """
 
 from __future__ import annotations
@@ -45,11 +47,14 @@ class Kind(StrEnum):
     REPO_FAILURES = "repo_failures"
     VERIFIER_UNKNOWNS = "verifier_unknowns"
     DECIDER_CREDIT = "decider_credit"  # Cloudflare's 2021: the AI Gateway credit is empty
+    # Jev costs cents a day; a repo's Haiku fallback crossing $1 means it has
+    # drifted or is failing (owner ruling 4)
+    DECIDER_FALLBACK = "decider_fallback_cap"
 
 
 GLOBAL = "global"
 GLOBAL_KINDS = (Kind.DAILY, Kind.MONTHLY, Kind.ESCALATIONS)
-REPO_KINDS = (Kind.WIP, Kind.REPO_FAILURES, Kind.VERIFIER_UNKNOWNS)
+REPO_KINDS = (Kind.WIP, Kind.REPO_FAILURES, Kind.VERIFIER_UNKNOWNS, Kind.DECIDER_FALLBACK)
 CAP_KIND = {"daily": Kind.DAILY, "monthly": Kind.MONTHLY, "per_task": Kind.PER_TASK}
 
 
@@ -172,6 +177,7 @@ class Breakers:
         *,
         job_id: str | None = None,
         actions: tuple[str, ...] = ("reset",),
+        title: str | None = None,
     ) -> Breaker:
         """Open the breaker. It pages once: tripping an open breaker again adds
         nothing to the inbox."""
@@ -185,7 +191,7 @@ class Breakers:
             if self.pager is not None:
                 item = self.pager(
                     job_id,
-                    f"breaker tripped: {kind.value} ({scope})",
+                    title or f"breaker tripped: {kind.value} ({scope})",
                     {
                         "kind": "breaker",
                         "breaker": b.id,

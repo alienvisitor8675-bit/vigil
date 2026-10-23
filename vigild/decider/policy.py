@@ -5,15 +5,26 @@ one, `vigild/repos.py`). Every answer is written to `decisions` with the
 action taken and the model version it reported ("unknown" when none), and
 goes on a `vigil.decider` span with the route and the visibility.
 
+Every decision reads the repo's visibility once and uses that answer for
+every call it makes, the Jev call and any Haiku call after it (review A10). A
+lookup that fails counts as private: the Cloudflare route, never OpenRouter.
+
 When Jev fails, the chain falls to Haiku (if listed), booked as
 `decider_fallback`, apart from a normal 0.6-0.85 escalation (`decider`), so a
-failing Jev can't quietly eat the day. Two Jev failures page the owner:
+failing Jev can't quietly eat the day; the gateway caps fallback spend per
+repo per day (`decider_fallback_per_repo_usd`, owner ruling 4). Two Jev
+failures page the owner, once each:
 - **version drift** (a version other than the route's pin, or none): one
-  inbox item per new (route, version), deduplicated in `jev_drift`, saying
-  where decisions went and today's fallback spend;
+  inbox item per new (route, version), deduplicated in `jev_drift` and
+  written in the same transaction as its page (review A9);
 - **Cloudflare 2021** (the AI Gateway credit is empty): the credit breaker
-  trips and pages; that question gets no fallback answer, and the route stays
-  off until the owner resets the breaker.
+  trips and pages. Like drift, the page says where decisions went ("on Haiku
+  fallback" or "waiting for the owner"), and every Haiku decision for a repo
+  whose Jev is that route, while the breaker is open, is a fallback (review
+  A2), until the owner resets it.
+
+Each row in `decisions` and each span carries the question's type and the
+answer's confidence (owner ruling 6; the report is `vigild/kpis.py`).
 """
 
 from __future__ import annotations
@@ -26,16 +37,17 @@ from typing import Any, Protocol
 
 from vigild.config import Config
 from vigild.db import Store, iso, utcnow
-from vigild.decider.questions import Answer, DeciderError, Question
-from vigild.gateway.service import GatewayError
+from vigild.decider.questions import QUESTIONS, Answer, DeciderError, Question
+from vigild.gateway.service import FALLBACK_PURPOSE, GatewayError
 from vigild.provenance import Provenance
 from vigild.repos import RepoPolicyError, check_decider_route, live_private, resolve_decider
 
 ACT = 0.85
 ESCALATE = 0.6
 HAIKU = "haiku"
-DECIDER, FALLBACK = "decider", "decider_fallback"  # the two purposes a decider call books
+DECIDER, FALLBACK = "decider", FALLBACK_PURPOSE  # the two purposes a decider call books
 CREDIT_ROUTE = "jev-cloudflare"
+QUESTIONS_KIND = {name: q.kind for name, q in QUESTIONS.items()}
 
 
 def decider_routes(
@@ -72,7 +84,14 @@ class Backend(Protocol):
     name: str
 
     def ask(
-        self, q: Question, state: str, *, repo: str, job_id: str | None, purpose: str = "decider"
+        self,
+        q: Question,
+        state: str,
+        *,
+        repo: str,
+        job_id: str | None,
+        private: bool,
+        purpose: str = "decider",
     ) -> Answer: ...
 
 
@@ -111,13 +130,15 @@ class Decider:
         route = self.cfg.backends.decider_routes.get(a.backend)
         local = route is not None and route.locality == "local"
         prov = Provenance.LOCAL if local else Provenance.CLAUDE
+        kind = a.kind or QUESTIONS_KIND.get(a.question, "")
         self.store.x(
-            "INSERT INTO decisions (job_id, task_id, question, answer, probability, backend,"
-            " model_version, action, ts, provenance) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO decisions (job_id, task_id, question, kind, answer, probability, backend,"
+            " model_version, action, ts, provenance) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 job_id,
                 task_id,
                 a.question,
+                kind,
                 str(a.value),
                 a.probability,
                 a.backend,
@@ -136,6 +157,7 @@ class Decider:
             "vigil.repo": repo,
             "vigil.repo.visibility": "private" if private else "public",
             "vigil.decider.model_version": "unknown",
+            "vigil.decider.kind": q.kind,
         }
         cm = self.telemetry.span_alone("vigil.decider", {}) if self.telemetry else nullcontext()
         with cm as span:
@@ -153,61 +175,57 @@ class Decider:
         return float(rows[0]["n"] or 0.0)
 
     def _drift(self, e: Any, escalation: str | None, job_id: str | None) -> None:
-        """One inbox item per new (route, version), however many calls drift."""
+        """One inbox item per new (route, version), however many calls drift.
+        The row and its page commit together: a crash between them leaves
+        neither, and the next drifting call pages (review A9)."""
+        where = "on Haiku fallback" if escalation else "waiting for the owner"
+        title = (
+            f"Jev version drift: {e.route} returned {e.version}, pinned {e.pin}; "
+            f"decisions now {where}"
+        )
         with self.store.tx() as c:
             seen = c.execute(
                 "SELECT 1 FROM jev_drift WHERE route=? AND version=?", (e.route, e.version)
             ).fetchone()
             if seen:
                 return
+            item = self.store.create_inbox_item(
+                "questions", "page", job_id, title,
+                {"kind": "jev_drift", "route": e.route, "version": e.version, "pin": e.pin,
+                 "decisions_now": where,
+                 "fallback_spend_today_usd": round(self._fallback_spend_today(), 6),
+                 "next": "a version bump is a PR, after the decider eval set is replayed",
+                 "actions": ["dismiss"]},
+            )  # fmt: skip
             c.execute(
-                "INSERT INTO jev_drift (route, version, pin, first_seen) VALUES (?,?,?,?)",
-                (e.route, e.version, e.pin, iso()),
+                "INSERT INTO jev_drift (route, version, pin, item_id, first_seen)"
+                " VALUES (?,?,?,?,?)",
+                (e.route, e.version, e.pin, item.id, iso()),
             )
-        where = "on Haiku fallback" if escalation else "waiting for the owner"
-        title = (
-            f"Jev version drift: {e.route} returned {e.version}, pinned {e.pin}; "
-            f"decisions now {where}"
-        )
-        item = self.store.create_inbox_item(
-            "questions", "page", job_id, title,
-            {"kind": "jev_drift", "route": e.route, "version": e.version, "pin": e.pin,
-             "decisions_now": where,
-             "fallback_spend_today_usd": round(self._fallback_spend_today(), 6),
-             "next": "a version bump is a PR, after the decider eval set is replayed",
-             "actions": ["dismiss"]},
-        )  # fmt: skip
-        self.store.x(
-            "UPDATE jev_drift SET item_id=? WHERE route=? AND version=?",
-            (item.id, e.route, e.version),
-        )
 
-    def _credit(self, job_id: str | None, err: str) -> None:
+    def _credit(self, job_id: str | None, err: str, escalation: str | None) -> None:
+        """Trip the credit breaker; it pages once, saying where decisions go."""
         from vigild.breakers import Kind
 
         if self.breakers is not None:
+            where = "on Haiku fallback" if escalation else "waiting for the owner"
             self.breakers.trip(
                 Kind.DECIDER_CREDIT, f"route:{CREDIT_ROUTE}",
-                {"code": 2021, "error": err[:300],
+                {"code": 2021, "error": err[:300], "decisions_now": where,
+                 "fallback_spend_today_usd": round(self._fallback_spend_today(), 6),
                  "next": "add AI Gateway credit in Cloudflare, then reset this"},
                 job_id=job_id,
+                title=f"Cloudflare Jev credit is empty (2021); decisions now {where}",
             )  # fmt: skip
 
     # --- asking -------------------------------------------------------------------
 
-    def _available(self) -> list[str]:
+    def _credit_off(self) -> bool:
         from vigild.breakers import Kind
 
-        out = []
-        for name in self.backends:
-            off = (
-                name == CREDIT_ROUTE
-                and self.breakers is not None
-                and self.breakers.is_open(Kind.DECIDER_CREDIT, f"route:{CREDIT_ROUTE}")
-            )
-            if not off:
-                out.append(name)
-        return out
+        return self.breakers is not None and self.breakers.is_open(
+            Kind.DECIDER_CREDIT, f"route:{CREDIT_ROUTE}"
+        )
 
     def _ask(
         self,
@@ -224,7 +242,9 @@ class Decider:
         with self._span(route, q, repo, private) as attrs:
             try:
                 check_decider_route(self.cfg, repo, route, private=private)  # item 11
-                a = self.backends[route].ask(q, state, repo=repo, job_id=job_id, purpose=purpose)
+                a = self.backends[route].ask(
+                    q, state, repo=repo, job_id=job_id, private=private, purpose=purpose
+                )
             except (DeciderError, RepoPolicyError, GatewayError) as e:
                 version = getattr(e, "version", None)
                 if version:
@@ -240,6 +260,7 @@ class Decider:
                     raise
                 raise DeciderError(str(e)) from e
             attrs["vigil.decider.model_version"] = a.model_version or "unknown"
+            attrs["vigil.decider.confidence"] = a.probability
             return a
 
     def decide(
@@ -253,15 +274,19 @@ class Decider:
     ) -> Decision:
         from vigild.decider.backends.jev import JevCreditExhausted, JevVersionDrift
 
-        private = live_private(repo, self.private)  # read now, never cached
-        primary, escalation = decider_routes(self.cfg, repo, self._available(), private=private)
+        # one lookup per decision, used by every call in it (review A10); fails closed
+        private = live_private(repo, self.private)
+        primary, escalation = decider_routes(self.cfg, repo, self.backends, private=private)
         if primary is None:
             return self._wait(q, job_id, task_id)
+        if primary == CREDIT_ROUTE and self._credit_off():
+            # the credit breaker is open: Haiku is this repo's fallback (A2)
+            return self._fall_back(escalation, q, state, repo, job_id, task_id, private)
         try:
             a = self._ask(primary, q, state, repo, job_id, private)
         except JevCreditExhausted as e:
-            self._credit(job_id, str(e))
-            return self._wait(q, job_id, task_id)  # no fallback answer for this question
+            self._credit(job_id, str(e), escalation)
+            return self._fall_back(escalation, q, state, repo, job_id, task_id, private)
         except JevVersionDrift as e:
             if e.answer is not None:
                 self._record(e.answer, Action.DRIFT, job_id, task_id)
@@ -311,14 +336,15 @@ class Decider:
         return Decision(h, action)
 
     def _wait(self, q: Question, job_id: str | None, task_id: str | None) -> Decision:
-        a = Answer(q.name, None, 0.0, NO_ANSWER)
+        a = Answer(q.name, None, 0.0, NO_ANSWER, None, q.kind)
         self.store.x(
-            "INSERT INTO decisions (job_id, task_id, question, answer, probability, backend,"
-            " model_version, action, ts, provenance) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO decisions (job_id, task_id, question, kind, answer, probability, backend,"
+            " model_version, action, ts, provenance) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 job_id,
                 task_id,
                 q.name,
+                q.kind,
                 "",
                 0.0,
                 NO_ANSWER,

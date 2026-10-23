@@ -198,6 +198,29 @@ def _m8_live_visibility(conn: sqlite3.Connection) -> None:
     _create(conn, JEV_DRIFT_DDL)
 
 
+# A provenance column added to an existing table needs a default: these rows
+# are vigild's own records, which it tags `human` like its events.
+PROV_ADDED = "TEXT NOT NULL DEFAULT 'human' CHECK (provenance IN ('claude','local','human'))"
+
+LADDER_CHANGES_DDL = f"""CREATE TABLE IF NOT EXISTS ladder_changes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, shape TEXT NOT NULL, old_rung INTEGER NOT NULL,
+  new_rung INTEGER NOT NULL, reason TEXT NOT NULL, sample_size INTEGER NOT NULL,
+  match_rate REAL, ts TEXT NOT NULL, {PROV});
+CREATE INDEX IF NOT EXISTS ladder_changes_shape ON ladder_changes(shape, id)"""
+
+
+def _m9_round2(conn: sqlite3.Connection) -> None:
+    """2a round 2: provenance on the four phase 2a tables (review B14); the
+    repo on every model call, for the per-repo fallback cap (owner ruling 4);
+    each decision's question type (ruling 6); one row per rung change
+    (ruling 1)."""
+    for table in ("ladder", "intake_seen", "breakers", "jev_drift"):
+        _add_columns(conn, table, {"provenance": PROV_ADDED})
+    _add_columns(conn, "model_calls", {"repo": "TEXT"})
+    _add_columns(conn, "decisions", {"kind": "TEXT NOT NULL DEFAULT ''"})
+    _create(conn, LADDER_CHANGES_DDL)
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
@@ -207,6 +230,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m6_transcripts,
     _m7_breakers,
     _m8_live_visibility,
+    _m9_round2,
 ]
 
 

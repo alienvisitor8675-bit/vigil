@@ -91,7 +91,30 @@ def test_doctor_checks_and_never_prints_values(cfg: Config, tmp_path: object) ->
     # no private repo uses Jev on Cloudflare, and no credentials: skipped
     assert names["CLOUDFLARE_ACCOUNT_ID+CLOUDFLARE_API_TOKEN"].ok is None
     assert names["OPENROUTER_API_KEY"].ok is False  # missing: reported, not fatal
-    assert names["decider: thomasbardhi01/parkagent (public, live) → haiku"].ok
+    # parkagent wasn't selected: config only, no call about it (review A1)
+    pa = names["decider: thomasbardhi01/parkagent (not checked: not selected)"]
+    assert pa.ok is None
+
+
+def test_doctor_makes_no_call_about_a_repo_it_was_not_asked_about(
+    cfg: Config, tmp_path: object
+) -> None:
+    pem = tmp_path / "app.pem"  # type: ignore[operator]
+    pem.write_bytes(_pem())
+    secrets = Secrets({"GITHUB_APP_ID": "123456", "GITHUB_APP_KEY_PATH": str(pem),
+                       "OPENROUTER_API_KEY": "sk-or-fake-value-000"})  # fmt: skip
+    seen: list[httpx2.Request] = []
+
+    def handler(req: httpx2.Request) -> httpx2.Response:
+        seen.append(req)
+        return _handler(req)
+
+    http = httpx2.Client(transport=httpx2.MockTransport(handler))
+    run_checks(cfg, secrets, http=http, docker=None, repos=["thomasbardhi01/vigil"],
+               include_claude_mods=False)  # fmt: skip
+    about_pa = [r for r in seen if b"parkagent" in r.content or "parkagent" in r.url.path]
+    assert about_pa == []
+    assert any(r.url.path == "/repos/thomasbardhi01/vigil" for r in seen)
 
 
 def test_doctor_names_each_repos_live_decider_route(cfg: Config, tmp_path: object) -> None:
@@ -104,7 +127,7 @@ def test_doctor_names_each_repos_live_decider_route(cfg: Config, tmp_path: objec
     })  # fmt: skip
     http = httpx2.Client(transport=httpx2.MockTransport(_handler))
     PRIVATE["vigil"] = False
-    names = {c.name: c for c in run_checks(cfg, secrets, http=http, docker=None, repos=[],
+    names = {c.name: c for c in run_checks(cfg, secrets, http=http, docker=None, repos=None,
                                            include_claude_mods=False)}  # fmt: skip
     assert names["OPENROUTER_API_KEY"].ok and names["OPENROUTER_API_KEY"].note == "GET /api/v1/key"
     for repo in ("thomasbardhi01/parkagent", "thomasbardhi01/vigil"):
@@ -113,7 +136,7 @@ def test_doctor_names_each_repos_live_decider_route(cfg: Config, tmp_path: objec
     assert cf.ok and cf.note == "unused: no private repo lists jev-cloudflare"
     # vigil goes private: its Jev is Cloudflare's, and the credentials are used
     PRIVATE["vigil"] = True
-    checks = run_checks(cfg, secrets, http=http, docker=None, repos=[], include_claude_mods=False)
+    checks = run_checks(cfg, secrets, http=http, docker=None, repos=None, include_claude_mods=False)
     names = {c.name: c for c in checks}
     assert names[
         "decider: thomasbardhi01/vigil (private, live) → jev-cloudflare (haiku escalation)"

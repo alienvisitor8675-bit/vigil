@@ -156,12 +156,11 @@ def run_checks(
 
     # Jev (owner, 2026-10-23): OpenRouter for public repos, Cloudflare only
     # for private ones, by each repo's live visibility; Haiku the escalation.
-    if app is not None:
-        for repo in cfg.repos.repos:
-            if repo not in vis:
-                vis[repo] = live_private(repo, app.is_private)
+    # Live calls only about the repos asked for (`--repo`); the rest get a
+    # config-only line (review A1).
+    selected = list(repos) if repos is not None else list(cfg.repos.repos)
     lists_jev = {r for r, pol in cfg.repos.repos.items() if JEV in pol.decider}
-    cloudflare_used = any(vis.get(r, True) for r in lists_jev)
+    cloudflare_used = any(vis[r] for r in lists_jev if r in vis)  # of the repos read
     or_key = secrets.get("OPENROUTER_API_KEY")
     if or_key:
         out.append(
@@ -207,6 +206,10 @@ def run_checks(
 
     have = available_routes(secrets)
     for repo in cfg.repos.repos:
+        if repo not in selected:
+            out.append(Check(f"decider: {repo} (not checked: not selected)", None,
+                             f"configured: {', '.join(cfg.repo(repo).decider)}"))  # fmt: skip
+            continue
         private = vis.get(repo, True)  # unread: private (fail closed)
         how = ("private" if private else "public") + (", live" if repo in vis else ", unread")
         primary, escalation = decider_routes(cfg, repo, have, private=private)

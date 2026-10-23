@@ -96,10 +96,11 @@ class LabelIntake:
         from vigild.decider.questions import QUESTIONS
 
         d = self.decider.decide(repo, QUESTIONS[name], text)
-        used = d.action is Action.ACT and isinstance(d.answer.value, int)
-        record = {"value": d.answer.value, "probability": d.answer.probability,
+        v = d.answer.value  # a number on the 1-5 scale (owner ruling 5)
+        used = d.action is Action.ACT and isinstance(v, int | float) and not isinstance(v, bool)
+        record = {"value": v, "probability": d.answer.probability,
                   "backend": d.answer.backend, "action": d.action.value}  # fmt: skip
-        return (int(d.answer.value) if used else 3), record
+        return (min(5, max(1, round(float(v)))) if used else 3), record
 
     def _claim(self, repo: str, number: int) -> bool:
         with self.store.tx() as c:

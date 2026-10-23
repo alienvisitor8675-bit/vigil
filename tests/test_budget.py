@@ -125,3 +125,26 @@ def test_open_reservations_count_against_their_own_day_only(budget: Budget, cloc
     clock.now += timedelta(days=1)
     assert budget.open_today() == 0
     budget.reserve(session_id="x", task_id="tx", amount=2.0, purpose="worker")
+
+
+def test_review_and_audit_spend_count_toward_the_day_and_the_month(
+    budget: Budget, store: Store, cfg: Config
+) -> None:
+    """Owner ruling 2: reviews and audits sit outside the task's $2 cap
+    (reserved with no task) but count toward the daily and monthly caps."""
+    w = budget.reserve(session_id="w", task_id="t1", amount=2.0, purpose="worker")
+    rv = budget.reserve(session_id="rv", task_id=None, amount=0.5, purpose="reviewer")
+    au = budget.reserve(session_id="au", task_id=None, amount=1.0, purpose="auditor")
+    assert budget.task_total("t1") == pytest.approx(2.0)  # outside the task's cap
+    assert budget.open_today() == pytest.approx(3.5) and budget.open_month() == pytest.approx(3.5)
+    with pytest.raises(BudgetExceeded) as e:  # $3.50 of $5 held: a second audit doesn't fit
+        budget.reserve(session_id="au2", task_id=None, amount=1.6, purpose="auditor")
+    assert e.value.cap == "daily"
+    for rid, sess, usd in ((w, "w", 0.2), (rv, "rv", 0.3), (au, "au", 0.9)):
+        _spend(store, cfg, sess, usd)
+        budget.settle(rid)
+    assert budget.spent_today() == pytest.approx(1.4) and budget.spent_month() == pytest.approx(1.4)
+    cfg.budgets.monthly_usd = 1.5
+    with pytest.raises(BudgetExceeded) as e:
+        budget.reserve(session_id="rv2", task_id=None, amount=0.5, purpose="reviewer")
+    assert e.value.cap == "monthly"

@@ -98,13 +98,14 @@ def record_call(
     latency_ms: int | None = None,
     timings: dict[str, Any] | None = None,
     provenance: Provenance = Provenance.CLAUDE,
+    repo: str | None = None,
 ) -> float:
     cost = prices.cost(model, usage)
     store.x(
         "INSERT INTO model_calls (session_id, task_id, job_id, purpose, provider, backend_preset,"
         " model, tokens_in, tokens_out, tokens_cache_read, tokens_cache_write_5m,"
         " tokens_cache_write_1h, cost_usd, provider_cost_usd, status, latency_ms, timings, ts,"
-        " provenance) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " provenance, repo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             session_id,
             task_id,
@@ -125,6 +126,7 @@ def record_call(
             json.dumps(timings) if timings else None,
             iso(),
             provenance.value,
+            repo,
         ),
     )
     if session_id:

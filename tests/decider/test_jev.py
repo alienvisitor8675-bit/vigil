@@ -12,7 +12,6 @@ import httpx2
 import pytest
 
 from tests.decider.test_decider import PA, Fixed, passthrough
-from vigild.breakers import Breakers, Kind
 from vigild.config import Config
 from vigild.db import Store
 from vigild.decider.backends.jev import JevCloudflare, JevCreditExhausted, JevOpenRouter
@@ -35,17 +34,28 @@ def _client(payload: Any, status: int = 200, seen: list[httpx2.Request] | None =
 
 def _cf(payload: Any, status: int = 200, seen: list[httpx2.Request] | None = None) -> JevCloudflare:
     return JevCloudflare(
-        _client(payload, status, seen), account_id="acct", token="t0k", meter=passthrough
+        _client(payload, status, seen),
+        account_id="acct",
+        token="t0k",
+        version_pin="jev-1.13.0",
+        meter=passthrough,
     )
 
 
 def _or(payload: Any, seen: list[httpx2.Request] | None = None) -> JevOpenRouter:
-    return JevOpenRouter(_client(payload, 200, seen), token="t0k", meter=passthrough)
+    return JevOpenRouter(
+        _client(payload, 200, seen),
+        token="t0k",
+        version_pin="typesafe/jev-1.13-20260917",
+        meter=passthrough,
+    )
 
 
 def test_the_cloudflare_request_body() -> None:
     seen: list[httpx2.Request] = []
-    _cf(CF, seen=seen).ask(QUESTIONS["size"], "Add three tests", repo=PA, job_id=None)
+    _cf(CF, seen=seen).ask(
+        QUESTIONS["size"], "Add three tests", repo=PA, job_id=None, private=False
+    )
     (req,) = seen
     assert req.method == "POST" and req.url.path == "/client/v4/accounts/acct/ai/run"
     assert req.headers["authorization"] == "Bearer t0k"
@@ -67,7 +77,9 @@ def test_the_cloudflare_request_body() -> None:
 
 def test_the_openrouter_request_body() -> None:
     seen: list[httpx2.Request] = []
-    _or(OR, seen=seen).ask(QUESTIONS["touches_money_path"], "x", repo=PA, job_id=None)
+    _or(OR, seen=seen).ask(
+        QUESTIONS["touches_money_path"], "x", repo=PA, job_id=None, private=False
+    )
     body = json.loads(seen[0].content)
     assert seen[0].url.path == "/api/alpha/decisions"
     assert body["model"] == "typesafe/jev-1.13" and body["provider"]["zdr"] is True
@@ -81,26 +93,32 @@ def test_the_openrouter_request_body() -> None:
 )
 def test_the_nested_parse(jev: Any, version: str) -> None:
     payload = CF if jev is _cf else OR
-    a = jev(payload).ask(QUESTIONS["size"], "x", repo=PA, job_id=None)
+    a = jev(payload).ask(QUESTIONS["size"], "x", repo=PA, job_id=None, private=False)
     assert a.value == "S" and a.model_version == version
     assert a.probability == (0.59 if jev is _cf else 0.62)
-    v = jev(payload).ask(QUESTIONS["value"], "x", repo=PA, job_id=None)
-    assert (v.value, v.probability) == (4, 0.7)  # the likeliest anchor: "4"
-    n = jev(payload).ask(QUESTIONS["touches_money_path"], "x", repo=PA, job_id=None)
-    assert n.value == n.probability == (0.16 if jev is _cf else 0.17)
+    v = jev(payload).ask(QUESTIONS["value"], "x", repo=PA, job_id=None, private=False)
+    # a number on the 1-5 scale (owner ruling 5); the likeliest anchor's probability
+    assert (v.value, v.probability) == (pytest.approx(3.76 if jev is _cf else 3.77), 0.7)
+    n = jev(payload).ask(QUESTIONS["touches_money_path"], "x", repo=PA, job_id=None, private=False)
+    assert n.value is False and n.probability == (0.16 if jev is _cf else 0.17)
 
 
 def test_a_run_that_didnt_complete_raises() -> None:
     bad = json.loads(json.dumps(CF))
     bad["result"]["state"] = "Failed"
     with pytest.raises(DeciderError, match="Failed"):
-        _cf(bad).ask(QUESTIONS["size"], "x", repo=PA, job_id=None)
+        _cf(bad).ask(QUESTIONS["size"], "x", repo=PA, job_id=None, private=False)
 
 
 def test_no_version_is_recorded_as_unknown() -> None:
+    """Every route is pinned (review A8), so no version is drift, as `unknown`."""
+    from vigild.decider.backends.jev import JevVersionDrift
+
     bare = json.loads(json.dumps(OR))
     del bare["model"]
-    assert _or(bare).ask(QUESTIONS["size"], "x", repo=PA, job_id=None).model_version == "unknown"
+    with pytest.raises(JevVersionDrift) as e:
+        _or(bare).ask(QUESTIONS["size"], "x", repo=PA, job_id=None, private=False)
+    assert e.value.version == "unknown"
 
 
 def _noul(value: float) -> dict[str, Any]:
@@ -131,37 +149,16 @@ def test_noul_is_a_float_the_thresholds_apply_to(
 @pytest.mark.parametrize("value", [1.4, -0.1, "yes"])
 def test_a_noul_outside_0_to_1_raises(value: Any) -> None:
     with pytest.raises(DeciderError):
-        _or(_noul(value)).ask(QUESTIONS["touches_money_path"], "x", repo=PA, job_id=None)
+        _or(_noul(value)).ask(
+            QUESTIONS["touches_money_path"], "x", repo=PA, job_id=None, private=False
+        )
 
 
-def test_2021_trips_the_credit_breaker_and_pages_with_no_fallback(
-    cfg: Config, store: Store
-) -> None:
+def test_2021_raises_credit_exhausted() -> None:
+    """What the decider does with it (fall back, page once) is in test_round2.py."""
     err = json.loads((FIX / "cloudflare_2021.json").read_text())
     with pytest.raises(JevCreditExhausted):
-        _cf(err, status=402).ask(QUESTIONS["size"], "x", repo=PA, job_id=None)
-    pages: list[dict[str, Any]] = []
-
-    class Item:
-        id = 1
-
-    def pager(job: str | None, title: str, body: dict[str, Any]) -> Item:
-        pages.append({"title": title, **body})
-        return Item()
-
-    breakers = Breakers(store, cfg, pager)
-    vigil = "thomasbardhi01/vigil"  # private here: Jev on Cloudflare, Haiku its one exception
-    haiku = Fixed("haiku", 0.99)
-    d = Decider(cfg, store, {"jev-cloudflare": _cf(err, 402), "haiku": haiku}, breakers=breakers,
-                private=lambda repo: True)  # fmt: skip
-    got = d.decide(vigil, QUESTIONS["size"], "x")
-    assert got.action is Action.WAIT and haiku.calls == []  # no fallback answer
-    assert breakers.is_open(Kind.DECIDER_CREDIT, "route:jev-cloudflare")
-    (page,) = pages
-    assert page["breaker_kind"] == "decider_credit" and "2021" in json.dumps(page["detail"])
-    # the route stays off until the breaker is reset: the chain goes on without it
-    again = d.decide(vigil, QUESTIONS["size"], "x")
-    assert again.answer.backend == "haiku" and len(pages) == 1
+        _cf(err, status=402).ask(QUESTIONS["size"], "x", repo=PA, job_id=None, private=False)
 
 
 # --- version pin and drift (owner, 2026-10-23) ------------------------------------------------

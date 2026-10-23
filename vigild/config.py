@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from vigild.contract.models import Backend
 
@@ -42,8 +42,15 @@ class DeciderRoute(_M):
     model: str | None = None
     key_ref: str | None = None
     live: bool = True
-    # Jev: the exact version its responses must report (owner, 2026-10-23)
+    # Jev: the exact version its responses must report (owner, 2026-10-23);
+    # required on every Jev route, so no route skips the drift guard (review A8)
     version_pin: str | None = None
+
+    @model_validator(mode="after")
+    def _jev_is_pinned(self) -> DeciderRoute:
+        if self.backend.startswith("jev_") and not self.version_pin:
+            raise ValueError(f"a {self.backend} route needs its version_pin")
+        return self
 
 
 class BackendsFile(_M):
@@ -112,6 +119,8 @@ class Budgets(_M):
     # round gets what's left of the worker's budget.
     review_session_usd: float = Field(default=0.50, gt=0)
     audit_session_usd: float = Field(default=1.00, gt=0)
+    # Haiku decisions Jev couldn't give, per repo per UTC day (owner ruling 4)
+    decider_fallback_per_repo_usd: float = Field(default=1.00, gt=0)
 
 
 class ShapePolicy(_M):
