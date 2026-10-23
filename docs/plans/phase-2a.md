@@ -158,6 +158,27 @@ move with them.
   - the cap releases it;
   - a missing report blocks the stop.
 
+## 7. Carry-overs from the phase 1 run and main's hotfixes (#15–#17, the runner-file hotfix)
+
+Fold these in when 2a rebases onto main:
+- **`depends_on` in the scheduler** (phase 1 run finding #3): a task that
+  depends on another is dispatched only after it, and branches from that
+  task's head. Today main starts both from base in parallel.
+- **Mid-run budget refusal:** pause at the last checkpoint with
+  raise-cap, resume and abandon actions. On #15 the session fails.
+- **A queued session waiting more than 2 hours pages the owner.**
+- **The budget queue:**
+  - a waiter re-checks the job's state and stops if the job was
+    abandoned;
+  - the queue is first-in, first-out;
+  - tests cover abandon and restart while a session is waiting.
+- **The peak test includes the review-stage reserve.**
+- **Runner-file tasks** (finding #2): permanently rung 0, never counted
+  toward ladder graduation, with a test.
+- **Migrations:** 2a's steps append after main's; there's no
+  renumbering. 2a's development runs never use `~/vigil-data` and set
+  `VIGIL_DATA_DIR`.
+
 ## Done when (2a)
 
 All of this runs on **the test repo and vigil only** (owner, 2026-10-23).
