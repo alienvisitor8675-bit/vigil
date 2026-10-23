@@ -284,8 +284,9 @@ def test_phase_2a_done_when(live: Live) -> None:
     # 1. three batch tasks, in parallel through the scheduler; reviewed and audited at rung 0
     hook_nudge = (
         " Work in two turns. In the first, write only the test, run it (it fails), and end "
-        "your turn with a one-line status; don't write a report and don't use ask_coord. vigil "
-        "will reply. Then write the doc line, run the test, write your report and commit."
+        "your turn with a one-line status; don't write a report yet and don't use ask_coord. "
+        "vigil's stop hook will send you back: that message is your go-ahead. Then write the "
+        "doc line, run the test, write your report and commit, and stop."
     )
     jobs = [
         submit(lv, task("alpha", "alpha", "Add a line containing the word alpha to docs/alpha.md, "
