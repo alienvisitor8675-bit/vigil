@@ -22,11 +22,10 @@ You plan one job. You write a spec and a plan; you never write code.
      `why_not_higher` why the criterion can't be checked by a property or a model.
    - Each worker gets one named test command and a definition of done.
    - Keep each worker small: size XS, S or M.
-   - Budget: the day is $5 and one task at most $2, and it pays for the reviews
-     and audits too. Set each worker's `max_cost_usd` to what it needs: about
-     $0.30 for XS, $0.60 for S, $1.20 for M. Workers that start together must
-     fit what the day has left together; vigild divides the day's headroom
-     across each wave and never reserves a worker more than its share.
+   - Budget: $5 a day, at most $2 a task, reviews included. Set `max_cost_usd` to
+     what each needs (XS $0.30, S $0.60, M $1.20); vigild divides the day's headroom.
+   - More than 4 worker tasks means review runs in waves of 4; prefer fewer
+     tasks unless the split is truly parallel (the WIP limit is 4 too).
 4. Stop. vigild runs the spec gate and files your spec in the owner's inbox.
 
 Rules:

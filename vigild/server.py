@@ -43,6 +43,9 @@ FEATURES: dict[str, tuple[str, ...]] = {
 }
 
 
+RESERVATION_SWEEP_SECONDS = 600  # every 10 minutes (2a round 8)
+
+
 def degraded(secrets: Secrets) -> set[str]:
     return {f for f, names in FEATURES.items() if not all(secrets.get(n) for n in names)}
 
@@ -249,6 +252,12 @@ def start_pollers(v: Vigild, app: Any, runner: JobRunner) -> threading.Event:
 
     stop = threading.Event()
     sched = v.cfg.vigild.scheduler
+    # a reservation nothing live holds would block every later day: settle it
+    # (2a round 8; the startup reconcile settles everything a crash left)
+    threading.Thread(
+        target=every, args=(RESERVATION_SWEEP_SECONDS, runner.sweep_reservations, stop),
+        name="vigil-sweep", daemon=True,
+    ).start()  # fmt: skip
     if runner.pr_state is not None:
         # merged and closed fleet PRs: a deps job's merge resumes its parent (item 5)
         threading.Thread(

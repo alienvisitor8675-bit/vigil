@@ -157,6 +157,7 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "description": "plan.md's workers and how each criterion is verified. More than 4\nworkers means review runs in passes of at most 4, one after another\n(owner, 2026-10-23): prefer fewer tasks unless the split is truly\nparallel; the WIP limit is 4 open PRs too.",
   "properties": {
     "verify": {
       "items": {

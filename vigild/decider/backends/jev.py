@@ -31,6 +31,7 @@ raises `JevCreditExhausted`; the decider trips the credit breaker and pages.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -116,6 +117,7 @@ class Meter(Protocol):
         job_id: str | None,
         run: Callable[[], dict[str, Any]],
         private: bool | None = None,
+        body_chars: int = 0,
     ) -> dict[str, Any]: ...
 
 
@@ -132,9 +134,15 @@ class _Jev:
         self.meter = meter  # required: no Jev call goes unmetered (review round 2, N9)
 
     def _call(
-        self, repo: str, job_id: str | None, run: Callable[[], dict[str, Any]], private: bool
+        self,
+        repo: str,
+        job_id: str | None,
+        run: Callable[[], dict[str, Any]],
+        private: bool,
+        body_chars: int = 0,
     ) -> dict[str, Any]:
         return self.meter(
+            body_chars=body_chars,
             repo=repo,
             route=self.name,
             provider=self.provider,
@@ -214,7 +222,7 @@ class JevCloudflare(_Jev):
             inner = (payload.get("result") or {}).get("result") or {}
             return {**payload, "usage": inner.get("usage") or {}}  # for the meter
 
-        payload = self._call(repo, job_id, run, private)
+        payload = self._call(repo, job_id, run, private, len(json.dumps(body)))
         outer = payload.get("result") or {}
         if outer.get("state") != "Completed":
             raise DeciderError(f"jev-cloudflare: the run's state is {outer.get('state')!r}")
@@ -260,6 +268,7 @@ class JevOpenRouter(_Jev):
             job_id,
             lambda: self._post(OR_URL, {"Authorization": f"Bearer {self.token}"}, body),
             private,
+            len(json.dumps(body)),
         )
         version = str(payload.get("model") or UNKNOWN)
         return self._check_version(parse_answer(q, payload.get("answers"), self.name, version))

@@ -253,6 +253,11 @@ class CriterionVerify(Strict):
 
 
 class Plan(Strict):
+    """plan.md's workers and how each criterion is verified. More than 4
+    workers means review runs in passes of at most 4, one after another
+    (owner, 2026-10-23): prefer fewer tasks unless the split is truly
+    parallel; the WIP limit is 4 open PRs too."""
+
     workers: list[WorkerContract]
     verify: list[CriterionVerify] = Field(min_length=1)
 

@@ -60,9 +60,9 @@ def test_a_merge_landing_on_the_way_to_a_deps_regeneration_is_quiet(
     assert [e for e in w.store.events(job_id=child) if e.type == "review_dropped"]
 
 
-def test_abandoning_a_breakers_last_held_job_closes_it_and_resolves_its_page(
-    world: World,
-) -> None:
+def test_abandoning_a_breakers_last_held_job_resolves_its_page(world: World) -> None:
+    """Round 7, as the owner ruled in round 8: the pages resolve, and the
+    breakers stay open until their own condition clears."""
     w = world
     job = _building(w)
     br = w.runner.breakers
@@ -74,7 +74,7 @@ def test_abandoning_a_breakers_last_held_job_closes_it_and_resolves_its_page(
     r = w.client.post(f"/api/inbox/{pages[daily.id]['id']}/abandon",
                       headers=auth(w.tokens.admin), json={"job_id": job})  # fmt: skip
     assert r.status_code == 200, r.text
-    assert br.get(wip.id).state == "closed" and br.get(daily.id).state == "closed"
+    assert br.get(wip.id).state == "open" and br.get(daily.id).state == "open"
     assert [p for p in _pages(w) if p["body"].get("kind") == "breaker"] == []
 
 

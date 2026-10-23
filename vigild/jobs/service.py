@@ -573,10 +573,11 @@ class JobService:
                 if (other.job_id == job.id and other.queue == "questions"
                         and other.body.get("kind") != "breaker"):  # fmt: skip
                     self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
-            # a breaker that then holds nothing closes and resolves its page;
+            # a breaker that then holds nothing resolves its page but stays
+            # open: only its own condition reopens dispatch (owner, 2026-10-23);
             # one that still holds a job keeps its page for it (2a round 7)
             for b in breakers.unhold(job.id):
-                page = breakers.close_empty(b, by="abandon")
+                page = breakers.empty_page(b)
                 if page is not None:
                     self.store.resolve_inbox_item(page, Actor.OWNER.value)
         failed = getattr(self.runner, "job_failed", None)

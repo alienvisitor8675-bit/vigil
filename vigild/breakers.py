@@ -298,15 +298,16 @@ class Breakers:
                         emptied.append(b)
         return emptied
 
-    def close_empty(self, b: Breaker, *, by: str) -> int | None:
-        """Close a breaker that holds nothing (2a round 7): it has no reason
-        to stay open. Returns its page, for the caller to resolve."""
-        with self.store.lock:
-            cur = self.get(b.id)
-            if cur.state == "closed" or cur.held:
-                return None
-            self._close(cur, by=by)
-            return cur.item_id
+    def empty_page(self, b: Breaker) -> int | None:
+        """The page of a breaker that now holds nothing, for the caller to
+        resolve. The breaker itself doesn't move (owner, 2026-10-23): a page
+        closing is not dispatch resuming. Only its own condition (spend
+        under the cap, a probe's success, a reset) reopens dispatch, and a
+        job it holds later gets a fresh page."""
+        cur = self.get(b.id)
+        if cur.state == "closed" or cur.held:
+            return None
+        return cur.item_id
 
     def held_by(self, breaker_id: int) -> list[str]:
         try:
@@ -315,11 +316,31 @@ class Breakers:
             return []
 
     def hold(self, b: Breaker, job_id: str) -> None:
-        """Note a job this breaker paused; resetting it resumes the job."""
+        """Note a job this breaker paused; resetting it resumes the job. If
+        the breaker's page was resolved while it stayed open (its last held
+        job abandoned), the job gets a fresh page (2a round 8)."""
         with self.store.lock:
             cur = self.get(b.id)
             if job_id not in cur.held:
                 self._set(cur, held=[*cur.held, job_id])
+            if cur.state != "closed" and self.pager is not None and not self._page_open(cur):
+                actions = ("reset", "replan", "abandon") if cur.kind is Kind.PER_TASK else (
+                    "reset", "abandon")  # fmt: skip
+                item = self.pager(
+                    job_id,
+                    f"breaker tripped: {cur.kind.value} ({cur.scope})",
+                    {"kind": "breaker", "breaker": cur.id, "breaker_kind": cur.kind.value,
+                     "scope": cur.scope, "detail": cur.detail, "actions": list(actions)},
+                )  # fmt: skip
+                self._set(self.get(b.id), item_id=getattr(item, "id", None))
+
+    def _page_open(self, b: Breaker) -> bool:
+        if b.item_id is None:
+            return False
+        try:
+            return self.store.get_inbox_item(int(b.item_id)).status == "open"
+        except KeyError:
+            return False
 
     def _close(self, b: Breaker, *, by: str) -> list[str]:
         self._set(b, state="closed", count=0, held=[], reopen_at=None)

@@ -4,7 +4,7 @@ Before any session starts (coord, worker, reviewer, auditor) or vigild makes
 a model call of its own (the decider), it reserves that session's
 max_cost_usd. A reservation is refused unless
 
-    spent (today) + open reservations (today) + this one <= daily cap,
+    spent (today) + every open reservation + this one <= daily cap,
 
 the same against the month, and the task's own spend + this one <= the
 per-task cap. Settling turns a reservation into metered spend (the sum of the
@@ -128,7 +128,21 @@ class Budget:
             if row is None or row["status"] != "open":
                 return 0.0
             if amount is not None:
-                spent = amount
+                # never more than was reserved (2a round 8): the rest is recorded,
+                # and the caller (the gateway) trips the daily breaker for it
+                held = float(
+                    c.execute(
+                        "SELECT amount_usd FROM reservations WHERE id=?", (reservation_id,)
+                    ).fetchone()[0]
+                )
+                spent = min(amount, held)
+                if amount > held + EPS:
+                    self.store.add_event(
+                        "settle_excess",
+                        {"reservation": reservation_id, "reserved_usd": round(held, 6),
+                         "reported_usd": round(amount, 6), "excess_usd": round(amount - held, 6)},
+                        "human",
+                    )  # fmt: skip
             elif row["session_id"]:
                 spent = session_cost(self.store, row["session_id"])
             else:

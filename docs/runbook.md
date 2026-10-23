@@ -350,7 +350,9 @@ uv run python -m vigild
   Cloudflare credit, a repo's decider fallback. Fix the cause, then press
   **Reset**: the jobs it held resume (`queued` if one's last run is still
   finishing; it picks up right after). Or press **Abandon** on the breaker's
-  page, naming one of the jobs it holds, to give that job up. A backend breaker also closes itself
+  page, naming one of the jobs it holds, to give that job up; abandoning
+  its last job resolves the page but leaves the breaker open, so dispatch
+  waits for its own condition (or your reset). A backend breaker also closes itself
   after a successful probe five minutes on, resolving its page; meanwhile
   its work goes to the preset's fallback in `configs/routing.yaml`.
 - **Midnight.** Work still running at UTC midnight counts against the new
@@ -364,9 +366,8 @@ uv run python -m vigild
 - **Review caps.** A job entering review reserves $1.20 per task under review
   (`review_session_usd` $0.40 + `audit_session_usd` $0.80 in
   `configs/budgets.yaml`); what isn't used goes back when the pass ends,
-  before any fix round builds. A job whose review stage is bigger than the
-  day can never be reviewed as it is: its page says so; re-plan it into
-  fewer tasks or abandon it. A
+  before any fix round builds. A pass reviews at most 4 tasks; a job with
+  more is reviewed in passes, one after another. A
   review that runs past its cap still completes, charged to the day (the
   daily and monthly caps stay hard). "Review caps too low for shape <shape>:
   2 overages; consider re-sizing" means raise those two values. Re-size

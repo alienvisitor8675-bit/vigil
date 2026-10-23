@@ -307,3 +307,18 @@ def test_a_draw_on_a_full_new_day_cannot_push_it_over(
     with pytest.raises(BudgetExceeded):  # past what the stage holds: refused, nothing left over
         budget.draw(stage, session_id=s.id, amount=0.80, purpose="auditor")
     assert _day_total(budget) == pytest.approx(5.0)
+
+
+# --- 2a round 8, R4(b): a settle never books more than its reservation ------------------------
+
+
+def test_settling_more_than_was_reserved_books_only_the_reservation(
+    budget: Budget, store: Store, cfg: Config
+) -> None:
+    """The reviewer's `test_q_settle_books_more_than_reserved_amount`."""
+    budget.reserve(session_id="c", task_id=None, amount=4.95, purpose="coord")
+    rid = budget.reserve(session_id=None, task_id=None, amount=0.05, purpose="decider")
+    assert budget.settle(rid, 0.30) == pytest.approx(0.05)
+    assert budget.spent_today() + budget.open_today() <= cfg.budgets.daily_usd + 1e-9
+    (ev,) = [e for e in store.events() if e.type == "settle_excess"]
+    assert ev.data["excess_usd"] == pytest.approx(0.25)

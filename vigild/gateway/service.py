@@ -216,6 +216,7 @@ class Gateway:
         self._fallback_pending: dict[str, float] = {}  # repo -> held for fallback calls
         self._inflight_lock = threading.Lock()
         self._drained = threading.Condition(self._inflight_lock)  # a session's holds all gone
+        self._after_drain: dict[str, list[Callable[[], Any]]] = {}  # session -> settle
         # vigild's circuit breakers (plan 2a, item 4): every upstream answer
         # counts for or against the preset's backend breaker
         self.breakers: Any = None
@@ -431,6 +432,20 @@ class Gateway:
             else:
                 self._inflight.pop(hold.session_id, None)
                 self._drained.notify_all()
+                later = self._after_drain.pop(hold.session_id, [])
+        for fn in later if left <= 1e-12 else []:
+            fn()  # a settle the runner left for when the late call was booked
+
+    def after_drain(self, session_id: str, fn: Callable[[], Any]) -> None:
+        """Run `fn` once none of the session's calls is in flight: now if
+        none is, else when the last one is booked (2a round 8: a call that
+        outlives the drain timeout still lands in the ledger, and the
+        session's reservation stays open, and counted, until then)."""
+        with self._inflight_lock:
+            if session_id in self._inflight:
+                self._after_drain.setdefault(session_id, []).append(fn)
+                return
+        fn()
 
     def drain(self, session_id: str, timeout: float = 60.0) -> bool:
         """Wait until none of the session's calls is in flight (each is booked
@@ -618,6 +633,7 @@ class Gateway:
         job_id: str | None,
         run: Callable[[], dict[str, Any]],
         private: bool | None = None,
+        body_chars: int = 0,
     ) -> dict[str, Any]:
         """A non-Anthropic call vigild makes itself (Jev): the same route check,
         reservation and per-call row as everything through the gateway (item 11).
@@ -631,13 +647,16 @@ class Gateway:
             check_decider_route(self.cfg, repo, route, private=private)
         except RepoPolicyError as e:
             raise GatewayError(403, "permission_error", str(e)) from e
+        # the call's worst case, as the other gateway paths reserve it: its
+        # input at the dearest input rate, twice over, never under the floor
+        # (2a round 8: $0.01 flat let a bigger call settle past its row)
+        worst = 2 * self.prices.cost(
+            model, CallUsage(tokens_cache_write_1h=math.ceil(body_chars / CHARS_PER_TOKEN),
+                             tokens_in=math.ceil(body_chars / CHARS_PER_TOKEN), tokens_out=1024)
+        ) if self.prices.has(model) else 0.0  # fmt: skip
+        amount = max(self.cfg.budgets.decider_call_usd, worst)
         try:
-            rid = self.budget.reserve(
-                session_id=None,
-                task_id=None,
-                amount=self.cfg.budgets.decider_call_usd,
-                purpose=purpose,
-            )
+            rid = self.budget.reserve(session_id=None, task_id=None, amount=amount, purpose=purpose)
         except BudgetExceeded as e:
             raise GatewayError(403, "permission_error", str(e)) from e
         started = time.monotonic()
@@ -671,7 +690,15 @@ class Gateway:
             )
             return payload
         finally:
-            self.budget.settle(rid, cost)
+            self.budget.settle(rid, cost)  # never more than `amount`
+            if cost > amount + 1e-9 and self.breakers is not None:
+                from vigild.breakers import GLOBAL, Kind
+
+                self.breakers.trip(
+                    Kind.DAILY, GLOBAL,
+                    {"why": "a metered call cost more than its reservation",
+                     "reserved_usd": round(amount, 6), "cost_usd": round(cost, 6)},
+                )  # fmt: skip
 
     def _fallback_today(self, repo: str) -> float:
         day = utcnow().strftime("%Y-%m-%d")

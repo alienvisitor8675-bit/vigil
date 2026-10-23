@@ -39,6 +39,7 @@ import math
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -61,7 +62,7 @@ from vigild.contract.models import (
     WorkerContract,
     WorkerReport,
 )
-from vigild.db import Store, iso
+from vigild.db import Store, iso, utcnow
 from vigild.devimage import DevImages, SessionImages, StaleDevImage, missing_tools
 from vigild.executors.base import ExecOutcome, Executor, Resume, SessionSpec
 from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
@@ -100,6 +101,9 @@ REVIEW_TURNS = 30
 # A review or an audit answers in a few thousand tokens. Capping each call's
 # output keeps the gateway's worst-case hold inside the session's reservation.
 REVIEW_OUTPUT_TOKENS = 8192
+# a review pass reviews at most this many tasks, each pass reserving for its
+# own (owner, 2026-10-23); as the WIP limit, so a pass is $4.80 at most
+REVIEW_PASS_TASKS = 4
 LIVE_SESSION = ("created", "running")
 DEAD_TASK = ("superseded", "abandoned")  # out of the job: re-planned away or given up
 PUBLISHED = ("pr_open", "reviewed")  # a task whose draft PR is open (reviewed: clean at its head)
@@ -190,7 +194,7 @@ class JobRunner:
         # the WIP room check and the move to running, for every job at once (B10)
         self._wip_lock = threading.Lock()
         # each job's review-stage reservation while its pass runs (owner, 2026-10-23)
-        self._review_stage: dict[str, int] = {}
+        self._review_stage_ids: dict[str, int] = {}
         self._stage_lock = threading.Lock()
         self.closers: list[Callable[[], None]] = []  # e.g. the docker client (item 0)
         self.ladder = Ladder(store, cfg)
@@ -373,6 +377,41 @@ class JobRunner:
                 out["rebuilt"] += 1
         self.store.add_event("reconcile", out, Provenance.HUMAN)
         return out
+
+    def sweep_reservations(self, grace_seconds: int = 600) -> list[int]:
+        """Settle every open reservation nothing live holds (2a round 8): a
+        leaked one would otherwise block every later day, since open rows
+        count against today whatever day they began. Live: a session still
+        created or running, a review stage whose pass is running, a worker
+        reservation whose task is running. Anything younger than the grace
+        period is left alone (it may be about to be used). Returns the ids."""
+        cutoff = utcnow().timestamp() - grace_seconds
+        with self._stage_lock:
+            stages = set(self._review_stage_ids.values())
+        swept: list[int] = []
+        for r in self.store.q("SELECT * FROM reservations WHERE status='open'"):
+            if datetime.fromisoformat(r["created_at"]).timestamp() > cutoff:
+                continue
+            live = False
+            if r["session_id"]:
+                try:
+                    live = self.store.get_session(r["session_id"]).status in LIVE_SESSION
+                except KeyError:
+                    live = False
+            elif r["purpose"] == "review_stage":
+                live = int(r["id"]) in stages
+            elif r["task_id"]:
+                try:
+                    live = self.store.get_task(r["task_id"]).state == "running"
+                except KeyError:
+                    live = False
+            if live:
+                continue
+            self.budget.settle(int(r["id"]))
+            swept.append(int(r["id"]))
+        if swept:
+            self.store.add_event("reservation_swept", {"reservations": swept}, Provenance.HUMAN)
+        return swept
 
     def _safe_to_resume(self, s: SessionRow) -> bool:
         """A worker a restart cut off may resume (item 3) when its job was
@@ -763,13 +802,16 @@ class JobRunner:
         reservation is already made; the token is issued once the slot is
         taken, so waiting for one doesn't eat its life."""
         with self.slots.session():
-            token = self.gateway.issue_token(
-                s.id, spec.repo, spec.preset, ttl_minutes=spec.max_minutes + TOKEN_TTL_MARGIN_MIN
-            )
-            self.store.update_session(
-                s.id, status="running", started_at=iso(), clone_path=str(spec.clone)
-            )
             try:
+                # inside the try: a token refused (the repo went private) still
+                # settles the reservation (2a round 8)
+                token = self.gateway.issue_token(
+                    s.id, spec.repo, spec.preset,
+                    ttl_minutes=spec.max_minutes + TOKEN_TTL_MARGIN_MIN,
+                )  # fmt: skip
+                self.store.update_session(
+                    s.id, status="running", started_at=iso(), clone_path=str(spec.clone)
+                )
                 with self.telemetry.session(s.id, attrs) as tr:
                     spec.traceparent = tr.traceparent
                     self.store.update_session(s.id, detail={"trace_id": tr.trace_id})
@@ -784,9 +826,15 @@ class JobRunner:
                 return out
             finally:
                 self.gateway.revoke(s.id)
-                if not self.gateway.drain(s.id):  # its last calls booked first
+                if self.gateway.drain(s.id):  # its last calls booked first
+                    self.budget.settle(reservation)
+                else:
+                    # a call outlived the wait: the reservation stays open (and
+                    # counted) until it is booked, then settles (2a round 8)
                     log.warning("%s: a call was still in flight at settling", s.id)
-                self.budget.settle(reservation)
+                    self.gateway.after_drain(
+                        s.id, functools.partial(self.budget.settle, reservation)
+                    )
                 self.store.update_session(s.id, ended_at=iso())
                 self._spend_check()
 
@@ -1147,10 +1195,27 @@ class JobRunner:
                     return None
                 for tid in admitted:
                     self.store.update_task(tid, state="running")  # its place in the stack
-            for tid in retrying:
-                # another attempt; the third is routed by rule 5 (escalated)
-                attempt = int(self.store.get_task(tid).contract.get("attempt") or 1)
-                self._reroute(job_id, tid, attempt=attempt + 1)
+            try:
+                for tid in retrying:
+                    # another attempt; the third is routed by rule 5 (escalated)
+                    attempt = int(self.store.get_task(tid).contract.get("attempt") or 1)
+                    self._reroute(job_id, tid, attempt=attempt + 1)
+            except RoutingError as e:
+                # nothing reserved is left behind (2a round 8): release the
+                # wave, put its tasks back, and page the job
+                for rid, _amt in held.values():
+                    if rid:
+                        self.budget.settle(rid, 0.0)
+                for tid in admitted:
+                    self.store.update_task(tid, state="failed" if tid in retrying else "waiting")
+                self._block(job_id, f"routing: {e}")
+                self._page(
+                    job_id, f"{job_id}: a retry can't be routed",
+                    {"kind": "cant_run", "error": str(e),
+                     "actions": ["retry", "replan", "abandon"]},
+                    resumable=True,
+                )  # fmt: skip
+                return None
             return {
                 tid: functools.partial(self._run_worker, job_id, tid, *held[tid])
                 for tid in admitted
@@ -2039,22 +2104,34 @@ class JobRunner:
         if b is not None:
             self._hold_for(job_id, b)
             return
-        tasks = [t for t in self.store.list_tasks(job_id) if t.state == "pr_open"]
-        # one reservation for the whole pass (owner, 2026-10-23): each review
-        # and audit session draws its cap from it; what's left goes back at
-        # the end, and a fix round's re-review reserves again
+        # passes of at most REVIEW_PASS_TASKS (owner, 2026-10-23): each reserves
+        # for its own tasks, the next only after the last one's stage went back
+        while True:
+            tasks = [t for t in self.store.list_tasks(job_id) if t.state == "pr_open"]
+            batch = tasks[:REVIEW_PASS_TASKS]
+            result = self._review_stage(job_id, job, batch, more=len(tasks) > len(batch))
+            if result == "dispatch":
+                # the pass is over and its stage released (2a round 6): only now
+                # does the fix round (or the deps job's regeneration) build
+                self.dispatch(job_id)
+            if result != "next":
+                return
+            job = self.store.get_job(job_id)
+
+    def _review_stage(self, job_id: str, job: Job, tasks: list[Any], *, more: bool) -> str:
+        """One pass's review stage: one reservation for its tasks (owner,
+        2026-10-23); each review and audit session draws its cap from it,
+        and what's left goes back when the pass ends, before anything else
+        builds. Returns what `_review_pass` decided."""
         bud = self.cfg.budgets
         amount = len(tasks) * (bud.review_session_usd + bud.audit_session_usd)
         if not tasks:
             # nothing to review (a restart after the reviews, or only fix
             # rounds owed): no reserve; straight on to ready or the fix rounds
-            if self._review_pass(job_id, job, tasks):
-                self.dispatch(job_id)
-            return
+            return self._review_pass(job_id, job, tasks, more=False)
         cap = min(bud.daily_usd, bud.monthly_usd)
         if amount > cap + 1e-9:
-            # can never fit: say so, and offer no retry that can't work
-            # (finding 5 is with the owner; until then, only this page)
+            # a guard for changed caps: at $0.40 + $0.80 a pass of 4 is $4.80
             self._block(job_id, f"review stage needs ${amount:.2f}; the daily cap is ${cap:.2f}")
             self._page(
                 job_id,
@@ -2063,7 +2140,7 @@ class JobRunner:
                  "tasks": [t.id for t in tasks], "actions": ["replan", "abandon"],
                  "next": "re-plan into fewer tasks, or abandon; a retry can't fit"},
             )  # fmt: skip
-            return
+            return "done"
         try:
             stage = self.budget.reserve(
                 session_id=None, task_id=None, amount=amount, purpose="review_stage"
@@ -2074,27 +2151,25 @@ class JobRunner:
                 self._hold_for(job_id, held)
             else:
                 self._budget_page(job_id, e, [t.id for t in tasks])
-            return
-        self.store.add_event(
-            "review_stage_reserved", {"amount_usd": amount, "tasks": [t.id for t in tasks]},
-            Provenance.HUMAN, job_id=job_id,
-        )  # fmt: skip
-        with self._stage_lock:
-            self._review_stage[job_id] = stage
+            return "done"
         try:
-            redispatch = self._review_pass(job_id, job, tasks)
+            self.store.add_event(
+                "review_stage_reserved", {"amount_usd": amount, "tasks": [t.id for t in tasks]},
+                Provenance.HUMAN, job_id=job_id,
+            )  # fmt: skip
+            with self._stage_lock:
+                self._review_stage_ids[job_id] = stage
+            return self._review_pass(job_id, job, tasks, more=more)
         finally:
             with self._stage_lock:
-                self._review_stage.pop(job_id, None)
+                self._review_stage_ids.pop(job_id, None)
             self.budget.settle(stage, 0.0)  # what no session drew goes back to the day
-        if redispatch:
-            # the pass is over and its stage released (2a round 6): only now
-            # does the fix round (or the deps job's regeneration) build
-            self.dispatch(job_id)
 
-    def _review_pass(self, job_id: str, job: Job, tasks: list[Any]) -> bool:
-        """One review pass. True when the job goes back to building and the
-        caller dispatches it, once this pass's stage is released."""
+    def _review_pass(self, job_id: str, job: Job, tasks: list[Any], *, more: bool) -> str:
+        """One review pass: "dispatch" when the job goes back to building
+        (the caller dispatches it once this pass's stage is released),
+        "next" when the pass was clean and tasks are still waiting for the
+        next pass, "done" otherwise."""
         with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as pool:
             outcomes = dict(zip(
                 [t.id for t in tasks],
@@ -2109,12 +2184,12 @@ class JobRunner:
                 {"state": self.store.get_job(job_id).state.value, "tasks": sorted(outcomes)},
                 Provenance.HUMAN, job_id=job_id,
             )  # fmt: skip
-            return False
+            return "done"
         failed = {tid: why for tid, (kind, why) in outcomes.items() if kind == "failed"}
         b = self._paused(job)
         if failed and b is not None:
             self._hold_for(job_id, b)  # a cap tripped mid-review: wait on its breaker
-            return False
+            return "done"
         if failed:
             self._block(job_id, f"review failed: {sorted(failed)}")
             self._page(
@@ -2123,10 +2198,10 @@ class JobRunner:
                 {"kind": "review_failed", "tasks": failed, "actions": ["retry", "abandon"]},
                 resumable=True,
             )
-            return False
+            return "done"
         flagged = {tid: f for tid, (kind, f) in outcomes.items() if kind == "deps_findings"}
         if flagged:
-            return self._deps_review_failed(job_id, flagged)
+            return "dispatch" if self._deps_review_failed(job_id, flagged) else "done"
         fixes = sorted(tid for tid, (kind, _) in outcomes.items() if kind == "fix")
         # a task a previous pass sent to a fix round, while another's review
         # failed, is still owed its round: it goes with this one (review B2)
@@ -2155,16 +2230,19 @@ class JobRunner:
                         "actions": ["replan", "abandon"],
                     },
                 )
-                return False
-            return self._move_on(
+                return "done"
+            moved = self._move_on(
                 job_id, JobState.BUILDING, sorted(outcomes),
                 evidence={"findings": {tid: outcomes[tid][1] for tid in fixes}},
             )  # fmt: skip
+            return "dispatch" if moved else "done"
+        if more:
+            return "next"  # clean so far; the next pass reviews the rest
         if not self._move_on(job_id, JobState.READY, sorted(outcomes)):
-            return False
+            return "done"
         self.breakers.success(Kind.REPO_FAILURES, f"repo:{job.repo}")
         self._ready(job_id)
-        return False
+        return "done"
 
     def _move_on(
         self,
@@ -2183,6 +2261,11 @@ class JobRunner:
             now = self.store.get_job(job_id).state
             if now is JobState.IN_REVIEW:
                 raise
+            if now is JobState.ABANDONED:
+                # nothing of the dropped move is left on a dead job (2a round 8)
+                for t in self.store.list_tasks(job_id):
+                    if t.state in ("fix", "queued", "running", "waiting"):
+                        self.store.update_task(t.id, state="abandoned")
             self.store.add_event(
                 "review_dropped", {"state": now.value, "to": to.value, "tasks": tasks},
                 Provenance.HUMAN, job_id=job_id,
@@ -2196,6 +2279,13 @@ class JobRunner:
         second failed review closes that PR too and pages the owner. The
         parent job stays blocked on this one throughout."""
         job = self.store.get_job(job_id)
+        if job.state is not JobState.IN_REVIEW:
+            # the job moved on (abandoned, merged): change nothing (2a round 8)
+            self.store.add_event(
+                "review_dropped", {"state": job.state.value, "tasks": sorted(flagged)},
+                Provenance.HUMAN, job_id=job_id,
+            )  # fmt: skip
+            return False
         again: list[str] = []
         for tid in sorted(flagged):
             t = self.store.get_task(tid)
@@ -2502,7 +2592,7 @@ class JobRunner:
         try:
             check_backend(self.cfg, job.repo, preset, private=live_private(job.repo))
             with self._stage_lock:
-                stage = self._review_stage.get(job.id)
+                stage = self._review_stage_ids.get(job.id)
             if stage is not None:  # its cap, drawn from the job's review stage
                 rid = self.budget.draw(stage, session_id=s.id, amount=amount, purpose=role.value)
             else:
@@ -2527,6 +2617,30 @@ class JobRunner:
             self.budget.settle(rid)
             self.store.update_session(s.id, status="failed")
             raise
+        try:
+            spec, attrs = self._review_spec(
+                job, t, s, role, preset, clone, rnd, packet, model, session_image
+            )
+        except Exception:
+            self.budget.settle(rid)  # the draw goes back (2a round 8)
+            self.store.update_session(s.id, status="failed")
+            raise
+        out = self._run_session(s, spec, rid, attrs, cap=amount)
+        return self._review_answer(s, job, t, role, shape, amount, out, model)
+
+    def _review_spec(
+        self,
+        job: Any,
+        t: Any,
+        s: SessionRow,
+        role: Role,
+        preset: str,
+        clone: Path,
+        rnd: int,
+        packet: str,
+        model: type[ReviewOutput] | type[AuditOutput],
+        session_image: str | None,
+    ) -> tuple[SessionSpec, dict[str, Any]]:
         spec = SessionSpec(
             session_id=s.id,
             role=role,
@@ -2556,7 +2670,19 @@ class JobRunner:
             "vigil.model": spec.model,
             "vigil.attempt": rnd,
         }
-        out = self._run_session(s, spec, rid, attrs, cap=amount)
+        return spec, attrs
+
+    def _review_answer(
+        self,
+        s: SessionRow,
+        job: Any,
+        t: Any,
+        role: Role,
+        shape: str,
+        amount: float,
+        out: ExecOutcome,
+        model: type[ReviewOutput] | type[AuditOutput],
+    ) -> tuple[ReviewOutput | AuditOutput | None, str]:
         cost = session_cost(self.store, s.id)
         if cost > amount + 1e-9:
             self._note_over_cap(shape, role, job.id, t.id, cap=amount, cost=cost)
