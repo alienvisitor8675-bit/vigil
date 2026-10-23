@@ -80,22 +80,26 @@ flowchart LR
 
   subgraph LRN["Learning epic (planned, after phase 5; design.md Learning loop)"]
     HT[("hidden tests<br/>vigild records only")]
-    VR["reward computation<br/>reward.json"]
-    RP["weekly replay<br/>Opus + best local"]
+    RW["vigild assembles quality + cost<br/>signs reward.json on the host"]
+  end
+  subgraph EV["Phase 7 Eval (planned)"]
+    RP["weekly replay<br/>Opus + best local · evidence rows"]
   end
   JOB -. "spec time" .-> HT
   VF["verifier (B33, built)<br/>plain dev image, offline"]
-  HT -. "verifier container only" .-> VF
-  VF -. "raw reports" .-> VR
-  VR -. "reward rows" .-> DB
-  VR -. "episode · attempt · reward spans" .-> OC
-  RP -. "replay jobs" .-> JOB
+  HT -. "own verifier run" .-> VF
+  VF -. "gate.json" .-> RW
+  GW -. "cost (metering)" .-> RW
+  RW -. "learning record" .-> DB
+  RW -. "spans with provenance" .-> OC
+  RP -. "replay jobs (bench label)" .-> JOB
 ```
 
-The nodes inside *Learning epic* are planned and not built. The verifier
-beside them is built (B33); only the reward computation and `reward.json`
-are new. Their conflicts with B33, B35, the budgets and the provenance rules are the
-*Open* notes in `docs/design.md` "Learning loop".
+The nodes inside *Learning epic* and *Phase 7 Eval* are planned and not
+built. The verifier beside them is built (B33). It will compute only the
+gate tier, as `gate.json`; vigild assembles the rest on the host, where
+the signing key lives. The owner's rulings of 2026-10-23 that shape this
+are listed at the end of `docs/design.md` "Learning loop".
 
 ## Build-time choices
 
@@ -515,48 +519,58 @@ file (runbook). The Cloudflare token is optional, because Haiku covers.
 
 ### Learning epic (after phase 5; design only)
 
-This is an epic, not an eighth phase. The spec is `docs/design.md`
-"Learning loop"; the rows are in `docs/feature-map.md` "Learning";
-`docs/learning/README.md` is the index.
+This is an epic, not an eighth phase. The spec and the owner's rulings
+(2026-10-23) are in `docs/design.md` "Learning loop"; the rows are in
+`docs/feature-map.md` "Learning"; `docs/learning/README.md` is the index.
+The outer loop (weekly replay) is part of phase 7 (ruling 3).
 - **First, three experiments, in order.** Each runs only after the
-  first ParkAgent run, only through vigild, and after the owner
-  confirms:
-  - #9, hidden-test validity: below ~80%, nothing else proceeds;
+  first ParkAgent run, only through vigild, after the owner confirms,
+  and on its own budget line:
+  - #9, hidden-test validity: below ~80% on the unfiltered metric,
+    nothing else proceeds;
   - #10, reward validity: drop components under ~0.7 AUROC;
-  - #11, swap gap: needs phase 5; the executor is a confound (Open 22).
+  - #11, swap gap: blocks on phases 4 and 5. ParkAgent's config gets
+    its local backend when phase 5 lands.
 - **Then the epic's features:**
-  - hidden tests;
-  - the reward computer and its graded signals;
-  - the attempt protocol;
-  - episode, attempt and reward spans;
-  - playbooks and the middle loop;
-  - retroactive reward on top of phase 6's watcher;
-  - weekly replay and task synthesis;
-  - the public anchor (with #8);
-  - the harness-lift baseline;
-  - packet-template evolution;
-  - the learning metrics;
+  - hidden tests (stage 1; never on the branch; their own verifier run);
+  - `gate.json` from the verifier, and `reward.json` assembled and
+    signed by vigild;
+  - opt-in mutation testing;
+  - the attempt feedback inside the existing retry;
+  - provenance on spans and packets;
+  - the `docs/product/` layer and its intake rule;
+  - the middle loop and its playbooks;
+  - the post-merge canary and inbox item;
+  - the learning record;
   - the tower loop.
-- **Flows it would change, once built.** Those PRs update this file:
-  - stage 1 gains a vigild-only hidden-test record;
-  - the verifier (B33) emits `reward.json`;
-  - the runner's retry (B35) becomes the attempt protocol;
-  - the post-merge watcher gains bisection and a 30-day reward;
-  - a weekly replay runs beside the job FSM;
-  - new tables arrive as appended `MIGRATIONS` steps.
-- **Until the owner decides the *Open* notes,** nothing in this epic
-  changes B33, B35, B14's caps or the provenance rules.
-- **Tools.** mutmut, Stryker, cargo-mutants, SWE-smith, Change2Task,
-  mini-swe-agent, Harbor and GEPA/DSPy are planned, not adopted. Each
-  needs an exact pin in `docs/sources.md` and a one-line reason when
-  it's adopted.
-- **Spend.** The issues estimate it:
+- **Flows it changes, once built.** Those PRs update this file:
+  - **Hidden tests:** stage 1 gains a vigild-only hidden-test record, and the
+    verifier (B33) gains a separate hidden-test run with its own base/head
+    comparison. The `test_cmd` runs and their checks are unchanged.
+  - **The reward:** the verifier writes `gate.json`, and vigild signs
+    `reward.json` on the host.
+  - **Retry:** B35's retry stays the owner's, and adds category feedback to
+    a full-context fork that shares the cap.
+  - **Post-merge:** the phase 6 watcher's canary is the full suite on `main`,
+    and a regression opens an inbox item with a proposed fix job.
+  - **Data:** new tables arrive as appended `MIGRATIONS` steps.
+- **Invariants it keeps:**
+  - B14's caps: replay and each experiment get their own planned
+    `configs/budgets.yaml` line, in #8's shape, and #11's lifts the
+    per-task cap for that run only. This PR changes no config, because
+    phase 2a is editing `configs/budgets.yaml`.
+  - The rung-0 lock and the `deps` cap in `configs/review.yaml`, which
+    phase 2a implements.
+  - The provenance rules, and the private-repo rule (local models only,
+    or off).
+- **Tools.** mutmut, Stryker, cargo-mutants, SWE-smith, Change2Task and
+  GEPA/DSPy are planned, not adopted. Each needs an exact pin in
+  `docs/sources.md` and a one-line reason when it's adopted. Harbor and
+  mini-swe-agent are dropped (ruling 21).
+- **Spend, as the issues estimate it:**
   - #9: about $3–8;
   - #10: about $6–85;
   - #11: about $60–80.
-
-  #10 and #11 need a budget of their own that never draws from the
-  daily cap, as #8's bench does.
 - **Done when:** each experiment's decision rule has been applied and
   recorded under `docs/learning/`. The rest is defined with the owner.
 
@@ -573,8 +587,22 @@ This is an epic, not an eighth phase. The spec is `docs/design.md`
 
 ### Phase 7: Eval (worker: Sonnet)
 
-- **Delivers:** `evals/run.py` over workers, reviewers and deciders, and
-  `routing.yaml` / `review.yaml` edited from the results.
+- **Delivers:**
+  - `evals/run.py` over workers, reviewers and deciders, and
+    `routing.yaml` / `review.yaml` edited from the results, by PR;
+  - **the weekly replay** (the learning loop's outer loop, owner ruling
+    3 of 2026-10-23: one eval):
+    - **What it runs:** closed jobs and synthesized hard tasks (a
+      SWE-smith and Change2Task batch job), with Opus and the best local
+      model, under #8's bench approval label and its own budget line.
+    - **What it produces:** evidence rows only. Promotion stays on the
+      audit path, and a parameter or prompt change is a PR for the owner.
+    - **Splits:** the tune split drives proposals, and the held-out
+      split is reported once per release.
+    - **The public anchor:** #8's tasks 1–50, run through vigild and
+      reported, not tested.
+    - **The baseline:** Vigil's executor with the harness features off.
+    - **30-day attribution:** written to each job's learning record.
 - **Done when:**
   - `evals/2026-xx/results.csv` is committed;
   - the first shapes are at rung 1;
