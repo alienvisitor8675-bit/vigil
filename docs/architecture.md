@@ -1,7 +1,7 @@
 # Vigil architecture
 
 How Vigil is built, which choices were made at build time and why, and the
-seven-phase plan. `docs/design.md` is the spec; this file says how the spec
+seven-phase plan with the learning epic after phase 5. `docs/design.md` is the spec; this file says how the spec
 is implemented and where the implementation had to depart from it.
 `docs/sources.md` cites every version and fact used here. Architectural
 decisions after phase 1 are ADRs in `docs/decisions/`.
@@ -77,7 +77,22 @@ flowchart LR
   GW --> DB
   JOB --> DB
   EXP -- "1 Hz samples (pulled)" --> D
+
+  subgraph LRN["Learning epic (planned, after phase 5; design.md Learning loop)"]
+    HT[("hidden tests<br/>vigild records only")]
+    VR["verifier → reward.json"]
+    RP["weekly replay<br/>Opus + best local"]
+  end
+  JOB -. "spec time" .-> HT
+  HT -. "verifier container only" .-> VR
+  VR -. "reward rows" .-> DB
+  VR -. "episode · attempt · reward spans" .-> OC
+  RP -. "replay jobs" .-> JOB
 ```
+
+The dotted *Learning epic* nodes are planned and not built. Their
+conflicts with B33, B35, the budgets and the provenance rules are the
+*Open* notes in `docs/design.md` "Learning loop".
 
 ## Build-time choices
 
@@ -494,6 +509,54 @@ file (runbook). The Cloudflare token is optional, because Haiku covers.
   - `tower/check.sh` passes;
   - one local task opens a PR;
   - tokens/s, J/token and GPU-s/token are recorded and shown.
+
+### Learning epic (after phase 5; design only)
+
+This is an epic, not an eighth phase. The spec is `docs/design.md`
+"Learning loop"; the rows are in `docs/feature-map.md` "Learning";
+`docs/learning/README.md` is the index.
+- **First, three experiments, in order.** Each runs only after the
+  first ParkAgent run, only through vigild, and after the owner
+  confirms:
+  - #9, hidden-test validity: below ~80%, nothing else proceeds;
+  - #10, reward validity: drop components under ~0.7 AUROC;
+  - #11, swap gap: needs phase 5, and one harness for Claude and local
+    models (phase 4).
+- **Then the epic's features:**
+  - hidden tests;
+  - the reward computer and its graded signals;
+  - the attempt protocol;
+  - episode, attempt and reward spans;
+  - playbooks and the middle loop;
+  - retroactive reward on top of phase 6's watcher;
+  - weekly replay and task synthesis;
+  - the public anchor (with #8);
+  - the harness-lift baseline;
+  - packet-template evolution;
+  - the learning metrics;
+  - the tower loop.
+- **Flows it would change, once built.** Those PRs update this file:
+  - stage 1 gains a vigild-only hidden-test record;
+  - the verifier (B33) emits `reward.json`;
+  - the runner's retry (B35) becomes the attempt protocol;
+  - the post-merge watcher gains bisection and a 30-day reward;
+  - a weekly replay runs beside the job FSM;
+  - new tables arrive as appended `MIGRATIONS` steps.
+- **Until the owner decides the *Open* notes,** nothing in this epic
+  changes B33, B35, B14's caps or the provenance rules.
+- **Tools.** mutmut, Stryker, cargo-mutants, SWE-smith, Change2Task,
+  mini-swe-agent, Harbor and GEPA/DSPy are planned, not adopted. Each
+  needs an exact pin in `docs/sources.md` and a one-line reason when
+  it's adopted.
+- **Spend.** The issues estimate it:
+  - #9: about $4–10;
+  - #10: about $8–90;
+  - #11: about $60–80.
+
+  #10 and #11 need a budget of their own that never draws from the
+  daily cap, as #8's bench does.
+- **Done when:** each experiment's decision rule has been applied and
+  recorded under `docs/learning/`. The rest is defined with the owner.
 
 ### Phase 6: Post-merge, fix jobs, auto-merge (worker: Sonnet)
 
