@@ -4,7 +4,7 @@ Every answer is written to `decisions` with the action taken."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -19,6 +19,20 @@ from vigild.repos import RepoPolicyError, check_decider_route
 ACT = 0.85
 ESCALATE = 0.6
 HAIKU = "haiku"
+
+
+def decider_routes(
+    cfg: Config, repo: str, available: Collection[str]
+) -> tuple[str | None, str | None]:
+    """(primary, escalation) for a repo: the first route it lists, other than
+    Haiku, that vigild has built (Jev: OpenRouter for a public repo,
+    Cloudflare for a private one), with Haiku as the escalation when listed;
+    Haiku alone when no Jev route is available. `decide` and `vigil doctor`
+    both read this (owner, 2026-10-23)."""
+    listed = [r for r in cfg.repo(repo).decider if r in available]
+    primary = next((r for r in listed if r != HAIKU), None) or (HAIKU if HAIKU in listed else None)
+    escalation = HAIKU if primary not in (None, HAIKU) and HAIKU in listed else None
+    return primary, escalation
 
 
 class Action(StrEnum):
@@ -95,10 +109,8 @@ class Decider:
         job_id: str | None = None,
         task_id: str | None = None,
     ) -> Decision:
-        listed = [r for r in self.cfg.repo(repo).decider if r in self.backends]
-        primary = next((r for r in listed if r != HAIKU), None) or (
-            HAIKU if HAIKU in listed else None
-        )
+        primary, escalation = decider_routes(self.cfg, repo, self.backends)
+        listed = [escalation] if escalation else []
         if primary is None:
             return self._wait(q, job_id, task_id)
         a = self._ask(primary, q, state, repo, job_id)

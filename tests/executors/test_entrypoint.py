@@ -309,3 +309,51 @@ def test_a_review_commits_nothing_and_answers_on_the_result_line(
     assert "head" not in result
     assert not (ep.OUT / "result.bundle").exists()
     assert _run(work, "rev-parse", BRANCH) == base
+
+
+# --- phase 2a, items 2-3: transcripts go out as they're written; resume reads them back ---
+
+
+def test_the_transcript_store_mirrors_lines_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncio
+
+    ep = _entrypoint()
+    store = ep.TranscriptStore(TOKEN)
+    entries = [{"type": "user", "uuid": "u1", "message": {"content": f"token {TOKEN}"}}]
+    asyncio.run(store.append({"project_key": "-work", "session_id": "sdk-1"}, entries))
+    (line,) = capsys.readouterr().out.splitlines()
+    out = json.loads(line)["vigil_transcript"]
+    assert out["session_id"] == "sdk-1" and out["subpath"] is None
+    assert TOKEN not in line and out["entries"][0]["uuid"] == "u1"
+    # it never loads: a store-backed resume lands in a root-only temp dir
+    assert asyncio.run(store.load({"project_key": "-work", "session_id": "sdk-1"})) is None
+
+
+SID = "0b6f1a52-6c4e-4c5e-9a43-1f2d3e4c5b6a"
+
+
+def test_a_resume_places_vigilds_transcript_where_the_cli_looks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ep = _entrypoint()
+    ep.WORK = Path("/work")
+    ep.RESUME = tmp_path / "resume.jsonl"
+    ep.RESUME.write_text('{"type": "user", "uuid": "u1"}\n{"type": "assistant", "uuid": "a1"}\n')
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "home" / ".claude"))
+    monkeypatch.setenv("VIGIL_GATEWAY_URL", "http://gw")
+    monkeypatch.setenv("VIGIL_RESUME_SESSION", SID)
+    monkeypatch.setenv("VIGIL_RESUME_FORK", "1")
+    assert ep.place_resume() == SID
+    placed = tmp_path / "home" / ".claude" / "projects" / "-work" / f"{SID}.jsonl"
+    assert placed.read_text() == ep.RESUME.read_text()
+    opts = ep.agent_options("worker", TOKEN, print)
+    assert opts["resume"] == SID and opts["fork_session"] is True
+    assert opts["session_store_flush"] == "eager" and opts["session_store"] is not None
+    monkeypatch.setenv("VIGIL_RESUME_SESSION", "../../etc/passwd")
+    with pytest.raises(ep.HarnessRefused):
+        ep.place_resume()
+    monkeypatch.delenv("VIGIL_RESUME_SESSION")
+    assert ep.place_resume() is None
+    assert "resume" not in ep.agent_options("worker", TOKEN, print)

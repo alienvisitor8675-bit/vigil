@@ -3,9 +3,9 @@ gateway's in-process `call`, and each Jev route through `Gateway.metered`, so
 every decider call is route-checked, reserved and booked. A Jev route without
 its credentials is left out, and Haiku answers alone.
 
-Nothing in phase 1 asks the decider a question: its first caller is the
-phase 2 scheduler (intake scoring and routing). Until then vigild doesn't
-build one at startup; this is the one place it will.
+Its first caller is the phase 2a fleet: label intake asks it for an issue's
+value and risk when no label gives them (vigild/intake/github.py). vigild
+builds it here and nowhere else.
 """
 
 from __future__ import annotations
@@ -20,15 +20,26 @@ from vigild.decider.policy import Backend, Decider
 from vigild.gateway.service import Gateway
 
 
+def available_routes(secrets: Secrets) -> set[str]:
+    """The decider routes vigild builds with these credentials."""
+    routes = {"haiku"}
+    if secrets.get("CLOUDFLARE_ACCOUNT_ID") and secrets.get("CLOUDFLARE_API_TOKEN"):
+        routes.add("jev-cloudflare")
+    if secrets.get("OPENROUTER_API_KEY"):
+        routes.add("jev-openrouter")
+    return routes
+
+
 def build_decider(
     cfg: Config, store: Store, gateway: Gateway, secrets: Secrets, client: httpx2.Client
 ) -> Decider:
     backends: dict[str, Backend] = {"haiku": HaikuBackend(gateway)}
+    routes = available_routes(secrets)
     account, cf_token = secrets.get("CLOUDFLARE_ACCOUNT_ID"), secrets.get("CLOUDFLARE_API_TOKEN")
-    if account and cf_token:
+    if "jev-cloudflare" in routes and account and cf_token:
         backends["jev-cloudflare"] = JevCloudflare(
             client, account_id=account, token=cf_token, meter=gateway.metered
         )
-    if or_key := secrets.get("OPENROUTER_API_KEY"):
+    if "jev-openrouter" in routes and (or_key := secrets.get("OPENROUTER_API_KEY")):
         backends["jev-openrouter"] = JevOpenRouter(client, token=or_key, meter=gateway.metered)
     return Decider(cfg, store, backends)

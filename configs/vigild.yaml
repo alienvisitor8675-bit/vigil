@@ -25,3 +25,8 @@ container:
   uid: 10001
   verifier_memory: 6g   # checkout + dependencies + a database, in tmpfs
   verifier_concurrency: 1   # one verifier container at a time on this machine
+scheduler:                        # the fleet (plan 2a, items 2-3)
+  sessions: 3                     # coord, worker, reviewer and auditor sessions at once, every job
+  intake_poll_seconds: 300        # issues labelled vigil:ready, in repos with `intake: true`
+  pr_poll_seconds: 120            # merged and closed fleet PRs (a deps job's merge resumes its parent)
+  resume_attempts: 2              # a crashed or killed worker resumes at most this often

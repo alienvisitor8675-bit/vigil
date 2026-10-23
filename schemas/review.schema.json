@@ -1,5 +1,45 @@
 {
   "$defs": {
+    "Checklist": {
+      "additionalProperties": false,
+      "description": "Every item answered (true when it holds); the schema names them, so a\nmodel can't answer a checklist of its own.",
+      "properties": {
+        "docs_updated": {
+          "title": "Docs Updated",
+          "type": "boolean"
+        },
+        "in_scope": {
+          "title": "In Scope",
+          "type": "boolean"
+        },
+        "no_weakened_tests": {
+          "title": "No Weakened Tests",
+          "type": "boolean"
+        },
+        "nothing_to_delete": {
+          "title": "Nothing To Delete",
+          "type": "boolean"
+        },
+        "one_way": {
+          "title": "One Way",
+          "type": "boolean"
+        },
+        "test_fails_first": {
+          "title": "Test Fails First",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "test_fails_first",
+        "no_weakened_tests",
+        "in_scope",
+        "docs_updated",
+        "one_way",
+        "nothing_to_delete"
+      ],
+      "title": "Checklist",
+      "type": "object"
+    },
     "Finding": {
       "additionalProperties": false,
       "properties": {
@@ -91,11 +131,7 @@
       "type": "boolean"
     },
     "checklist": {
-      "additionalProperties": {
-        "type": "boolean"
-      },
-      "title": "Checklist",
-      "type": "object"
+      "$ref": "#/$defs/Checklist"
     },
     "findings": {
       "items": {

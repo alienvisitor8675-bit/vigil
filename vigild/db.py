@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS audits (
   match_rate REAL NOT NULL, missed_high INTEGER NOT NULL, missed_medium INTEGER NOT NULL,
   false_findings INTEGER NOT NULL, ts TEXT NOT NULL, {PROV})"""
 
+INTAKE_DDL = """CREATE TABLE IF NOT EXISTS intake_seen (
+  repo TEXT NOT NULL, number INTEGER NOT NULL, job_id TEXT, seen_at TEXT NOT NULL,
+  PRIMARY KEY (repo, number))"""
+
+TRANSCRIPT_DDL = f"""CREATE TABLE IF NOT EXISTS transcripts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, sdk_session_id TEXT NOT NULL,
+  subpath TEXT, entry TEXT NOT NULL, ts TEXT NOT NULL, {PROV});
+CREATE INDEX IF NOT EXISTS transcripts_session ON transcripts(session_id, id)"""
+
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY, repo TEXT NOT NULL, base TEXT NOT NULL, title TEXT NOT NULL,
@@ -106,6 +115,8 @@ CREATE TABLE IF NOT EXISTS ui_sessions (
   id_hash TEXT PRIMARY KEY, scope TEXT NOT NULL, created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL, revoked_at TEXT);
 {LADDER_DDL};
+{INTAKE_DDL};
+{TRANSCRIPT_DDL};
 CREATE INDEX IF NOT EXISTS events_job ON events(job_id, id);
 CREATE INDEX IF NOT EXISTS calls_session ON model_calls(session_id);
 CREATE INDEX IF NOT EXISTS res_day ON reservations(day, status);
@@ -153,11 +164,23 @@ def _m4_trust_ladder(conn: sqlite3.Connection) -> None:
     _create(conn, LADDER_DDL)
 
 
+def _m5_label_intake(conn: sqlite3.Connection) -> None:
+    """Phase 2a, item 2: each labelled issue becomes a job exactly once."""
+    _create(conn, INTAKE_DDL)
+
+
+def _m6_transcripts(conn: sqlite3.Connection) -> None:
+    """Phase 2a, items 2-3: every session's transcript, for resume and forks."""
+    _create(conn, TRANSCRIPT_DDL)
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
     _m3_job_blocked_on,
     _m4_trust_ladder,
+    _m5_label_intake,
+    _m6_transcripts,
 ]
 
 
@@ -470,6 +493,44 @@ class Store:
             " tokens_out=tokens_out+? WHERE id=?",
             (cost, tokens_in, tokens_out, session_id),
         )
+
+    # --- transcripts (phase 2a) -----------------------------------------------
+
+    def add_transcript(
+        self,
+        session_id: str,
+        sdk_session_id: str,
+        subpath: str | None,
+        entries: list[Any],
+        provenance: Provenance | str = Provenance.CLAUDE,
+    ) -> None:
+        """Transcript lines the harness mirrored from the SDK (its session
+        store), in order. Entries are opaque JSON; the SDK reads them back."""
+        now, prov = iso(), require(provenance).value
+        with self.tx() as c:
+            c.executemany(
+                "INSERT INTO transcripts (session_id, sdk_session_id, subpath, entry, ts,"
+                " provenance) VALUES (?,?,?,?,?,?)",
+                [(session_id, sdk_session_id, subpath, json.dumps(e), now, prov) for e in entries],
+            )
+
+    def transcript(self, session_id: str) -> tuple[str | None, list[Any]]:
+        """A session's main transcript (no subagents): the SDK session id it
+        last wrote under, and that session's entries in order."""
+        rows = self.q(
+            "SELECT sdk_session_id FROM transcripts WHERE session_id=? AND subpath IS NULL"
+            " ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        )
+        if not rows:
+            return None, []
+        sdk = str(rows[0]["sdk_session_id"])
+        entries = self.q(
+            "SELECT entry FROM transcripts WHERE session_id=? AND sdk_session_id=?"
+            " AND subpath IS NULL ORDER BY id",
+            (session_id, sdk),
+        )
+        return sdk, [json.loads(r["entry"]) for r in entries]
 
     # --- events -------------------------------------------------------------
 

@@ -32,6 +32,7 @@ and writes its events (secrets redacted).
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import threading
@@ -60,9 +61,10 @@ from vigild.contract.models import (
 )
 from vigild.db import Store, iso
 from vigild.devimage import DevImages, SessionImages, StaleDevImage, missing_tools
-from vigild.executors.base import ExecOutcome, Executor, SessionSpec
+from vigild.executors.base import ExecOutcome, Executor, Resume, SessionSpec
 from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
 from vigild.github.publish import PublishError
+from vigild.intake.github import issue_text
 from vigild.jobs.acceptance import check_worker, runner_config_changes
 from vigild.jobs.artifacts import parse_plan, render
 from vigild.jobs.deps import infer_deps, is_lockfile
@@ -81,6 +83,8 @@ from vigild.redact import redact
 from vigild.repos import RepoPolicyError, check_backend
 from vigild.review.ladder import Ladder, LadderChange, classify_shape
 from vigild.router.rules import RoutingError, route
+from vigild.scheduler import wip
+from vigild.scheduler.graph import Slots, run_graph
 from vigild.telemetry.spans import Telemetry
 from vigild.verifier import Verifier
 from vigild.workspace import Workspace, WorkspaceError
@@ -173,6 +177,7 @@ class JobRunner:
         self._running_lock = threading.Lock()
         self.closers: list[Callable[[], None]] = []  # e.g. the docker client (item 0)
         self.ladder = Ladder(store, cfg)
+        self.slots = Slots(cfg.vigild.scheduler.sessions)  # across every job (item 2)
 
     def close(self) -> None:
         for close in self.closers:
@@ -357,6 +362,9 @@ class JobRunner:
 
     def _event_sink(self, s: SessionRow) -> Callable[[dict[str, Any]], None]:
         def sink(e: dict[str, Any]) -> None:
+            if e.get("type") == "transcript":
+                self._transcript(s, e.get("data") or {})
+                return
             self.store.add_event(
                 str(e.get("type", "state")),
                 redact(e.get("data") or {}),
@@ -368,28 +376,59 @@ class JobRunner:
 
         return sink
 
+    def _transcript(self, s: SessionRow, data: dict[str, Any]) -> None:
+        """Transcript lines the harness mirrored from the SDK: kept for resume
+        and forks (phase 2a), redacted like every event."""
+        sdk = data.get("session_id")
+        entries = data.get("entries")
+        if not isinstance(sdk, str) or not sdk or not isinstance(entries, list):
+            return
+        sub = data.get("subpath")
+        self.store.add_transcript(
+            s.id, sdk[:100], str(sub)[:200] if sub else None, redact(entries)[:5000]
+        )
+
+    def _resume_from(self, session_id: str | None, *, fork: bool = True) -> Resume | None:
+        """A Resume of a vigil session's stored transcript, if it has one."""
+        if session_id is None:
+            return None
+        sdk, entries = self.store.transcript(session_id)
+        if sdk is None or not entries:
+            return None
+        return Resume(session_id=sdk, entries=entries, fork=fork, from_session=session_id)
+
+    def _last_worker(self, task_id: str) -> SessionRow | None:
+        rows = self.store.q(
+            "SELECT id FROM sessions WHERE task_id=? AND role='worker' ORDER BY rowid DESC LIMIT 1",
+            (task_id,),
+        )
+        return self.store.get_session(rows[0]["id"]) if rows else None
+
     def _run_session(
         self, s: SessionRow, spec: SessionSpec, reservation: int, attrs: dict[str, Any]
     ) -> ExecOutcome:
-        """Token, telemetry, run, revoke, settle. The reservation is already made."""
-        token = self.gateway.issue_token(
-            s.id, spec.repo, spec.preset, ttl_minutes=spec.max_minutes + TOKEN_TTL_MARGIN_MIN
-        )
-        self.store.update_session(
-            s.id, status="running", started_at=iso(), clone_path=str(spec.clone)
-        )
-        try:
-            with self.telemetry.session(s.id, attrs) as tr:
-                spec.traceparent = tr.traceparent
-                self.store.update_session(s.id, detail={"trace_id": tr.trace_id})
-                with self.telemetry.span(tr, "vigil.spawn", {"vigil.image": spec.image or ""}):
-                    out = self.executor.run(spec, token, self._event_sink(s))
-                tr.set("vigil.status", out.status)
-            return out
-        finally:
-            self.gateway.revoke(s.id)
-            self.budget.settle(reservation)
-            self.store.update_session(s.id, ended_at=iso())
+        """A session slot, then token, telemetry, run, revoke, settle. The
+        reservation is already made; the token is issued once the slot is
+        taken, so waiting for one doesn't eat its life."""
+        with self.slots.session():
+            token = self.gateway.issue_token(
+                s.id, spec.repo, spec.preset, ttl_minutes=spec.max_minutes + TOKEN_TTL_MARGIN_MIN
+            )
+            self.store.update_session(
+                s.id, status="running", started_at=iso(), clone_path=str(spec.clone)
+            )
+            try:
+                with self.telemetry.session(s.id, attrs) as tr:
+                    spec.traceparent = tr.traceparent
+                    self.store.update_session(s.id, detail={"trace_id": tr.trace_id})
+                    with self.telemetry.span(tr, "vigil.spawn", {"vigil.image": spec.image or ""}):
+                        out = self.executor.run(spec, token, self._event_sink(s))
+                    tr.set("vigil.status", out.status)
+                return out
+            finally:
+                self.gateway.revoke(s.id)
+                self.budget.settle(reservation)
+                self.store.update_session(s.id, ended_at=iso())
 
     def _replan_context(self, job_id: str) -> dict[str, Any]:
         """The failures the owner sent back with the latest re-plan, if any."""
@@ -512,6 +551,9 @@ class JobRunner:
             **{f"previous_{k}": v for k, v in previous.items()},
         }
         untrusted: dict[str, str] = {}
+        issue = issue_text(self.store, job_id)
+        if issue is not None:
+            untrusted["github issue"] = issue  # label intake: the issue's own text
         if replan:
             # vigild's summary goes in the contract; the failure details carry
             # worker and test output, so they go in the untrusted section
@@ -666,40 +708,90 @@ class JobRunner:
         self.dispatch(job_id)
 
     def dispatch(self, job_id: str) -> None:
-        """Run every live task not yet published, in dependency waves. After a
-        wave with a failure, the job blocks and the owner chooses (N5)."""
+        """Run every live task not yet published as a dependency graph (plan
+        2a, item 2): each starts once its own dependencies are published, and
+        tasks that become ready together reserve their budgets together. A
+        task that would open a new PR waits while the repo is at its WIP
+        limit. After a failure nothing new starts, and the job blocks once
+        what's running finishes; the owner chooses (N5)."""
+        job = self.store.get_job(job_id)
         tasks = {t.id: t for t in self.store.list_tasks(job_id) if t.state not in DEAD_TASK}
         done = {t for t, row in tasks.items() if row.state in PUBLISHED}
-        pending = [t for t in tasks if t not in done]
-        while pending:
-            wave = [t for t in pending if set(tasks[t].contract.get("depends_on", [])) <= done]
-            if not wave:
-                # Nothing can start: a dependency is missing from the plan (item 17).
-                stuck = {t: self.store.get_task(t).state for t in pending}
-                self._page(
-                    job_id,
-                    f"{job_id}: work is stuck behind unfinished dependencies",
-                    {"pending": stuck, "actions": ["replan", "abandon"]},
-                )
-                self._block(job_id, f"stuck: {sorted(stuck)}")
-                return
-            pending = [t for t in pending if t not in wave]
+        deps = {t: list(row.contract.get("depends_on", [])) for t, row in tasks.items()}
+        limit = self.cfg.budgets.wip_per_repo
+        wip_held: set[str] = set()
+
+        def launch(batch: list[str]) -> dict[str, Callable[[], bool]] | None:
+            free = wip.room(self.store, job.repo, limit)
+            admitted: list[str] = []
+            for tid in batch:
+                if wip.opens_a_pr(self.store, tid):
+                    if free <= 0:
+                        wip_held.add(tid)
+                        continue
+                    free -= 1
+                admitted.append(tid)
+            if not admitted:
+                return {}
             try:
-                reservations = self._reserve_wave(job_id, wave)
+                held = self._reserve_wave(job_id, admitted)
             except Refused:
-                return
-            with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-                futures = [pool.submit(self._run_worker, job_id, t, *reservations[t]) for t in wave]
-                results = [f.result() for f in futures]
-            done |= {t for t, ok in zip(wave, results, strict=True) if ok}
-            failed = [t for t, ok in zip(wave, results, strict=True) if not ok]
-            if failed:
-                self._hold_failed(job_id, failed)
-                return
+                return None
+            for tid in admitted:
+                if self.store.get_task(tid).state == "failed":
+                    # another attempt; the third is routed by rule 5 (escalated)
+                    attempt = int(self.store.get_task(tid).contract.get("attempt") or 1)
+                    self._reroute(job_id, tid, attempt=attempt + 1)
+                self.store.update_task(tid, state="running")  # takes its place in the stack
+            return {
+                tid: functools.partial(self._run_worker, job_id, tid, *held[tid])
+                for tid in admitted
+            }
+
+        result = run_graph(deps, done, launch)
+        if result.failed:
+            self._hold_failed(job_id, result.failed)
+            return
+        if result.halted:
+            return  # a budget refusal blocked the job and paged
+        waiting = [t for t in result.waiting if t in wip_held]
+        if waiting:
+            for tid in waiting:
+                self.store.update_task(tid, state="waiting")
+            self._wip_hold(job_id, job.repo, waiting)
+            return
+        if result.waiting:
+            # Nothing can start: a dependency is missing from the plan (item 17).
+            stuck = {t: self.store.get_task(t).state for t in result.waiting}
+            self._page(
+                job_id,
+                f"{job_id}: work is stuck behind unfinished dependencies",
+                {"pending": stuck, "actions": ["replan", "abandon"]},
+            )
+            self._block(job_id, f"stuck: {sorted(stuck)}")
+            return
         live = [t for t in self.store.list_tasks(job_id) if t.state not in DEAD_TASK]
         if all(t.state in PUBLISHED for t in live):
             transition(self.store, job_id, JobState.IN_REVIEW, Actor.VIGILD)
             self.review(job_id)
+
+    def _wip_hold(self, job_id: str, repo: str, waiting: list[str]) -> None:
+        """The repo is at its WIP limit: the job waits, and the inbox shows the
+        stack (design "Intake", rule 2). Merge or close one, then retry."""
+        limit = self.cfg.budgets.wip_per_repo
+        self._block(job_id, f"WIP limit: {limit} open fleet PRs in {repo}")
+        self._page(
+            job_id,
+            f"{repo}: {limit} open fleet PRs (the WIP limit); {len(waiting)} task(s) wait",
+            {
+                "kind": "wip",
+                "repo": repo,
+                "stack": wip.stack(self.store, repo),
+                "waiting": waiting,
+                "actions": ["retry", "abandon"],
+            },
+            resumable=True,
+        )
 
     def remaining(self, task_id: str) -> tuple[float, float, float]:
         """(cap, spent, left) for a task: a retry gets what's left, never a fresh cap."""
@@ -876,6 +968,7 @@ class JobRunner:
         contract = t.contract
         preset = t.backend_preset or self.cfg.routing.fallback
         branch = contract["branch"]
+        prev = self._last_worker(task_id)
         s = self.store.create_session(
             job_id,
             Role.WORKER,
@@ -928,6 +1021,18 @@ class JobRunner:
         packet = assemble_worker(
             clone, contract, untrusted={}, approval_edits=edits, fix_round=self._fix_round(t)
         )
+        # The same worker goes on: a fix round (or a retry after one) forks its
+        # last session's transcript, and so does an escalated attempt, from
+        # the failed attempt's whole context, not a summary (item 2).
+        escalated = str(t.tier_reason or "").startswith("rule5")
+        resume = self._resume_from(prev.id) if prev and (published or escalated) else None
+        if resume is not None:
+            self.store.add_event(
+                "fork",
+                {"from_session": resume.from_session, "sdk_session_id": resume.session_id,
+                 "entries": len(resume.entries), "escalated": escalated},
+                Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
+            )  # fmt: skip
         self.store.add_event(
             "packet",
             {"role": "worker", "dropped": packet.dropped},
@@ -953,6 +1058,7 @@ class JobRunner:
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=session_image,  # the verifier runs the plain dev image, `image`
+            resume=resume,
         )
         attrs = {
             "vigil.job_id": job_id,
@@ -1365,19 +1471,24 @@ class JobRunner:
     def _reroute_for_round(self, job_id: str, task_id: str, rounds: int) -> None:
         """A review round with findings is counted on the contract and the task
         is routed again: the second round trips routing rule 5 (escalation)."""
+        self._reroute(job_id, task_id, review_rounds=rounds)
+        self.store.update_task(task_id, state="fix")
+
+    def _reroute(self, job_id: str, task_id: str, **changes: Any) -> None:
+        """Route a task again after its contract's counters move (a review
+        round, another attempt). Crossing into rule 5 is an escalation."""
         t = self.store.get_task(task_id)
-        contract = {**t.contract, "review_rounds": rounds}
+        contract = {**t.contract, **changes}
         r = route(Task.model_validate(contract), self.cfg)
         contract.update(tier=r.tier, tier_reason=r.tier_reason, backend=r.preset)
         self.store.update_task(task_id, contract=contract)
         self.store.route_task(
             task_id, tier=r.tier, tier_reason=r.tier_reason, backend_preset=r.preset
         )
-        self.store.update_task(task_id, state="fix")
         if r.tier_reason.startswith("rule5") and not str(t.tier_reason or "").startswith("rule5"):
             self.store.add_event(
                 "escalation",
-                {"task_id": task_id, "rounds": rounds, "from": t.backend_preset, "to": r.preset,
+                {"task_id": task_id, **changes, "from": t.backend_preset, "to": r.preset,
                  "tier_reason": r.tier_reason},
                 Provenance.HUMAN, job_id=job_id, task_id=task_id,
             )  # fmt: skip

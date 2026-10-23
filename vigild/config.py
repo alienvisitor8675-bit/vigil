@@ -70,6 +70,9 @@ class RepoPolicy(_M):
     # Commands a test_cmd may use in the image. A test_cmd that needs anything
     # else is refused at the spec gate (review r1, blocker 4).
     dev_image_tools: list[str]
+    # Poll the repo's open issues labelled `vigil:ready` into jobs (plan 2a,
+    # item 2). Off unless a repo turns it on.
+    intake: bool = False
 
 
 class ReposFile(_M):
@@ -211,6 +214,15 @@ class ContainerLimits(_M):
     verifier_concurrency: int = Field(default=1, ge=1)
 
 
+class Scheduler(_M):
+    """The fleet (plan 2a, items 2-3)."""
+
+    sessions: int = Field(default=3, ge=1)  # sessions at once, across every job
+    intake_poll_seconds: int = Field(default=300, ge=10)  # the vigil:ready label
+    pr_poll_seconds: int = Field(default=120, ge=10)  # merged PRs (deps auto-resume)
+    resume_attempts: int = Field(default=2, ge=0)  # crash resumes per task
+
+
 class Vigild(_M):
     data_dir: str
     api: Bind
@@ -220,6 +232,7 @@ class Vigild(_M):
     collector: Collector
     github: GitHub
     container: ContainerLimits
+    scheduler: Scheduler = Field(default_factory=Scheduler)
 
     @property
     def data_path(self) -> Path:

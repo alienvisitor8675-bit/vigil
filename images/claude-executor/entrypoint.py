@@ -269,6 +269,69 @@ def prepare_session() -> None:
         raise HarnessRefused(f"the session-prepare hook failed: {(p.stdout + p.stderr)[-500:]}")
 
 
+RESUME = Path("/vigil/resume.jsonl")
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+class TranscriptStore:
+    """The SDK's session store (phase 2a, items 2-3), for mirroring only:
+    every transcript line the CLI writes goes out on PID 1's stdout,
+    redacted, so vigild keeps each session's transcript as it happens, even
+    when the container is killed. It never loads: a store-backed resume would
+    write the transcript into a root-only temp dir the CLI (the agent uid)
+    can't read, so `place_resume` puts it where the CLI looks instead."""
+
+    def __init__(self, token: str) -> None:
+        self.token = token
+
+    async def append(self, key: dict[str, Any], entries: list[dict[str, Any]]) -> None:
+        emit(
+            "vigil_transcript",
+            redact(
+                {
+                    "session_id": key["session_id"],
+                    "subpath": key.get("subpath"),
+                    "entries": entries,
+                },
+                self.token,
+            ),
+        )
+
+    async def load(self, key: dict[str, Any]) -> list[dict[str, Any]] | None:
+        return None
+
+
+def project_dir() -> Path:
+    """Where the CLI keeps /work's transcripts: its config dir's projects/,
+    named the way the CLI and the SDK name a directory (non-alphanumerics to
+    hyphens)."""
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    return config / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(WORK))
+
+
+def place_resume() -> str | None:
+    """The transcript vigild mounted, copied (as the agent uid) to where the
+    CLI resumes from; the session id to resume, or None."""
+    sid = os.environ.get("VIGIL_RESUME_SESSION") or ""
+    if not sid:
+        return None
+    if not UUID.match(sid):
+        raise HarnessRefused("the session to resume isn't a session id")
+    dest = project_dir()
+    p = subprocess.run(
+        ["sh", "-c", 'mkdir -p "$1" && cp "$2" "$1/$3.jsonl"', "sh", str(dest), str(RESUME), sid],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        **as_agent(),
+    )
+    if p.returncode != 0:
+        raise HarnessRefused(f"the transcript to resume can't be placed: {p.stderr[-300:]}")
+    return sid
+
+
 def agent_options(role: str, token: str, stderr: Any) -> dict[str, Any]:
     """The SDK's options for this session, as keyword arguments (pure, so
     tested without the SDK)."""
@@ -290,6 +353,12 @@ def agent_options(role: str, token: str, stderr: Any) -> dict[str, Any]:
         "env": child_env,
         "stderr": stderr,  # piped to the harness, never the container's streams
     }
+    resume_id = os.environ.get("VIGIL_RESUME_SESSION") or None
+    opts["session_store"] = TranscriptStore(token)
+    opts["session_store_flush"] = "eager"  # a killed session keeps what it said
+    if resume_id:
+        opts["resume"] = resume_id  # placed by place_resume() before the agent starts
+        opts["fork_session"] = os.environ.get("VIGIL_RESUME_FORK", "1") == "1"
     if role in READ_ONLY_ROLES:
         opts["tools"] = READ_ONLY_TOOLS
         opts["disallowed_tools"] = WRITE_TOOLS
@@ -399,6 +468,7 @@ def main() -> int:
 
     try:
         prepare_session()
+        place_resume()
     except HarnessRefused as e:
         emit("vigil_result", {"status": "failed", "error": f"harness: {e}"})
         return 6

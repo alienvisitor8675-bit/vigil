@@ -75,8 +75,36 @@ def test_doctor_checks_and_never_prints_values(cfg: Config, tmp_path: object) ->
     assert names["token mint+revoke: thomasbardhi01/claude-mods (contents:read)"].ok
     assert names["configs (incl. the private-repo rule)"].ok
     vis = names["visibility: thomasbardhi01/vigil"]
-    assert vis.ok and "keeps it private" in vis.note
-    assert not names["CLOUDFLARE_API_TOKEN"].ok  # missing: reported, not fatal
+    assert vis.ok and vis.note == "matches"
+    # owner, 2026-10-23: Jev on OpenRouter for public repos; no repo lists
+    # Cloudflare, so its entries are skipped, not failed
+    assert names["CLOUDFLARE_API_TOKEN"].ok is None
+    assert names["OPENROUTER_API_KEY"].ok is False  # missing: reported, not fatal
+    pa = names["decider: thomasbardhi01/parkagent → haiku"]  # no OpenRouter key here
+    assert pa.ok
+
+
+def test_doctor_checks_openrouter_and_names_each_repos_decider(cfg: Config) -> None:
+    seen: list[httpx2.Request] = []
+
+    def handler(req: httpx2.Request) -> httpx2.Response:
+        seen.append(req)
+        ok = req.headers.get("authorization") == "Bearer sk-or-fake-value-000"
+        return httpx2.Response(200 if ok else 401, json={"data": {}})
+
+    secrets = Secrets({"OPENROUTER_API_KEY": "sk-or-fake-value-000"})
+    http = httpx2.Client(transport=httpx2.MockTransport(handler))
+    checks = run_checks(cfg, secrets, http=http, docker=None, repos=[], include_claude_mods=False)
+    names = {c.name: c for c in checks}
+    assert names["OPENROUTER_API_KEY"].ok and names["OPENROUTER_API_KEY"].note == "GET /api/v1/key"
+    assert any(r.url.host == "openrouter.ai" and r.url.path == "/api/v1/key" for r in seen)
+    for repo in ("thomasbardhi01/parkagent", "thomasbardhi01/vigil"):
+        assert names[f"decider: {repo} → jev-openrouter (haiku escalation)"].ok
+    cfg.repos.repos["thomasbardhi01/vigil"].decider = ["haiku", "jev-cloudflare"]
+    names = {c.name: c for c in run_checks(cfg, secrets, http=http, docker=None, repos=[])}
+    assert names["CLOUDFLARE_API_TOKEN"].ok is False  # listed now, and missing
+    assert names["decider: thomasbardhi01/vigil → haiku"].ok  # no Cloudflare key: Haiku alone
+    assert "sk-or-fake-value-000" not in render(checks)
     out = render(checks)
     for v in [*SECRET_VALUES, "ghs_x"]:
         assert v not in out

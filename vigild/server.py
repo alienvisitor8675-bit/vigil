@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -225,6 +226,27 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     return runner
 
 
+def start_pollers(v: Vigild, app: Any, runner: JobRunner) -> threading.Event:
+    """vigild's background loops (plan 2a): label intake for repos that turn
+    it on. Each runs in its own daemon thread until the event is set."""
+    from vigild.intake.github import LabelIntake, RestIssues, every
+
+    stop = threading.Event()
+    sched = v.cfg.vigild.scheduler
+    if app is not None and any(p.intake for p in v.cfg.repos.repos.values()):
+        import httpx2
+
+        from vigild.decider.wiring import build_decider
+
+        decider = build_decider(v.cfg, v.store, v.gateway, v.secrets, httpx2.Client(timeout=30))
+        intake = LabelIntake(v.cfg, v.store, v.services.jobs, RestIssues(app), decider)
+        threading.Thread(
+            target=every, args=(sched.intake_poll_seconds, intake.poll, stop),
+            name="vigil-intake", daemon=True,
+        ).start()  # fmt: skip
+    return stop
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     from vigild.repos import RepoPolicyError, verify_visibility
@@ -247,4 +269,9 @@ def main() -> None:
     # repo's dev image first: built and validated when its lockfiles change,
     # never on a timer (the nightly validation is gone).
     log.info("reconcile: %s", runner.reconcile())
-    asyncio.run(serve(v, on_ready=runner.start_deferred))
+
+    def ready() -> None:
+        runner.start_deferred()
+        start_pollers(v, app, runner)
+
+    asyncio.run(serve(v, on_ready=ready))

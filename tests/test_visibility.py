@@ -26,7 +26,7 @@ class FakeGitHub:
 
 
 def test_matching_visibility_passes(cfg: Config) -> None:
-    gh = FakeGitHub({"thomasbardhi01/parkagent": False, "thomasbardhi01/vigil": True})
+    gh = FakeGitHub({"thomasbardhi01/parkagent": False, "thomasbardhi01/vigil": False})
     verify_visibility(cfg, gh.is_private)
     assert sorted(gh.asked) == sorted(cfg.repos.repos)
 
@@ -35,6 +35,18 @@ def test_a_public_yaml_entry_for_a_private_repo_stops_vigild(cfg: Config) -> Non
     gh = FakeGitHub({"thomasbardhi01/parkagent": True, "thomasbardhi01/vigil": True})
     with pytest.raises(RepoPolicyError, match=r"parkagent.*private"):
         verify_visibility(cfg, gh.is_private)
+
+
+def test_vigil_going_private_again_stops_vigild_until_the_yaml_says_so(cfg: Config) -> None:
+    """Owner, 2026-10-23: the YAML says public for now; if the repo goes private,
+    vigild fails closed until the entry says `private` (and its decider moves
+    back to jev-cloudflare)."""
+    gh = FakeGitHub({"thomasbardhi01/parkagent": False, "thomasbardhi01/vigil": True})
+    with pytest.raises(RepoPolicyError, match=r"vigil.*private"):
+        verify_visibility(cfg, gh.is_private)
+    cfg.repos.repos["thomasbardhi01/vigil"].visibility = "private"
+    cfg.repos.repos["thomasbardhi01/vigil"].decider = ["haiku", "jev-cloudflare"]
+    verify_visibility(cfg, gh.is_private)
 
 
 def test_a_failed_check_stops_vigild(cfg: Config) -> None:
@@ -48,6 +60,8 @@ def test_yaml_stricter_than_github_warns_and_keeps_the_yaml(
 ) -> None:
     """vigil may be public on GitHub for a while; the YAML keeps it private,
     which is the stricter rule, so vigild starts and warns."""
+    cfg.repos.repos["thomasbardhi01/vigil"].visibility = "private"
+    cfg.repos.repos["thomasbardhi01/vigil"].decider = ["haiku", "jev-cloudflare"]
     gh = FakeGitHub({"thomasbardhi01/parkagent": False, "thomasbardhi01/vigil": False})
     with caplog.at_level("WARNING"):
         verify_visibility(cfg, gh.is_private)

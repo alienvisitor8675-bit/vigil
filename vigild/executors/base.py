@@ -14,6 +14,18 @@ from vigild.workspace import Mount
 
 
 @dataclass
+class Resume:
+    """A session that picks up an earlier one's transcript (phase 2a): the
+    SDK resumes `session_id` from `entries` (the transcript vigild stored),
+    forked into a new session id when `fork`."""
+
+    session_id: str
+    entries: list[dict[str, Any]]
+    fork: bool = True
+    from_session: str | None = None  # the vigil session it continues
+
+
+@dataclass
 class SessionSpec:
     session_id: str
     role: Role
@@ -34,6 +46,7 @@ class SessionSpec:
     # A reviewer's or auditor's answer, as JSON schema: the harness asks the
     # SDK for structured output and puts it on the result line (phase 2a).
     output_schema: dict[str, Any] | None = None
+    resume: Resume | None = None  # its transcript, resumed or forked (items 2-3)
 
 
 @dataclass

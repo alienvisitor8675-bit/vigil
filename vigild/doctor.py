@@ -151,14 +151,46 @@ def run_checks(
     else:
         out.append(Check("GITHUB_APP_ID+GITHUB_APP_KEY_PATH", False, "missing"))
 
-    for name in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"):
+    # Jev (owner, 2026-10-23): OpenRouter for public repos, Cloudflare only
+    # for private ones; Haiku is the escalation everywhere.
+    or_key = secrets.get("OPENROUTER_API_KEY")
+    if or_key:
         out.append(
-            Check(
-                name,
-                bool(secrets.get(name)),
-                "" if secrets.get(name) else "missing: Jev off, Haiku covers",
+            _safe(
+                "OPENROUTER_API_KEY",
+                lambda: (
+                    http.get(
+                        "https://openrouter.ai/api/v1/key",
+                        headers={"Authorization": f"Bearer {or_key}"},
+                        timeout=TIMEOUT,
+                    ).status_code
+                    == 200,
+                    "GET /api/v1/key",
+                ),
             )
         )
+    else:
+        out.append(Check("OPENROUTER_API_KEY", False, "missing: Jev off for public repos"))
+    cloudflare_used = any("jev-cloudflare" in p.decider for p in cfg.repos.repos.values())
+    for name in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"):
+        if not cloudflare_used:
+            out.append(Check(name, None, "no repo lists jev-cloudflare"))
+        else:
+            out.append(
+                Check(
+                    name,
+                    bool(secrets.get(name)),
+                    "" if secrets.get(name) else "missing: Jev off for private repos, Haiku covers",
+                )
+            )
+    from vigild.decider.policy import decider_routes
+    from vigild.decider.wiring import available_routes
+
+    have = available_routes(secrets)
+    for repo in cfg.repos.repos:
+        primary, escalation = decider_routes(cfg, repo, have)
+        tail = f" ({escalation} escalation)" if escalation else ""
+        out.append(Check(f"decider: {repo} → {primary or 'none'}{tail}", primary is not None))
 
     if secrets.get("PHOENIX_ADMIN_SECRET"):
         out.append(

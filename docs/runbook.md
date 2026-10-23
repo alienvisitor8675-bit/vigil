@@ -67,8 +67,8 @@ feature: vigild logs `config: <feature> is off`, `/api/health` lists it in
 | `VIGIL_API_TOKEN` | Admin bearer token for the REST API and the CLI; the one-time login for the web UI. | **You generate it** (below). | Full control of vigild. | 1 | `GET /api/health` → 200 |
 | `VIGIL_METRICS_TOKEN` | Read-only token: GET endpoints, `/metrics` (phase 3), and a read-only UI login. | **You generate it** (below). Hand it to Hearth yourself. | Read only. | 1 (reads), 3 (metering) | — |
 | `VIGIL_HEARTBEAT_TOKEN` | Lets an outside session post heartbeats for the UI's `/sessions` page. | **You generate it** (below). | Write heartbeats; nothing else. | 3 | — |
-| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | Jev on Workers AI (zero retention), the default decider. Without them, Haiku decides. | Cloudflare → My Profile → API Tokens → Custom token: **Account · Workers AI · Read** and **Edit**, that one account. | Workers AI only. | 1 (optional) | reported missing |
-| `OPENROUTER_API_KEY` | The OpenRouter preset and Jev's other route. | openrouter.ai → Keys, with a **credit limit**. | Never for a private repo: vigild refuses to start if `repos.yaml` lists it for one. | 4 | — |
+| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | Jev on Workers AI (zero retention): the decider route for **private** repos only. No repo lists it while both are public, and `vigil doctor` skips these then. | Cloudflare → My Profile → API Tokens → Custom token: **Account · Workers AI · Read** and **Edit**, that one account. | Workers AI only. | 1 (optional) | skipped unless a repo lists `jev-cloudflare`; then reported missing |
+| `OPENROUTER_API_KEY` | Jev on OpenRouter's Decisions API: **the decider for public repos** (owner, 2026-10-23), with Haiku as the escalation; later the OpenRouter preset (phase 4). | openrouter.ai → Keys, with a **credit limit**. Set. | Never for a private repo: vigild refuses to start if `repos.yaml` lists it for one. | 2a | `GET /api/v1/key` → 200, and one `decider:` line per repo naming its route |
 | `LLAMA_API_KEY` | llama-server's `--api-key`. In **both** the env file and the tower's `/etc/vigil/llama.env`. | **You generate it** (below), then copy the same line to the tower. | Tower only, over Tailscale. | 5 | — |
 
 ### Secrets you generate (owner, 2026-10-23)
@@ -284,4 +284,13 @@ uv run python -m vigild
 - The gateway is at 127.0.0.1:8788. Containers reach it as
   `host.docker.internal:8788` through their proxy; Docker Desktop forwards
   that to the Mac's loopback.
-- Running it under launchd arrives with phase 2, together with the CLI.
+- **The fleet** (`scheduler` in `configs/vigild.yaml`): three sessions at
+  once across every job; four open fleet PRs per repo (`wip_per_repo` in
+  `configs/budgets.yaml`). At the limit a job blocks with a page listing
+  the stack: merge or close one, then press **Retry**.
+- **Label intake** is off until a repo says `intake: true` in
+  `configs/repos.yaml`. Then every five minutes vigild turns each open
+  issue labelled `vigil:ready` into a job, once; `value:N` and `risk:N`
+  labels score it (3 each by default). Anyone who can label issues there
+  can start work, so turn it on only where that's you.
+- Running it under launchd arrives with phase 2b, together with the CLI.

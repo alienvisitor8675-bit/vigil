@@ -287,21 +287,27 @@ class Finding(Strict):
     fix: str = Field(min_length=1, max_length=4000)
 
 
+class Checklist(Strict):
+    """Every item answered (true when it holds); the schema names them, so a
+    model can't answer a checklist of its own."""
+
+    test_fails_first: bool
+    no_weakened_tests: bool
+    in_scope: bool
+    docs_updated: bool
+    one_way: bool
+    nothing_to_delete: bool
+
+
 class ReviewOutput(Strict):
     """What a reviewer session ends with (its structured output)."""
 
     verdict: Verdict
     findings: list[Finding] = Field(max_length=100)
-    checklist: dict[str, bool]
+    checklist: Checklist
 
     @model_validator(mode="after")
-    def _complete(self) -> ReviewOutput:
-        missing = [c for c in CHECKLIST if c not in self.checklist]
-        if missing:
-            raise ValueError(f"checklist incomplete: {missing}")
-        extra = sorted(set(self.checklist) - set(CHECKLIST))
-        if extra:
-            raise ValueError(f"unknown checklist items: {extra}")
+    def _consistent(self) -> ReviewOutput:
         if self.verdict == "clean" and any(f.severity in BLOCKING for f in self.findings):
             raise ValueError("a clean verdict has no finding of severity medium or higher")
         return self

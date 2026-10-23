@@ -28,6 +28,7 @@ from vigild.verifier import MAX_REPORT, REPORT_DIR, RunResult
 
 LABEL = "dev.vigil.session"
 OUTPUT_SCHEMA = "/vigil/output_schema.json"
+RESUME = "/vigil/resume.jsonl"
 HARNESS_CAPS = ("SETUID", "SETGID", "KILL")
 
 
@@ -85,6 +86,11 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         _mount(str(spec.session_dir / "out"), "/vigil/out", read_only=False),
         *[_mount(m.host, m.container, m.read_only) for m in spec.mounts],
     ]
+    if spec.resume is not None:
+        # the transcript to resume (phase 2a): read by the harness's session store
+        mounts.append(_mount(str(spec.session_dir / "resume.jsonl"), RESUME, read_only=True))
+        env["VIGIL_RESUME_SESSION"] = spec.resume.session_id
+        env["VIGIL_RESUME_FORK"] = "1" if spec.resume.fork else "0"
     if spec.output_schema is not None:
         # a reviewer's or auditor's answer schema (phase 2a): structured output
         mounts.append(
@@ -311,6 +317,9 @@ def write_session_files(cfg: Config, spec: SessionSpec) -> None:
     if spec.output_schema is not None:
         (sd / "output_schema.json").write_text(json.dumps(spec.output_schema))
         (sd / "output_schema.json").chmod(0o644)
+    if spec.resume is not None:
+        (sd / "resume.jsonl").write_text("".join(json.dumps(e) + "\n" for e in spec.resume.entries))
+        (sd / "resume.jsonl").chmod(0o644)
     (sd / "proxy" / "acl.yaml").write_text(acl_yaml(allowlist(cfg, spec.role)))
     (sd / "proxy" / "config.yaml").write_text(proxy_config_yaml(cfg))
     for p in (sd, sd / "proxy"):
@@ -447,6 +456,8 @@ class DockerRuntime:
                         continue
                     if "vigil_event" in msg:
                         on_event(msg["vigil_event"])
+                    elif "vigil_transcript" in msg:
+                        on_event({"type": "transcript", "data": msg["vigil_transcript"]})
                     elif "vigil_result" in msg:
                         result = msg["vigil_result"]
             code = int(worker.wait().get("StatusCode", -1))

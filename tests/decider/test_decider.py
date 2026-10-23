@@ -75,31 +75,31 @@ def _decider(cfg: Config, store: Store, primary: Fixed, haiku: Fixed) -> Decider
 
 
 def test_confident_primary_acts(cfg: Config, store: Store) -> None:
-    jev, haiku = Fixed("jev-cloudflare", 0.9), Fixed("haiku", 0.99)
+    jev, haiku = Fixed("jev-openrouter", 0.9), Fixed("haiku", 0.99)
     d = _decider(cfg, store, jev, haiku).decide(PA, QUESTIONS["size"], "issue text")
-    assert d.action is Action.ACT and d.answer.backend == "jev-cloudflare"
+    assert d.action is Action.ACT and d.answer.backend == "jev-openrouter"
     assert haiku.calls == []
 
 
 def test_middle_confidence_escalates_to_haiku(cfg: Config, store: Store) -> None:
-    jev, haiku = Fixed("jev-cloudflare", 0.7), Fixed("haiku", 0.9, "M")
+    jev, haiku = Fixed("jev-openrouter", 0.7), Fixed("haiku", 0.9, "M")
     d = _decider(cfg, store, jev, haiku).decide(PA, QUESTIONS["size"], "issue text")
     assert d.action is Action.ACT and d.answer.backend == "haiku" and d.answer.value == "M"
     rows = store.q("SELECT backend, action FROM decisions ORDER BY id")
     assert [(r["backend"], r["action"]) for r in rows] == [
-        ("jev-cloudflare", "escalated"),
+        ("jev-openrouter", "escalated"),
         ("haiku", "act"),
     ]
 
 
 def test_unsure_haiku_waits_for_the_owner(cfg: Config, store: Store) -> None:
-    jev, haiku = Fixed("jev-cloudflare", 0.7), Fixed("haiku", 0.7)
+    jev, haiku = Fixed("jev-openrouter", 0.7), Fixed("haiku", 0.7)
     d = _decider(cfg, store, jev, haiku).decide(PA, QUESTIONS["size"], "x")
     assert d.action is Action.WAIT
 
 
 def test_low_confidence_waits_without_escalating(cfg: Config, store: Store) -> None:
-    jev, haiku = Fixed("jev-cloudflare", 0.5), Fixed("haiku", 0.99)
+    jev, haiku = Fixed("jev-openrouter", 0.5), Fixed("haiku", 0.99)
     d = _decider(cfg, store, jev, haiku).decide(PA, QUESTIONS["size"], "x")
     assert d.action is Action.WAIT and haiku.calls == []
 
@@ -111,8 +111,8 @@ def test_haiku_alone_when_jev_is_unavailable(cfg: Config, store: Store) -> None:
 
 
 def test_a_route_the_repo_does_not_list_is_never_called(cfg: Config, store: Store) -> None:
-    rogue, haiku = Fixed("jev-openrouter", 0.99), Fixed("haiku", 0.9)
-    d = Decider(cfg, store, {"jev-openrouter": rogue, "haiku": haiku}).decide(
+    rogue, haiku = Fixed("jev-cloudflare", 0.99), Fixed("haiku", 0.9)
+    d = Decider(cfg, store, {"jev-cloudflare": rogue, "haiku": haiku}).decide(
         PA, QUESTIONS["size"], "x"
     )
     assert rogue.calls == [] and d.answer.backend == "haiku"
@@ -243,6 +243,7 @@ def test_jev_calls_go_through_the_gateways_meter(cfg: Config, store: Store) -> N
     from vigild.config import Secrets
     from vigild.gateway.service import Gateway
 
+    cfg.repos.repos[PA].decider = ["haiku", "jev-cloudflare"]  # a public repo may list it too
     gw = Gateway(cfg, store, Budget(store, cfg.budgets), Secrets({}))
     fixture = json.loads((FIX / "jev_cloudflare_choice.json").read_text())
     client = httpx2.Client(
@@ -263,8 +264,8 @@ def test_the_meter_refuses_a_route_the_repo_does_not_list(cfg: Config, store: St
 
     gw = Gateway(cfg, store, Budget(store, cfg.budgets), Secrets({}))
     client = httpx2.Client(transport=httpx2.MockTransport(lambda r: httpx2.Response(500)))
-    jev = JevOpenRouter(client, token="t", meter=gw.metered)
-    with pytest.raises(GatewayError, match="jev-openrouter"):
+    jev = JevCloudflare(client, account_id="a", token="t", meter=gw.metered)
+    with pytest.raises(GatewayError, match="jev-cloudflare"):
         jev.ask(QUESTIONS["size"], "x", repo=PA, job_id=None)
 
 
@@ -290,13 +291,13 @@ def test_a_gateway_refusal_is_a_decider_failure(cfg: Config, store: Store) -> No
     from vigild.gateway.service import GatewayError
 
     class Refused:
-        name = "jev-cloudflare"
+        name = "jev-openrouter"
 
         def ask(self, q: Question, state: str, *, repo: str, job_id: str | None) -> Answer:
             raise GatewayError(403, "permission_error", "budget: the day is spent")
 
     haiku = Fixed("haiku", 0.95)
-    d = Decider(cfg, store, {"jev-cloudflare": Refused(), "haiku": haiku}).decide(
+    d = Decider(cfg, store, {"jev-openrouter": Refused(), "haiku": haiku}).decide(
         PA, QUESTIONS["size"], "x"
     )
     assert haiku.calls == ["size"] and d.answer is not None and d.answer.backend == "haiku"
@@ -320,3 +321,30 @@ def test_the_production_wiring_meters_every_route(cfg: Config, store: Store) -> 
     for name in ("jev-cloudflare", "jev-openrouter"):
         assert d.backends[name].meter == gw.metered  # type: ignore[attr-defined]
     assert set(build_decider(cfg, store, gw, Secrets({}), client).backends) == {"haiku"}
+
+
+# --- owner, 2026-10-23: Jev on OpenRouter for public repos ---------------------------------
+
+
+def test_a_public_repo_listing_jev_openrouter_uses_it_first(cfg: Config, store: Store) -> None:
+    from vigild.decider.policy import decider_routes
+
+    assert cfg.repo(PA).visibility == "public" and "jev-openrouter" in cfg.repo(PA).decider
+    every = {"haiku", "jev-openrouter", "jev-cloudflare"}
+    assert decider_routes(cfg, PA, every) == ("jev-openrouter", "haiku")
+    assert decider_routes(cfg, PA, {"haiku"}) == ("haiku", None)  # no key: Haiku alone
+    jev, haiku = Fixed("jev-openrouter", 0.95), Fixed("haiku", 0.99)
+    d = _decider(cfg, store, jev, haiku).decide(PA, QUESTIONS["value"], "x")
+    assert d.answer.backend == "jev-openrouter" and jev.calls == ["value"] and haiku.calls == []
+
+
+def test_a_private_repo_may_not_list_jev_openrouter(cfg: Config) -> None:
+    from vigild.config import validate
+    from vigild.repos import RepoPolicyError
+
+    cfg.repos.repos["thomasbardhi01/vigil"].visibility = "private"
+    cfg.repos.repos["thomasbardhi01/vigil"].decider = ["haiku", "jev-openrouter"]
+    with pytest.raises(RepoPolicyError, match="jev-openrouter"):
+        validate(cfg)
+    cfg.repos.repos["thomasbardhi01/vigil"].decider = ["haiku", "jev-cloudflare"]
+    validate(cfg)

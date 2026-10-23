@@ -140,6 +140,20 @@ CLEAN_REVIEW: dict[str, Any] = {
 CLEAN_AUDIT: dict[str, Any] = {"findings": [], "false_findings": []}
 
 
+def transcript_lines(spec: SessionSpec) -> dict[str, Any]:
+    """A session's transcript as the harness mirrors it: forked from the one it
+    resumes (history first), then its own turn."""
+    sdk = f"sdk-{spec.session_id}"
+    history = list(spec.resume.entries) if spec.resume else []
+    own = [
+        {"type": "user", "uuid": f"u-{spec.session_id}", "message": {"role": "user",
+         "content": spec.packet[:40]}},
+        {"type": "assistant", "uuid": f"a-{spec.session_id}", "message": {"id": f"m-{spec.session_id}",
+         "role": "assistant", "content": [{"type": "text", "text": "done"}]}},
+    ]  # fmt: skip
+    return {"session_id": sdk, "subpath": None, "entries": history + own}
+
+
 def _work(clone: Path, doc: str, *, honest: bool = True) -> None:
     """A worker's change: its test first, then (if honest) the doc it checks."""
     test, text = TESTS[doc]
@@ -178,6 +192,8 @@ class StandIn:
         if spec.role in (Role.REVIEWER, Role.AUDITOR):
             answer = (self.review if spec.role is Role.REVIEWER else self.audit)(spec)
             return ExecOutcome("done", 0, {"status": "done", "structured_output": answer})
+        # what the harness's session store mirrors: the transcript, as it's written
+        on_event({"type": "transcript", "data": transcript_lines(spec)})
         task = json.loads((spec.clone / ".vigil" / "task.json").read_text())
         with self.lock:
             self.running += 1

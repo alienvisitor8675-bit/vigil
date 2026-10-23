@@ -252,7 +252,10 @@ class JobService:
         self.runner.on_job_created(job.id, False)
         return SubmitOutcome("spec_pending", task.task_id, job.id)
 
-    def submit_request(self, req: JobRequest) -> Job:
+    def submit_request(self, req: JobRequest, *, issue: dict[str, Any] | None = None) -> Job:
+        """A free-form request becomes a job its coord drafts. `issue` (label
+        intake, plan 2a item 2) is the GitHub issue it came from: stored as
+        `issue.json` before the coord starts, and fenced in its packet."""
         try:
             self.cfg.repo(req.repo)
         except ConfigError as e:
@@ -267,6 +270,8 @@ class JobService:
             source=req.source.value,
         )
         self.store.add_artifact(job.id, "intake.json", req.model_dump_json(), Provenance.HUMAN)
+        if issue is not None:
+            self.store.add_artifact(job.id, "issue.json", json.dumps(issue), Provenance.HUMAN)
         self.runner.on_job_created(job.id, True)
         return job
 

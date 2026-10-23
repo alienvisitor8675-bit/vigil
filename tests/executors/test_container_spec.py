@@ -244,3 +244,26 @@ def test_verifier_containers_run_one_at_a_time(cfg: Config, tmp_path: Path) -> N
     for t in threads:
         t.join()
     assert peak[0] == 1
+
+
+def test_a_resumed_session_gets_its_transcript_read_only(cfg: Config, spec: SessionSpec) -> None:
+    """Phase 2a, items 2-3: the transcript to resume is a read-only file the
+    harness's session store loads; nothing else about the container changes."""
+    import json
+
+    from vigild.executors.base import Resume
+    from vigild.executors.runtime import write_session_files
+
+    spec.resume = Resume("sdk-1", [{"type": "user", "uuid": "u1"}], fork=True)
+    write_session_files(cfg, spec)
+    kw = worker_kwargs(cfg, spec, network="vigil-s-abc123")
+    (m,) = [m for m in kw["mounts"] if m["Target"] == "/vigil/resume.jsonl"]
+    assert m["ReadOnly"] and m["Source"] == str(spec.session_dir / "resume.jsonl")
+    lines = (spec.session_dir / "resume.jsonl").read_text().splitlines()
+    assert [json.loads(x) for x in lines] == [{"type": "user", "uuid": "u1"}]
+    assert kw["environment"]["VIGIL_RESUME_SESSION"] == "sdk-1"
+    assert kw["environment"]["VIGIL_RESUME_FORK"] == "1"
+    spec.resume = None
+    kw = worker_kwargs(cfg, spec, network="vigil-s-abc123")
+    assert "VIGIL_RESUME_SESSION" not in kw["environment"]
+    assert not [m for m in kw["mounts"] if m["Target"] == "/vigil/resume.jsonl"]

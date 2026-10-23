@@ -15,7 +15,7 @@
 repos:
   thomasbardhi01/parkagent:
     visibility: public
-    decider: [haiku, jev-cloudflare]      # jev-openrouter once its key exists
+    decider: [haiku, jev-openrouter]      # Jev on OpenRouter first, Haiku the escalation
     backends: [claude-sonnet, claude-opus, claude-haiku]
     worker_overflow: []
     auto_merge: false
@@ -85,9 +85,14 @@ repos:
       - "**/conftest.py"
       - "**/.npmrc"
       - "**/node_modules/**"
+  # vigil is public for now (owner, 2026-10-23). When it goes private again,
+  # vigild's startup visibility check fails closed until this entry says
+  # `private`, and its decider moves back to jev-cloudflare (the private-repo
+  # rule refuses jev-openrouter for a private repo). The `anthropic` exception
+  # for vigil stays hard-coded in vigild/repos.py either way.
   thomasbardhi01/vigil:
-    visibility: private
-    decider: [haiku, jev-cloudflare]
+    visibility: public
+    decider: [haiku, jev-openrouter]
     backends: [claude-sonnet, claude-opus, claude-haiku]
     worker_overflow: []
     auto_merge: false

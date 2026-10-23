@@ -34,7 +34,10 @@ def _private(**kw: Any) -> dict[str, Any]:
 
 def test_shipped_repos_yaml_loads() -> None:
     cfg = config_mod.load()
-    assert cfg.repos.repos["thomasbardhi01/vigil"].visibility == "private"
+    # owner, 2026-10-23: vigil is public for now, its Jev on OpenRouter
+    assert cfg.repos.repos["thomasbardhi01/vigil"].visibility == "public"
+    assert cfg.repos.repos["thomasbardhi01/vigil"].decider == ["haiku", "jev-openrouter"]
+    assert cfg.repos.repos["thomasbardhi01/parkagent"].decider == ["haiku", "jev-openrouter"]
     raw = yaml.safe_load((CONFIG_DIR / "repos.yaml").read_text())
     assert "claude-sonnet" in raw["repos"]["thomasbardhi01/vigil"]["backends"]
 

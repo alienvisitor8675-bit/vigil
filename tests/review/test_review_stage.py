@@ -109,7 +109,7 @@ def test_two_rounds_with_findings_trigger_rule_5(world: World) -> None:
     assert t.contract["review_rounds"] == 2
     assert t.tier_reason is not None and t.tier_reason.startswith("rule5:escalated")
     (esc,) = [e for e in w.store.events(job_id=job) if e.type == "escalation"]
-    assert esc.data["task_id"] == f"{job}-w1" and esc.data["rounds"] == 2
+    assert esc.data["task_id"] == f"{job}-w1" and esc.data["review_rounds"] == 2
     assert len(_workers(w, "w1")) == 3
 
 
@@ -155,3 +155,28 @@ def test_reviewers_get_read_only_sessions_of_the_head(world: World) -> None:
         )
     )
     assert w.store.get_job(job).state.value == "ready"
+
+
+def test_an_escalated_attempt_forks_the_failed_attempts_whole_transcript(world: World) -> None:
+    """Plan 2a, item 2: the escalated attempt's first packet carries the prior
+    transcript (an SDK fork), not a summary."""
+    w = world
+    w.standin.review = _rounds({"w1": [CHANGES, CHANGES]})
+    job = _approve(w)
+    assert w.store.get_job(job).state.value == "ready"
+    first, second, escalated = _workers(w, "w1")
+    assert first.resume is None
+    # each fix round forks the worker's last session
+    assert second.resume is not None and second.resume.from_session == first.session_id
+    assert second.resume.fork is True
+    # the escalated attempt (rule 5) carries the whole failed attempt, history included
+    assert w.store.get_task(f"{job}-w1").tier_reason.startswith("rule5")  # type: ignore[union-attr]
+    assert escalated.resume is not None and escalated.resume.from_session == second.session_id
+    sdk, stored = w.store.transcript(second.session_id)
+    assert escalated.resume.session_id == sdk == f"sdk-{second.session_id}"
+    assert escalated.resume.entries == stored
+    uuids = [e["uuid"] for e in escalated.resume.entries]
+    assert uuids == [f"u-{first.session_id}", f"a-{first.session_id}",
+                     f"u-{second.session_id}", f"a-{second.session_id}"]  # fmt: skip
+    forks = [e for e in w.store.events(job_id=job) if e.type == "fork"]
+    assert [f.data["escalated"] for f in forks] == [False, True]
