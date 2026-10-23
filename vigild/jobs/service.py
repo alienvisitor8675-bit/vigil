@@ -23,6 +23,8 @@ from vigild.contract.models import Score, Source, Task
 from vigild.db import Store
 from vigild.devimage import missing_tools
 from vigild.gateway.firstcall import refusals as first_call_refusals
+from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
+from vigild.hidden import public_view
 from vigild.intake.paths import matches_any
 from vigild.intake.scoring import IntakeOutcome, score
 from vigild.intake.spec_gate import check_job_spec, check_task, runner_files_named
@@ -31,6 +33,7 @@ from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import InboxItem, Job, JobState
 from vigild.provenance import Provenance
 from vigild.router.rules import RoutingError, route
+from vigild.verifier import runner_overlap
 
 
 class Runner(Protocol):
@@ -209,6 +212,16 @@ class JobService:
         except ConfigError as e:
             raise SubmitError([str(e)]) from e
 
+        # vigild computes the runner-file class; a caller's value is replaced
+        task = task.model_copy(
+            update={
+                "runner_file_change": runner_overlap(
+                    task.spec.files_in_scope,
+                    self.cfg.repo(task.repo).runner_config,
+                    task.spec.test_cmd or "",
+                )
+            }
+        )
         intake = {"why": task.why, "value": task.value, "risk": task.risk, "source": task.source}
         proposed = self._intake(intake, task.spec.files_in_scope)
         if proposed:
@@ -283,14 +296,36 @@ class JobService:
 
     # --- spec gate and the inbox ---------------------------------------------
 
+    def flagged_tasks(self, job_id: str) -> dict[str, list[str]]:
+        """Tasks of the stored plan whose scope names a runner file, with those
+        files (owner ruling, 2026-10-23): they need hidden tests and an owner look."""
+        plan = self.store.get_artifact(job_id, "plan.md")
+        if plan is None:
+            return {}
+        runner_config = self.cfg.repo(self.store.get_job(job_id).repo).runner_config
+        out: dict[str, list[str]] = {}
+        for w in parse_plan(plan.content).workers:
+            if hit := runner_overlap(w.files_in_scope, runner_config, w.test_cmd):
+                out[w.task_id] = hit
+        return out
+
     def file_for_approval(self, job_id: str) -> list[str]:
-        """Run the job spec gate on the stored spec and plan; file the inbox item."""
+        """Run the job spec gate on the stored spec and plan, and file the inbox
+        item. A job with a runner-file task is not filed here: the runner's
+        author writes its hidden tests first (it never blocks a submit), then
+        calls `file_item`."""
+        errors = self.gate_spec(job_id)
+        if errors or self.flagged_tasks(job_id):
+            return errors
+        self.file_item(job_id)
+        return []
+
+    def gate_spec(self, job_id: str) -> list[str]:
         spec = self.store.get_artifact(job_id, "spec.md")
         plan = self.store.get_artifact(job_id, "plan.md")
         if spec is None or plan is None:
             errors = ["spec.md and plan.md are both required"]
         else:
-            pdoc = parse_plan(plan.content)
             job0 = self.store.get_job(job_id)
             errors = self._gate(job0.repo, spec.content, plan.content, job0.base)
         self.store.add_artifact(
@@ -305,8 +340,26 @@ class JobService:
         canonical = canonicalize_plan(job_id, plan.content)  # type: ignore[union-attr]
         if canonical != plan.content:  # type: ignore[union-attr]
             self.store.add_artifact(job_id, "plan.md", canonical, plan.provenance)  # type: ignore[union-attr]
-            pdoc = parse_plan(canonical)
+        flagged = self.flagged_tasks(job_id)
+        if flagged:
+            self.store.add_artifact(
+                job_id,
+                "spec_gate.json",
+                json.dumps({"ok": True, "errors": [], "runner_file_change": flagged}),
+                Provenance.HUMAN,
+            )
+        return []
+
+    def file_item(self, job_id: str) -> None:
+        """File the spec inbox item for a spec that passed the gate."""
+        plan = self.store.get_artifact(job_id, "plan.md")
+        spec = self.store.get_artifact(job_id, "spec.md")
+        assert plan is not None
+        pdoc = parse_plan(plan.content)
         job = self.store.get_job(job_id)
+        flagged = self.flagged_tasks(job_id)
+        stored = self.store.get_artifact(job_id, HIDDEN_ARTIFACT)
+        hidden = json.loads(stored.content).get("tasks", {}) if stored else {}
         intake_art = self.store.get_artifact(job_id, "intake.json")
         intake = json.loads(intake_art.content) if intake_art else {}
         sdoc = parse_spec(spec.content) if spec else None
@@ -332,6 +385,14 @@ class JobService:
                         "changes_how_tests_run": runner_files_named(
                             w.files_in_scope, self.cfg.repo(job.repo).runner_config, w.test_cmd
                         ),
+                        # owner ruling, 2026-10-23: hidden tests (names and
+                        # categories only) and an owner look
+                        "runner_file_change": flagged.get(w.task_id, []),
+                        **(
+                            {"hidden_tests": public_view(hidden.get(w.task_id) or {})}
+                            if w.task_id in flagged
+                            else {}
+                        ),
                         "size": w.size.value,
                         "files_in_scope": w.files_in_scope,
                         "depends_on": w.depends_on,
@@ -340,7 +401,6 @@ class JobService:
                 ],
             },
         )
-        return []
 
     def page(
         self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False

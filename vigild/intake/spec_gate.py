@@ -22,7 +22,7 @@ from vigild.contract.models import BUILT_VERIFY_LEVELS, Task, WorkerContract
 from vigild.intake.paths import globs_overlap, in_scope, matches_any, scope_entry_error
 from vigild.jobs.artifacts import SPEC_SECTIONS, PlanDoc, SpecDoc
 from vigild.shellwords import Command, parse
-from vigild.verifier import ReadFile, plan_reports
+from vigild.verifier import ReadFile, plan_reports, runner_overlap
 
 
 @dataclass(frozen=True)
@@ -100,11 +100,9 @@ def test_cmd_problem(cmd: str | None, read: ReadFile | None = None) -> str | Non
 def runner_files_named(
     scope: Sequence[str], runner_config: Sequence[str], test_cmd: str
 ) -> list[str]:
-    """The literal entries in a worker's scope that decide how tests run."""
-    from vigild.verifier import invoked_scripts
-
-    globs = [*runner_config, *invoked_scripts(test_cmd)]
-    return [f for f in scope if not set("*?[") & set(f) and in_scope(f, globs)]
+    """The literal entries in a worker's scope that decide how tests run: the
+    runner-file overlap, computed by the verifier's own matcher."""
+    return runner_overlap(scope, runner_config, test_cmd)
 
 
 def check_task(task: Task) -> GateResult:

@@ -65,3 +65,16 @@ def test_the_coord_keeps_headroom_for_a_long_session(cfg: Config) -> None:
     left = cfg.budgets.coord_session_usd - 0.30
     assert worst_case_usd(prices, "claude-opus-5-5", 590_000, MIN_OUTPUT_TOKENS) < left
     assert worst_case_usd(prices, "claude-opus-5-5", 620_000, MIN_OUTPUT_TOKENS) > left
+
+
+def test_the_hidden_test_authors_first_call_is_checked_under_its_own_cap(cfg: Config) -> None:
+    (a,) = [r for r in first_calls(cfg) if r.role == "hidden_test_author"]
+    assert a.model == "claude-sonnet-5-5"  # the reviewer tier
+    assert a.limit_usd == cfg.budgets.hidden_tests_session_usd == 1.00
+    assert a.worst_usd <= a.limit_usd
+
+
+def test_a_hidden_tests_cap_that_no_longer_fits_is_refused_at_submission(cfg: Config) -> None:
+    cfg.budgets.hidden_tests_session_usd = 0.20
+    (msg,) = refusals(cfg, REPO)
+    assert "hidden_test_author" in msg and "$0.20" in msg

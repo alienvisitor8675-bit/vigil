@@ -240,6 +240,38 @@ stored inbox bodies, events and `tests.json` (a migration), so a key that was
 stored before the fix is scrubbed on the next restart; an item's status is
 not changed.
 
+### Tasks that change a runner file
+
+A runner file is one that decides how tests run (`runner_config` in
+`configs/repos.yaml`, or a script the `test_cmd` runs). When a spec's scope
+names one (ParkAgent's `scripts/check-feature-map.mjs`, vigil's `conftest.py`),
+the class is flagged and handled differently:
+
+- **At spec time** vigild runs a fresh Sonnet session (the hidden-test author,
+  up to $1, twice at most) before the spec reaches your inbox. The job stays
+  `spec_pending` with nothing to approve until it finishes. The spec item then
+  shows, per flagged task, the runner files and the hidden tests' names and
+  categories. If it says "hidden tests missing; this task can only escalate",
+  the task will be built and verified but cannot pass: approve only if you want
+  that, or re-plan.
+- **At build time** the verifier runs the head's copy of only the runner file
+  and the base's copy of every other runner file, plus the hidden tests (fail
+  on the base, pass on the head). They decide; the visible test is reported but
+  is not enough. `tests.json` has `runner_files`, `runner_file_changed` and
+  `hidden`.
+- **The PR** is a draft that says "Owner review required: runner file changed:
+  <files>". Read the runner-file diff yourself; this class is always your look.
+  You merge as always.
+- **An escalation** (no hidden tests) shows as an inbox page of kind
+  `escalated` and the job as `escalated`: re-plan or abandon.
+- **A dispute.** If a worker fails against a hidden test and you think the test
+  is wrong, run `vigil hidden show <task>` on the Mac (honours
+  `VIGIL_DATA_DIR`). It prints the tests and records a `hidden_tests_shown`
+  event. It is not served over the API or MCP. Once shown, the tests have been
+  shown to a human, not to a model, so the rule "never replay a job whose
+  hidden tests were shown to a model" does not fire on its own account; pasting
+  them into a session would count.
+
 ### Check everything
 
 ```sh

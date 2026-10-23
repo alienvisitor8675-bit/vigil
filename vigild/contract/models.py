@@ -130,6 +130,10 @@ class Task(Strict):
     # A deps task names the task it unblocks; a blocked task names its deps job.
     parent_task: str | None = None
     blocked_on: str | None = None
+    # The runner files this task's scope names (vigild sets it; a caller's value
+    # is replaced). The class needs hidden tests and an owner look, and never
+    # counts toward ladder graduation.
+    runner_file_change: list[str] = Field(default_factory=list)
 
 
 class TestOutcome(StrEnum):

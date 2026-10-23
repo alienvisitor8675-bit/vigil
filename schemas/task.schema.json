@@ -309,6 +309,13 @@
       "title": "Risk",
       "type": "integer"
     },
+    "runner_file_change": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Runner File Change",
+      "type": "array"
+    },
     "shape": {
       "anyOf": [
         {

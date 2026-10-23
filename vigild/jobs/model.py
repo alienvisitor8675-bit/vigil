@@ -30,6 +30,7 @@ class Role(StrEnum):
     REVIEWER = "reviewer"
     AUDITOR = "auditor"
     SUBAGENT = "subagent"
+    HIDDEN_TEST_AUTHOR = "hidden_test_author"  # a fresh session; never a worker or reviewer
 
 
 class FixDepthExceeded(ValueError):

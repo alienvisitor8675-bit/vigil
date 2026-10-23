@@ -8,6 +8,7 @@ monthly_usd: 100.00      # mandatory (P4, owner 2026-10-22)
 wip_per_repo: 4          # enforced by the phase 2 scheduler
 coord_session_usd: 2.00  # reservation for one coord drafting session
 decider_call_usd: 0.01   # reservation for one Haiku decider call
+hidden_tests_session_usd: 1.00  # reservation for one hidden-test author session (Sonnet)
 # Each model call's output is capped at this for every coord and worker session
 # (CLAUDE_CODE_MAX_OUTPUT_TOKENS). The gateway holds max_tokens of output at
 # the model's price against a session's reservation, so an uncapped Opus call

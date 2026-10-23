@@ -202,6 +202,10 @@ def _j(v: Any) -> str:
     return json.dumps(v, sort_keys=True)
 
 
+class SessionRoleError(ValueError):
+    """A session was asked to do a job its recorded role forbids."""
+
+
 class Store:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
@@ -408,6 +412,7 @@ class Store:
         branch: str | None = None,
         provenance: Provenance | str = Provenance.CLAUDE,
     ) -> SessionRow:
+        self._check_role_separation(role, parent_session_id)
         sid = "s-" + uuid.uuid4().hex[:10]
         self.x(
             "INSERT INTO sessions (id, job_id, task_id, role, parent_session_id, backend_preset,"
@@ -426,6 +431,26 @@ class Store:
             ),
         )
         return self.get_session(sid)
+
+    def _check_role_separation(self, role: Role, parent_session_id: str | None) -> None:
+        """A hidden-test author is a fresh context: it has no parent, and no
+        worker or reviewer session descends from one (learning ruling 14; the
+        design's "never reused")."""
+        if role is Role.HIDDEN_TEST_AUTHOR and parent_session_id is not None:
+            raise SessionRoleError("a hidden-test author session starts fresh: it has no parent")
+        seen: set[str] = set()
+        cur = parent_session_id
+        while cur and cur not in seen:
+            seen.add(cur)
+            try:
+                parent = self.get_session(cur)
+            except KeyError:
+                return
+            if parent.role is Role.HIDDEN_TEST_AUTHOR and role is not Role.HIDDEN_TEST_AUTHOR:
+                raise SessionRoleError(
+                    f"a {role.value} session can't continue hidden-test author session {cur}"
+                )
+            cur = parent.parent_session_id
 
     def get_session(self, session_id: str) -> SessionRow:
         rows = self.q("SELECT * FROM sessions WHERE id=?", (session_id,))
