@@ -174,7 +174,7 @@ reference: a shape made of characters that breathes while it's live.
 
 ## Pages
 
-These nine pages, and nothing else. The Vigil UI canvas is the visual
+These nine pages, and nothing else (a tenth, `/learn`, is planned below). The Vigil UI canvas is the visual
 reference for all nine, Talk and Watch included. Each page lists the API calls
 behind it; the UI calls nothing else. A **job** is the UI's word for a task (the API says `tasks`): one
 contract, and every session (attempt, review, audit) it has spawned.
@@ -187,6 +187,16 @@ One table with every job:
 - turns, elapsed;
 - tokens in/out, $ or GPU-s;
 - PR, CI, review rung, trace link.
+
+- **Risk and readiness** (planned, Stage A, `docs/design.md` "Factory
+  engineering"): the PR's merge-risk grade (`low`, `med`, `HIGH`) and, when
+  the PR is UI-shaped and has neither a recording nor a before/after
+  screenshot pair, `not ready for review`. Both are read from artifact
+  rows. Neither is a gate, and neither changes a CI or review column.
+  `not ready for review` reads the Evidence cell's `rec` mark and does not
+  repeat it. The Evidence cell also carries the
+  diagram mark, `diag` (`made`, `skipped` or `pending`), with its skip
+  reason on hover.
 
 Typing filters the table. `Enter` opens `/job/:id`.
 
@@ -228,6 +238,15 @@ Three columns.
   - GPU, CPU, RAM and W as per-second character sparklines.
   - J/token and GPU-s/token.
   - A link to the Langfuse trace.
+- **PR header** (planned, Stage A): the merge-risk grade beside the PR
+  link, with its signals one line each: blast radius (the sensitive paths
+  hit), rollback cost (migration, down step, schema or API change),
+  swallowed errors (`not measured` until semgrep's false-positive rate is
+  known) and the reviewer's alignment and drive-by input. A `HIGH` grade
+  shows `owner look required`. It never shows a rung lower than the
+  ladder's, and it is advisory. Below it, the PR footer's `vigil:`
+  references (spec, plan, event-log range, gate digest, hidden-test
+  categories, cost), each `made`, `pending` or `skipped`.
 - **Kill.** `x` puts an inline line under the header: `kill pa-0142? y/n`.
   `y` stops the running session (`POST /api/sessions/{id}/kill`), the same
   call as `vigil kill`.
@@ -324,6 +343,14 @@ task passes the same gates.
   - today's open reservations;
   - the month against the monthly cap.
 - **WIP limits** per repo, with the open fleet PRs.
+- **Experiment line** (planned, Stage B, `docs/design.md` "Factory
+  engineering"): the monthly experiment budget (proposed `$20`) as spent,
+  reserved and remaining, split into task validation, experiment design and
+  analysis review, scorer samples and proposal comparisons. It counts inside
+  the month and never inside today's bar. Local arms cost `$0` and are not
+  drawn. Greyed until 30 validated benchmark tasks.
+- **Cost per merged PR** beside the caps, over 30 days, by shape and route,
+  with the experiment line shown apart from it. Greyed until 10 merged PRs.
 - Caps are read-only here. They live in `configs/budgets.yaml`, the same
   for every interface.
 
@@ -399,6 +426,48 @@ No polling. The 100 KB page-weight limit applies.
 
 **Depends on:** the phase 2 session proxy (the code stream) and phase 2
 review data (the quality strip's findings); tower meters wait for phase 5.
+
+### 10. `/learn` (planned)
+
+The owner's request names a Learn screen; the pages above have none, so
+this is a tenth page (owner ruling, 2026-10-23). It reads and never writes
+policy.
+
+**Greyed until the count is reached.** Every block below declares the run
+count it needs (`docs/design.md` "Factory engineering"). Until then it shows
+its name, the count needed and the count held (`merged 12 / 30`), and no
+number or chart.
+
+- **Stage A, from the first merged PRs:**
+  - cost per merged PR (10 merged PRs);
+  - autonomy rate: merged PRs with no owner code push (10);
+  - human touches per PR: steers, takeovers, escalations answered, review
+    overrides (10);
+  - time from PR open to first owner review, and from open to merge (10);
+  - 14-day revert rate (10 PRs at least 14 days old);
+  - auditor-confirmed finding rate, random audit sample only (20 audited
+    reviews).
+
+  Each is a 30-day character sparkline with its latest value.
+- **Stage B, 30 validated benchmark tasks in the repo:**
+  - **Pareto view.** Cost on one axis and quality on the other, one point
+    per named benchmark config, the non-dominated points joined and
+    dominated ones dimmed. Each point carries its *n* and interval; a shape
+    under 8 tasks reads `insufficient n` and is not ranked. The reference
+    arm (the original merged run) is marked and is not a paired comparison.
+    Results are split by whether a task is dated after the model's training
+    cutoff. A job whose hidden tests were shown to a model reads `exposed`
+    and is not plotted.
+  - **Scorers.** Each scorer with its agreement over its owner-labelled
+    runs (`n/30` until 30, then the rate). Below 30 labels or 80% it reads
+    `uncalibrated` and none of its trends is drawn. The owner labels a run
+    here.
+- **Stage C, 60 merged Vigil jobs in the repo or the owner's switch:** open
+  improvement-proposal PRs with the runs they cite and their replay
+  comparison.
+
+**API:** `GET /api/metrics`, `GET /api/benchmarks`, `GET /api/scorers`,
+`POST /api/scorers/{id}/labels`.
 
 ## Files
 

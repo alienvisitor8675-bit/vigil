@@ -583,6 +583,9 @@ The outer loop (weekly replay) is part of phase 7 (ruling 3).
   - auto-merge for shapes at rung 3, per the design's conditions;
   - Dependabot-style bumps as deps jobs (B39): a scheduled intake, or a
     Dependabot PR adopted as a deps job, next to the post-merge watcher.
+  - the auto-merge race from factory engineering (planned): a PR that
+    auto-merges at rung 3 before CI turns red cannot be reopened, so the
+    watcher owns that case (`docs/design.md` "Factory engineering").
 - **Done when:** defined with the owner when the phase is dispatched.
 
 ### Phase 7: Eval (worker: Sonnet)
