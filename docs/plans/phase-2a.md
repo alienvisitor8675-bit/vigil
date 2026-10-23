@@ -175,6 +175,15 @@ Fold these in when 2a rebases onto main:
 - **The peak test includes the review-stage reserve.**
 - **Runner-file tasks** (finding #2): permanently rung 0, never counted
   toward ladder graduation, with a test.
+- **Job artifacts go to the vault, not the target repo** (owner,
+  2026-10-23):
+  - `.vigil/<job>/` stays on the job branch while the job runs, because
+    the worker needs it (layer 6).
+  - Before a PR is marked ready, vigild adds a commit that removes
+    `.vigil/<job>/`. The artifacts stay in the vault, and the PR body links
+    to them with an opaque `vigil:` reference.
+  - This doesn't apply to #14's `.vigil/` playbook folder.
+  - Test: a ready PR's diff contains no `.vigil/<job>/` path.
 - **Migrations:** 2a's steps append after main's; there's no
   renumbering. 2a's development runs never use `~/vigil-data` and set
   `VIGIL_DATA_DIR`.
