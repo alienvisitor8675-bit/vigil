@@ -133,18 +133,22 @@ def test_two_workers_build_in_their_own_containers(
         headers=auth(tokens.admin),
         json={
             "repo": REPO,
-            "title": "Document the rate limit",
+            # 2a round 4: nothing here may claim what the fixture repo doesn't
+            # have (round 3's spec asked for a rate limit it lacks, and the
+            # reviewer and worker rightly stalled on it)
+            "title": "Say the fixture repo is empty",
             "request": (
-                "Two independent doc edits. (1) Add a line containing the words 'rate limit' to "
-                "docs/feature-map.md, with a pytest test tests/test_feature_map.py that reads "
-                "the file and asserts it. (2) Add a line containing RATE_LIMIT to "
-                "docs/runbook.md saying it is the env var that sets the limit, with a pytest "
-                "test tests/test_runbook.py that asserts it. One worker per doc and its test, in "
-                "parallel; each test_cmd is `pytest -q tests/<its test file>`. Keep max_cost_usd "
-                "at 0.25 per worker."
+                "Two independent doc edits about this repo as it is: it has no code yet. "
+                "(1) Add a line to docs/feature-map.md saying 'No features yet: this repo has "
+                "no code.', with a pytest test tests/test_feature_map.py that reads the file and "
+                "asserts the words 'No features yet'. (2) Add a line to docs/runbook.md saying "
+                "'Nothing to run yet: this repo has no code.', with a pytest test "
+                "tests/test_runbook.py that asserts the words 'Nothing to run yet'. One worker "
+                "per doc and its test, in parallel; each test_cmd is `pytest -q tests/<its test "
+                "file>`. Keep max_cost_usd at 0.25 per worker."
             ),
             "notes": ["keep it to one line per file"],
-            "why": "the limit is undocumented",
+            "why": "the docs don't say the repo is empty",
             "value": 3,
             "risk": 1,
         },
