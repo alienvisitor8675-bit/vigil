@@ -452,10 +452,13 @@ file (runbook). The Cloudflare token is optional, because Haiku covers.
 
 ### Phase 2: Review ladder, fleet, CLI and MCP, session proxy (worker: Opus)
 
-The full plan, with the owner's 2026-10-22/23 additions (resume, circuit
-breakers, the Stop hook, the product model, and the phase 1 carry-overs), is
-`docs/plans/phase-2.md`. It is dispatched only after the phase 1 done-when
-run on ParkAgent completes against `main`.
+Phase 2 is split into two PRs (owner, 2026-10-23): **2a, the pipeline**
+(`docs/plans/phase-2a.md`: review ladder, scheduler, resume, circuit
+breakers, deps jobs, the Stop hook, the phase 1 carry-overs), then **2b,
+clients and knowledge** (CLI/MCP, session proxy, bridge, doc layers 4/5/7/9,
+verify level 1), branched from 2a's merge. Each has its own done-when, run
+on the test repo and vigil only. 2a's PR opens only after the phase 1
+done-when run on ParkAgent completes against `main`.
 
 - **Review:**
   - reviewer (Sonnet) and auditor (Opus) sessions;
