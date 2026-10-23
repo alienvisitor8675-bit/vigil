@@ -140,6 +140,14 @@ class Budget:
                 "UPDATE reservations SET status='settled', closed_at=? WHERE id=?",
                 (iso(self.clock()), reservation_id),
             )
+            if amount is None and row["session_id"]:
+                # the session's other reservations (a draw's top-up, an
+                # over-cap extension) close with it: its cost is booked once
+                c.execute(
+                    "UPDATE reservations SET status='released', closed_at=?"
+                    " WHERE session_id=? AND status='open' AND id != ?",
+                    (iso(self.clock()), row["session_id"], reservation_id),
+                )
             c.execute(
                 "INSERT INTO ledger (reservation_id, session_id, task_id, amount_usd, day, month,"
                 " ts) VALUES (?,?,?,?,?,?,?)",
@@ -154,6 +162,37 @@ class Budget:
                 ),
             )
             return spent
+
+    def draw(self, parent_id: int, *, session_id: str, amount: float, purpose: str) -> int:
+        """A session's own reservation, taken out of a job's review-stage
+        reservation (owner, 2026-10-23): the parent shrinks by what the
+        session takes, so the day sees the same total. If the parent has less
+        left than `amount`, the rest is reserved against the day as usual."""
+        rid = 0
+        with self.store.tx() as c:
+            row = c.execute(
+                "SELECT amount_usd, status, day, month FROM reservations WHERE id=?", (parent_id,)
+            ).fetchone()
+            take = 0.0
+            if row is not None and row["status"] == "open":
+                take = min(amount, float(row["amount_usd"]))
+            if take > 0:
+                c.execute(
+                    "UPDATE reservations SET amount_usd = amount_usd - ? WHERE id=?",
+                    (take, parent_id),
+                )
+                cur = c.execute(
+                    "INSERT INTO reservations (session_id, task_id, purpose, amount_usd, status,"
+                    " day, month, created_at) VALUES (?,?,?,?, 'open', ?,?,?)",
+                    (session_id, None, purpose, take, row["day"], row["month"],
+                     iso(self.clock())),
+                )  # fmt: skip
+                rid = int(cur.lastrowid or 0)
+        if take <= 0:
+            return self.reserve(session_id=session_id, task_id=None, amount=amount, purpose=purpose)
+        if amount - take > EPS:
+            self.reserve(session_id=session_id, task_id=None, amount=amount - take, purpose=purpose)
+        return rid
 
     def settle_session(self, session_id: str) -> float:
         rows = self.store.q(

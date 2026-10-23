@@ -117,8 +117,8 @@ class Budgets(_M):
     # Reservations for one reviewer and one auditor session (phase 2a). They
     # count against the day and the month, not the task's own cap, so a fix
     # round gets what's left of the worker's budget.
-    review_session_usd: float = Field(default=0.50, gt=0)
-    audit_session_usd: float = Field(default=1.00, gt=0)
+    review_session_usd: float = Field(default=0.40, gt=0)
+    audit_session_usd: float = Field(default=0.80, gt=0)
     # Haiku decisions Jev couldn't give, per repo per UTC day (owner ruling 4)
     decider_fallback_per_repo_usd: float = Field(default=1.00, gt=0)
 

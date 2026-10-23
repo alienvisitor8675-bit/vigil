@@ -189,6 +189,9 @@ class JobRunner:
         self._queued: dict[str, tuple[Callable[[str], None], JobState | None]] = {}
         # the WIP room check and the move to running, for every job at once (B10)
         self._wip_lock = threading.Lock()
+        # each job's review-stage reservation while its pass runs (owner, 2026-10-23)
+        self._review_stage: dict[str, int] = {}
+        self._stage_lock = threading.Lock()
         self.closers: list[Callable[[], None]] = []  # e.g. the docker client (item 0)
         self.ladder = Ladder(store, cfg)
         self.deps = deps  # the deps executor (item 5); None: deps jobs fail
@@ -748,7 +751,13 @@ class JobRunner:
         return self.store.get_session(rows[0]["id"]) if rows else None
 
     def _run_session(
-        self, s: SessionRow, spec: SessionSpec, reservation: int, attrs: dict[str, Any]
+        self,
+        s: SessionRow,
+        spec: SessionSpec,
+        reservation: int,
+        attrs: dict[str, Any],
+        *,
+        cap: float | None = None,
     ) -> ExecOutcome:
         """A session slot, then token, telemetry, run, revoke, settle. The
         reservation is already made; the token is issued once the slot is
@@ -767,6 +776,11 @@ class JobRunner:
                     with self.telemetry.span(tr, "vigil.spawn", {"vigil.image": spec.image or ""}):
                         out = self.executor.run(spec, token, self._event_sink(s))
                     tr.set("vigil.status", out.status)
+                    if cap is not None:  # a review or audit: did it go past its cap?
+                        self.gateway.drain(s.id)
+                        over = session_cost(self.store, s.id) - cap
+                        tr.set("vigil.review.over_cap", over > 1e-9)
+                        tr.set("vigil.review.overage_usd", round(max(0.0, over), 6))
                 return out
             finally:
                 self.gateway.revoke(s.id)
@@ -1312,17 +1326,16 @@ class JobRunner:
         )
 
     def _wave_share(self, task_ids: list[str]) -> float:
-        """What the day (and the month) has left, less the wave's own review
-        and audit reservations (one of each per worker, at their preset caps;
-        2a round 3), divided across its workers (review B1), floored to a
-        hundredth of a cent so the shares never sum past it."""
+        """What the day (and the month) has left, divided across a wave's
+        workers (review B1), floored to a hundredth of a cent so the shares
+        never sum past it. Build caps only: the review stage reserves its own,
+        once per job, when the job enters review (owner, 2026-10-23)."""
         b = self.cfg.budgets
         n = sum(1 for t in task_ids if self.store.get_task(t).contract.get("shape") != "deps")
         left = min(
             b.daily_usd - self.budget.spent_today() - self.budget.open_today(),
             b.monthly_usd - self.budget.spent_month() - self.budget.open_month(),
         )
-        left -= n * (b.review_session_usd + b.audit_session_usd)
         return math.floor(max(0.0, left) / max(1, n) * 1e4) / 1e4
 
     def _reserve_wave(self, job_id: str, task_ids: list[str]) -> dict[str, tuple[int, float]]:
@@ -2027,6 +2040,36 @@ class JobRunner:
             self._hold_for(job_id, b)
             return
         tasks = [t for t in self.store.list_tasks(job_id) if t.state == "pr_open"]
+        # one reservation for the whole pass (owner, 2026-10-23): each review
+        # and audit session draws its cap from it; what's left goes back at
+        # the end, and a fix round's re-review reserves again
+        bud = self.cfg.budgets
+        amount = len(tasks) * (bud.review_session_usd + bud.audit_session_usd)
+        try:
+            stage = self.budget.reserve(
+                session_id=None, task_id=None, amount=amount, purpose="review_stage"
+            )
+        except BudgetExceeded as e:
+            held = self._refused_budget(job_id, e, None)
+            if held is not None:
+                self._hold_for(job_id, held)
+            else:
+                self._budget_page(job_id, e, [t.id for t in tasks])
+            return
+        self.store.add_event(
+            "review_stage_reserved", {"amount_usd": amount, "tasks": [t.id for t in tasks]},
+            Provenance.HUMAN, job_id=job_id,
+        )  # fmt: skip
+        with self._stage_lock:
+            self._review_stage[job_id] = stage
+        try:
+            self._review_pass(job_id, job, tasks)
+        finally:
+            with self._stage_lock:
+                self._review_stage.pop(job_id, None)
+            self.budget.settle(stage, 0.0)  # what no session drew goes back to the day
+
+    def _review_pass(self, job_id: str, job: Job, tasks: list[Any]) -> None:
         with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as pool:
             outcomes = dict(zip(
                 [t.id for t in tasks],
@@ -2225,7 +2268,7 @@ class JobRunner:
         packet = assemble_review(rules, request, diff=diff, untrusted=untrusted)
         out, why = self._read_only_session(
             job, t, Role.REVIEWER, reviewer, head, base_sha, rnd, packet.text, ReviewOutput,
-            self.cfg.budgets.review_session_usd,
+            self.cfg.budgets.review_session_usd, shape.value,
         )  # fmt: skip
         if out is None:
             return "failed", f"no valid review.json: {why}"
@@ -2255,7 +2298,7 @@ class JobRunner:
             )
             aout, why = self._read_only_session(
                 job, t, Role.AUDITOR, auditor, head, base_sha, rnd, apacket.text, AuditOutput,
-                self.cfg.budgets.audit_session_usd,
+                self.cfg.budgets.audit_session_usd, shape.value,
             )  # fmt: skip
             if aout is None:
                 return "failed", f"no valid audit.json: {why}"
@@ -2338,6 +2381,40 @@ class JobRunner:
                     Kind.ESCALATIONS, GLOBAL, {"today": escalations_today(self.store), "max": most}
                 )
 
+    def _note_over_cap(
+        self,
+        shape: str,
+        role: Role,
+        job_id: str | None,
+        task_id: str | None,
+        *,
+        cap: float,
+        cost: float,
+    ) -> None:
+        """A review or audit went past its cap (owner, 2026-10-23): it
+        completed, its overage is in the day's spend, and it is an event. The
+        second overage for one shape, counted since the caps last changed,
+        pages once."""
+        b = self.cfg.budgets
+        caps = [b.review_session_usd, b.audit_session_usd]
+        self.store.add_event(
+            "review_over_cap",
+            {"shape": shape, "role": role.value, "cap_usd": cap, "cost_usd": round(cost, 6),
+             "overage_usd": round(cost - cap, 6), "caps": caps},
+            Provenance.HUMAN, job_id=job_id, task_id=task_id,
+        )  # fmt: skip
+        n = sum(
+            1
+            for r in self.store.q("SELECT data FROM events WHERE type='review_over_cap'")
+            if (d := json.loads(r["data"])).get("shape") == shape and d.get("caps") == caps
+        )
+        if n == 2:
+            self._page(
+                None, f"Review caps too low for shape {shape}: 2 overages; consider re-sizing",
+                {"kind": "review_caps", "shape": shape, "caps": caps, "actions": ["dismiss"],
+                 "next": "raise review_session_usd or audit_session_usd in configs/budgets.yaml"},
+            )  # fmt: skip
+
     def _ladder_page(self, change: LadderChange) -> None:
         """You see every promotion and demotion (design, trust ladder)."""
         verb = "promoted" if change.to > change.frm else "demoted"
@@ -2361,6 +2438,7 @@ class JobRunner:
         packet: str,
         model: type[ReviewOutput] | type[AuditOutput],
         amount: float,
+        shape: str = "",
     ) -> tuple[ReviewOutput | AuditOutput | None, str]:
         """A reviewer or auditor session on a fresh clone of the task's head:
         read-only tools, its answer as structured output (validated here; an
@@ -2373,9 +2451,14 @@ class JobRunner:
         )  # fmt: skip
         try:
             check_backend(self.cfg, job.repo, preset, private=live_private(job.repo))
-            rid = self.budget.reserve(
-                session_id=s.id, task_id=None, amount=amount, purpose=role.value
-            )
+            with self._stage_lock:
+                stage = self._review_stage.get(job.id)
+            if stage is not None:  # its cap, drawn from the job's review stage
+                rid = self.budget.draw(stage, session_id=s.id, amount=amount, purpose=role.value)
+            else:
+                rid = self.budget.reserve(
+                    session_id=s.id, task_id=None, amount=amount, purpose=role.value
+                )
         except (RepoPolicyError, BudgetExceeded) as e:
             self.store.update_session(s.id, status="refused")
             if isinstance(e, BudgetExceeded):
@@ -2406,7 +2489,9 @@ class JobRunner:
             session_dir=self._session_dir(s.id),
             max_turns=REVIEW_TURNS,
             max_minutes=REVIEW_MINUTES,
-            max_budget_usd=amount,
+            # the cap is checked call by call at the gateway, and a review may
+            # go past it (owner, 2026-10-23): only the day stops the CLI
+            max_budget_usd=self.cfg.budgets.daily_usd,
             mounts=self.workspace.overlays(clone),
             packet=packet,
             image=session_image,
@@ -2421,7 +2506,10 @@ class JobRunner:
             "vigil.model": spec.model,
             "vigil.attempt": rnd,
         }
-        out = self._run_session(s, spec, rid, attrs)
+        out = self._run_session(s, spec, rid, attrs, cap=amount)
+        cost = session_cost(self.store, s.id)
+        if cost > amount + 1e-9:
+            self._note_over_cap(shape, role, job.id, t.id, cap=amount, cost=cost)
         if out.status != "done":
             self.store.update_session(s.id, status="failed")
             return None, f"{role.value} session {out.status}: {(out.error or '')[:500]}"

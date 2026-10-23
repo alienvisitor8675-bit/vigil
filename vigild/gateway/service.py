@@ -387,6 +387,8 @@ class Gateway:
         with self._inflight_lock:
             held = self._inflight.get(session_id, 0.0)
             headroom = self.budget.session_headroom(session_id) - held
+            if amount > headroom and self._over_cap_ok(session_id, amount - headroom):
+                headroom = amount
             if amount > headroom:
                 raise GatewayError(
                     403,
@@ -396,6 +398,27 @@ class Gateway:
                 )
             self._inflight[session_id] = held + amount
             return amount
+
+    def _over_cap_ok(self, session_id: str, shortfall: float) -> bool:
+        """A reviewer or auditor call past its session cap goes on (owner,
+        2026-10-23): its reservation grows by the shortfall, against the day
+        and the month, which stay hard stops. Any other session's cap is its
+        cap. Raises GatewayError when the day or month can't take it."""
+        from vigild.jobs.model import Role
+
+        try:
+            role = self.store.get_session(session_id).role
+        except KeyError:
+            return False
+        if role not in (Role.REVIEWER, Role.AUDITOR):
+            return False
+        try:
+            self.budget.reserve(
+                session_id=session_id, task_id=None, amount=shortfall, purpose="review_over_cap"
+            )
+        except BudgetExceeded as e:
+            raise GatewayError(403, "permission_error", f"budget: {e}") from e
+        return True
 
     def release(self, hold: Hold) -> None:
         if hold.released:

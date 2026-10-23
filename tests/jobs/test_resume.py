@@ -74,10 +74,7 @@ def test_a_killed_worker_resumes_from_its_last_commit_within_its_remainder(
     assert resumed.max_budget_usd == pytest.approx(2.0 - 0.30)
     held = w.store.q("SELECT amount_usd FROM reservations WHERE task_id=? ORDER BY id",
                      (f"{job}-w1",))  # fmt: skip
-    assert [r["amount_usd"] for r in held] == [
-        1.0,
-        pytest.approx(1.70),
-    ]  # the wave's share: ($5 - 2 x $1.50 of reviews) / 2 (2a round 3)
+    assert [r["amount_usd"] for r in held] == [2.0, pytest.approx(1.70)]
     assert w.runner.remaining(f"{job}-w1")[1] == pytest.approx(0.60)
     assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
 

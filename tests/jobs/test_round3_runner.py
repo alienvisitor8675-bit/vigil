@@ -14,7 +14,7 @@ import pytest
 from tests.conftest import auth
 from tests.jobs.test_coord_loop import REPO, World, _approve, _flaky
 from tests.jobs.test_coord_loop import world as world
-from tests.jobs.test_round2_runner import _pages, _run_n, assert_actionable
+from tests.jobs.test_round2_runner import _pages, assert_actionable
 from vigild.breakers import GLOBAL, Kind
 from vigild.executors.base import SessionSpec
 from vigild.jobs.model import JobState, Role
@@ -125,20 +125,6 @@ def test_a_review_stops_quietly_when_the_owner_merged_meanwhile(world: World) ->
     assert {t.state for t in w.store.list_tasks(job)} == {"merged"}
     assert [p for p in _pages(w, job)] == []  # no "vigild error"
     assert _events(w, job, "review_dropped")
-
-
-# --- 4: a wave leaves room for its own reviews ---------------------------------------------------
-
-
-def test_a_wave_holds_back_its_own_reviews_and_audits(world: World) -> None:
-    w = world
-    job = _run_n(w, 3)
-    assert w.store.get_job(job).state.value == "ready"
-    b = w.runner.cfg.budgets
-    held = w.store.q("SELECT amount_usd FROM reservations WHERE purpose='worker'")
-    assert len(held) == 3
-    room = b.daily_usd - 3 * (b.review_session_usd + b.audit_session_usd)
-    assert sum(r["amount_usd"] for r in held) <= room + 1e-6
 
 
 # --- 7: resume and retry say `queued` ----------------------------------------------------------

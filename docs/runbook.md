@@ -356,9 +356,15 @@ uv run python -m vigild
 - **Budget pages.** A job whose workers don't fit what the day has left gets
   its own page, "the budget can't fit this work now": retry later, re-plan
   with smaller `max_cost_usd`, or abandon. Each worker in a wave reserves its
-  cap or its share of what's left of the day, whichever is less, after
-  holding back that wave's reviews and audits ($1.50 a task): at $5 a day,
-  one worker gets up to $2, two $1.00 each, three about $0.17 each.
+  cap or its share of what's left of the day, whichever is less (build caps
+  only: at $5 a day, three workers get about $1.67 each).
+- **Review caps.** A job entering review reserves $1.20 per task under review
+  (`review_session_usd` $0.40 + `audit_session_usd` $0.80 in
+  `configs/budgets.yaml`); what isn't used goes back when the pass ends. A
+  review that runs past its cap still completes, charged to the day (the
+  daily and monthly caps stay hard). "Review caps too low for shape <shape>:
+  2 overages; consider re-sizing" means raise those two values. Re-size
+  them from real ParkAgent reviews after the phase 1 run.
 - **Deps PRs.** vigild opens them with no source builds (wheels and
   tarballs only) and builds the new dev image only after you merge. A review
   that fails closes the PR and makes it again once; a second failure closes

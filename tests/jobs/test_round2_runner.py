@@ -136,7 +136,7 @@ def test_a_review_refused_by_the_budget_pages_the_job_not_the_fleet(world: World
     real = w.budget.reserve
 
     def refuse_reviews(**kw: Any) -> int:
-        if kw.get("purpose") == "reviewer":
+        if kw.get("purpose") == "review_stage":  # the job's one review reservation (round 5)
             from vigild.budget import BudgetExceeded
 
             raise BudgetExceeded("daily", "a test says the day is held")
@@ -145,7 +145,7 @@ def test_a_review_refused_by_the_budget_pages_the_job_not_the_fleet(world: World
     w.budget.reserve = refuse_reviews  # type: ignore[method-assign]
     job = _approve(w)
     page = assert_actionable(w, job)
-    assert page["body"]["kind"] == "review_failed" and "retry" in page["body"]["actions"]
+    assert page["body"]["kind"] == "budget" and "retry" in page["body"]["actions"]
     assert _breaker_pages(w) == []
 
 
