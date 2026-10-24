@@ -105,7 +105,9 @@ def _py(tmp_path: Path, subject: Path, script: str) -> dict[str, Any]:
         [sys.executable, "-c", script],
         cwd=helper_dir,
         env={
-            "PATH": "/usr/bin:/bin",
+            # The interpreter's own directory too: in the dev image python3 is in
+            # /usr/local/bin, not /usr/bin, and run_subject passes PATH through.
+            "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
             "VIGIL_SUBJECT": str(subject),
             TAG_ENV: "TAGGED",
             "PYTHONPATH": str(helper_dir),
