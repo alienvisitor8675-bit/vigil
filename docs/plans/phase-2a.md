@@ -273,3 +273,10 @@ unmetered, before #16.
 6. **Owner audit sample (3.3).** #12 ruling 12 says the ladder's statistics come from the random audit sample only. The owner audit is a third, also random, sample. Decide whether it feeds the ladder or stays labelled data only.
 7. **Kill switch (1.1).** #14 puts host policy in vigild's own config. The kill switch is state, not policy, so it lives outside `configs/` as ruled. Note it in #14's host-policy list.
 8. **2a's §7.** Items 1.5–1.8 used to sit there. They now live in this backlog; §7 keeps only the mechanics of 2a's rebase.
+
+### 2b done-when (carried over unchanged)
+- One task is dispatched from a Claude Code session through `vigil mcp`.
+- `vigil kill` works.
+- `vigil_approve` approves a spec, and `vigil_talk` can't change state.
+- A joined message is tagged `human`.
+- All of it runs on the test repo and vigil only.
