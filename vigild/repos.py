@@ -72,6 +72,22 @@ def check_backend(cfg: Config, repo: str, preset_name: str) -> None:
         raise RepoPolicyError(f"{repo} does not list backend {preset_name} in configs/repos.yaml")
 
 
+def check_hidden_author(cfg: Config, repo: str, preset_name: str) -> None:
+    """Hosted hidden-test authoring sends the spec and the repo's code to a hosted
+    model. For a private repo that is ruling 15; the owner waived it for
+    thomasbardhi01/vigil only (2026-10-23), here in code with the other hard-coded
+    exception, so a YAML edit can't extend it. Every other private repo is
+    local-only or off; with no local model yet, that is off."""
+    pol = cfg.repo(repo)
+    if pol.visibility != "private":
+        return
+    p = cfg.backends.presets[preset_name]
+    if p.locality == "hosted" and not _hosted_allowed(repo, p.provider):
+        raise RepoPolicyError(
+            f"{repo} is private: hidden-test authoring on a hosted model ({p.provider}) is off"
+        )
+
+
 def check_decider_route(cfg: Config, repo: str, route: str) -> None:
     if route not in cfg.repo(repo).decider:
         raise RepoPolicyError(f"{repo} does not list decider route {route}")

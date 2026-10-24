@@ -176,6 +176,20 @@ def run_checks(
     else:
         out.append(Check("PHOENIX_ADMIN_SECRET", False, "missing: tracing off"))
 
+    raw_key = secrets.get("VIGIL_HOST_KEY")
+    have_key = bool(raw_key) and len(raw_key or "") >= 64
+    out.append(
+        Check(
+            "VIGIL_HOST_KEY",
+            have_key,
+            ""
+            if have_key
+            else "too short: needs 64 hex characters; every hidden-test task escalates"
+            if raw_key
+            else "missing: every hidden-test task escalates",
+        )
+    )
+
     token = secrets.get("VIGIL_API_TOKEN")
     if token:
         api = cfg.vigild.api

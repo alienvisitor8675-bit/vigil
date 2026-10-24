@@ -14,7 +14,7 @@ import re
 from typing import Any
 
 from vigild.contract.models import WorkerReport
-from vigild.github.publish import out_of_scope
+from vigild.github.publish import artifact_paths, out_of_scope
 from vigild.intake.paths import in_scope
 from vigild.verifier import TEST_FILE, invoked_scripts
 from vigild.workspace import Workspace
@@ -140,6 +140,7 @@ def check_worker(
     *,
     cost: float,
     runner_config: list[str] | tuple[str, ...] = (),
+    session_base: str | None = None,
 ) -> list[str]:
     spec = contract["spec"]
     errors: list[str] = []
@@ -158,8 +159,16 @@ def check_worker(
     if report.task_id != contract["task_id"]:
         errors.append(f"report task_id {report.task_id} is not {contract['task_id']}")
     errors += check_tests(spec, tests)
-    changed = [path for _, path in ws.changed(repo, base_sha, head)]
-    outside = out_of_scope(changed, spec.get("files_in_scope") or [])
+    if session_base and not ws.is_ancestor(repo, session_base, head):
+        # the branch was rewritten (reset, amend, rebase): what vigild committed is gone
+        errors.append(
+            "vigild's pre-session commit is missing from the branch (history was rewritten); "
+            "the files can't be checked against scope"
+        )
+        return errors
+    changed = [path for _, path in ws.changed(repo, session_base or base_sha, head)]
+    own = artifact_paths(str(contract.get("job_id") or ""), str(contract.get("task_id") or ""))
+    outside = out_of_scope(changed, [*(spec.get("files_in_scope") or []), *own])
     if outside:
         errors.append(f"files changed outside scope: {outside}")
     for w in weakened_tests(ws, repo, base_sha, head):

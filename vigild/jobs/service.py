@@ -31,6 +31,7 @@ from vigild.intake.spec_gate import check_job_spec, check_task, runner_files_nam
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import InboxItem, Job, JobState
+from vigild.metering.calls import session_cost
 from vigild.provenance import Provenance
 from vigild.router.rules import RoutingError, route
 from vigild.verifier import runner_overlap
@@ -39,7 +40,7 @@ from vigild.verifier import runner_overlap
 class Runner(Protocol):
     def on_job_created(self, job_id: str, needs_spec: bool) -> None: ...
     def on_approved(self, job_id: str) -> None: ...
-    def on_resume(self, job_id: str) -> None: ...
+    def on_resume(self, job_id: str, *, replan: bool = False) -> None: ...
     def on_rebuild(self, repo: str, base_sha: str) -> None: ...
 
 
@@ -351,7 +352,32 @@ class JobService:
         return []
 
     def file_item(self, job_id: str) -> None:
-        """File the spec inbox item for a spec that passed the gate."""
+        """File the spec inbox item for a spec that passed the gate. One open
+        spec item per job: a second call (a retry, a restart) files nothing."""
+        with self.store.tx():
+            if self.open_spec_item(job_id) is not None:
+                return
+            self._file_item(job_id)
+
+    def _stage_spend(self, job_id: str) -> dict[str, float]:
+        """Coord and hidden-test author spend so far, shown side by side on the
+        spec item. The author's is outside every task's own cap."""
+        out = {"coord_usd": 0.0, "hidden_test_author_usd": 0.0}
+        for s in self.store.list_sessions(job_id):
+            key = {"coord": "coord_usd", "hidden_test_author": "hidden_test_author_usd"}.get(
+                s.role.value
+            )
+            if key:
+                out[key] += session_cost(self.store, s.id)
+        return {k: round(v, 6) for k, v in out.items()}
+
+    def open_spec_item(self, job_id: str) -> InboxItem | None:
+        for it in self.store.list_inbox():
+            if it.job_id == job_id and it.kind == "spec":
+                return it
+        return None
+
+    def _file_item(self, job_id: str) -> None:
         plan = self.store.get_artifact(job_id, "plan.md")
         spec = self.store.get_artifact(job_id, "spec.md")
         assert plan is not None
@@ -370,6 +396,7 @@ class JobService:
             f"Approve spec: {job.title}",
             {
                 "repo": job.repo,
+                "spend": self._stage_spend(job_id),
                 "why": intake.get("why"),
                 "value": intake.get("value"),
                 "risk": intake.get("risk"),
@@ -522,7 +549,7 @@ class JobService:
                 job_id=job.id,
             )
             self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
-        self.runner.on_resume(job.id)
+        self.runner.on_resume(job.id, replan=True)
         return job
 
     def abandon(self, item_id: int) -> Job:

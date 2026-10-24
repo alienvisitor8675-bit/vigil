@@ -53,7 +53,7 @@ class NullRunner:
     def on_approved(self, job_id: str) -> None:
         log.info("job %s approved; no runner attached", job_id)
 
-    def on_resume(self, job_id: str) -> None:
+    def on_resume(self, job_id: str, *, replan: bool = False) -> None:
         log.info("job %s resumed; no runner attached", job_id)
 
     def on_rebuild(self, repo: str, base_sha: str) -> None:
@@ -166,7 +166,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     from vigild.executors.runtime import DockerRuntime, DockerTestRunner
     from vigild.github.app import READ_ONLY
     from vigild.jobs.runner import GitHubPublisher, NoPublisher, Publisher
-    from vigild.verifier import Verifier
+    from vigild.verifier import Verifier, host_key
     from vigild.workspace import Workspace
 
     client = docker.from_env()
@@ -199,7 +199,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         publisher,
         v.telemetry,
         images,
-        Verifier(ws, tests),
+        Verifier(ws, tests, host_key=host_key(v.secrets.get("VIGIL_HOST_KEY"))),
         reaper=runtime.reap,
         session_images=sessions,
     )

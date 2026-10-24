@@ -38,6 +38,7 @@ from vigild.telemetry.spans import Telemetry
 from vigild.verifier import Verifier
 from vigild.workspace import Workspace
 
+KEY = b"k" * 32
 REPO = "o/fixture"
 
 SPEC = """# Spec: document the rate limit
@@ -140,7 +141,10 @@ def _work(clone: Path, doc: str, *, honest: bool = True) -> None:
 
 
 HIDDEN_BODY = (
-    "import os\n\n\ndef test_flag_env_is_set():\n    assert os.environ.get('FLAG_ON') == '1'\n"
+    "from vigil_hidden import check, run_subject\n\n\n"
+    "def test_flag_env_is_set():\n"
+    "    r = run_subject(['python3', 'tools/check.py'])\n"
+    "    check(r['returncode'] == 0 and r['stdout'].strip() == 'ok', repr(r))\n"
 )
 HIDDEN_NAME = "flag env is set by the runner"
 Author = Callable[[SessionSpec, dict[str, Any]], "ExecOutcome | None"]
@@ -358,7 +362,7 @@ def world(
         publisher,
         Telemetry(),
         images,
-        Verifier(ws, tests),
+        Verifier(ws, tests, host_key=KEY),
         background=False,
         session_images=SessionImages(images, lambda: tmp_path),
     )
@@ -1095,28 +1099,32 @@ def test_an_unnamed_runner_config_change_is_rejected(world: World) -> None:
 
 
 def _named(j: str) -> tuple[str, str]:
-    """A spec whose first worker names conftest.py, a runner file."""
-    sp = SPEC.replace("- `tests/test_runbook.py`\n", "- `tests/test_runbook.py`\n- `conftest.py`\n")
-    pl = plan(j).replace(
-        '"tests/test_feature_map.py"\n   ]', '"tests/test_feature_map.py",\n    "conftest.py"\n   ]'
+    """A spec whose first worker names tools/check.py, a runner file."""
+    sp = SPEC.replace(
+        "- `tests/test_runbook.py`\n", "- `tests/test_runbook.py`\n- `tools/check.py`\n"
     )
-    assert "conftest.py" in pl
+    pl = plan(j).replace(
+        '"tests/test_feature_map.py"\n   ]',
+        '"tests/test_feature_map.py",\n    "tools/check.py"\n   ]',
+    )
+    assert "tools/check.py" in pl
     return sp, pl
 
 
-FLAG_CONFTEST = "import os\n\nos.environ['FLAG_ON'] = '1'\n"
+TOOL_OK = 'print("ok")\n'
 
 
 def _runner_world(w: World) -> None:
-    w.runner.cfg.repos.repos[REPO].runner_config = ["conftest.py"]
+    w.runner.cfg.repos.repos[REPO].runner_config = ["tools/check.py"]
     w.standin.coord_drafts = [_named]
 
 
-def _flag_edit(conftest: str = FLAG_CONFTEST) -> Callable[[SessionSpec, dict[str, Any]], None]:
+def _flag_edit(tool: str = TOOL_OK) -> Callable[[SessionSpec, dict[str, Any]], None]:
     def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
         _work(spec.clone, task["spec"]["files_in_scope"][0])
         if str(spec.task_id).endswith("w1"):
-            (spec.clone / "conftest.py").write_text(conftest)
+            (spec.clone / "tools").mkdir(exist_ok=True)
+            (spec.clone / "tools/check.py").write_text(tool)
 
     return edit
 
@@ -1145,14 +1153,14 @@ def test_the_author_runs_before_the_spec_is_filed_and_the_inbox_shows_names_only
     item = _spec_item(w)
     by = {x["task_id"]: x for x in item["body"]["workers"]}
     w1, w2 = by[f"{job}-w1"], by[f"{job}-w2"]
-    assert w1["runner_file_change"] == ["conftest.py"] and w2["runner_file_change"] == []
+    assert w1["runner_file_change"] == ["tools/check.py"] and w2["runner_file_change"] == []
     assert w1["hidden_tests"] == {
         "status": "ok",
         "tests": [{"name": HIDDEN_NAME, "category": "happy-path"}],
         "attempts": 1,
     }
     assert "hidden_tests" not in w2
-    assert "test_hidden.py" not in json.dumps(item) and "FLAG_ON" not in json.dumps(item)
+    assert "test_hidden.py" not in json.dumps(item) and "run_subject" not in json.dumps(item)
     # the author is a fresh, role-recorded session under its own cap
     (author,) = [x for x in w.store.list_sessions(job) if x.role is Role.HIDDEN_TEST_AUTHOR]
     assert author.parent_session_id is None and author.detail["for_task"] == f"{job}-w1"
@@ -1167,7 +1175,7 @@ def test_the_author_runs_before_the_spec_is_filed_and_the_inbox_shows_names_only
     art = json.loads(w.store.get_artifact(job, "hidden_tests.json").content)
     assert art["provenance"] == "claude" and art["tasks"][f"{job}-w1"]["status"] == "ok"
     gate = json.loads(w.store.get_artifact(job, "spec_gate.json").content)
-    assert gate["runner_file_change"] == {f"{job}-w1": ["conftest.py"]}
+    assert gate["runner_file_change"] == {f"{job}-w1": ["tools/check.py"]}
 
 
 def test_a_runner_file_task_passes_on_its_hidden_tests_and_the_pr_says_so(world: World) -> None:
@@ -1177,19 +1185,19 @@ def test_a_runner_file_task_passes_on_its_hidden_tests_and_the_pr_says_so(world:
     job = _approve(w)
     assert w.store.get_job(job).state.value == "in_review"
     pr = next(p for p in w.publisher.prs if p["head"] == f"vigil/{job}-w1")
-    assert "Owner review required: runner file changed: `conftest.py`" in pr["body"]
+    assert "Owner review required: runner file changed: `tools/check.py`" in pr["body"]
     assert pr["draft"]
     other = next(p for p in w.publisher.prs if p["head"] == f"vigil/{job}-w2")
     assert "Owner review required" not in other["body"]
     # the marker is durable: on the task's contract and on the pr_open event
-    assert w.store.get_task(f"{job}-w1").contract["runner_file_change"] == ["conftest.py"]
+    assert w.store.get_task(f"{job}-w1").contract["runner_file_change"] == ["tools/check.py"]
     assert w.store.get_task(f"{job}-w2").contract["runner_file_change"] == []
     (opened,) = [e for e in _events(w, "pr_open") if e["task_id"] == f"{job}-w1"]
-    assert opened["runner_file_change"] == ["conftest.py"]
+    assert opened["runner_file_change"] == ["tools/check.py"]
     rec = json.loads(w.store.get_artifact(job, "tests.json", task_id=f"{job}-w1").content)
-    assert rec["runner_files"] == ["conftest.py"] and rec["runner_file_changed"] is True
+    assert rec["runner_files"] == ["tools/check.py"] and rec["runner_file_changed"] is True
     assert rec["runner_config"]["pinned_to_base"] == []
-    assert rec["after"]["outcome"] == "pass"  # the head's conftest.py ran
+    assert rec["after"]["outcome"] == "pass"  # the head's tool is the subject, run as a subprocess
     assert rec["hidden"]["ok"] and rec["hidden"]["base"]["outcome"] == "fail"
     assert rec["hidden"]["head"]["outcome"] == "pass"
 
@@ -1218,7 +1226,7 @@ def test_hidden_tests_never_reach_a_worker_or_the_branch(world: World) -> None:
     assert clones == {f"{job}-w1": False, f"{job}-w2": False}
     for role, packet in w.standin.packets:
         if role == "worker":
-            assert HIDDEN_NAME not in packet and "FLAG_ON" not in packet
+            assert HIDDEN_NAME not in packet and "run_subject" not in packet
             assert "test_hidden.py" not in packet and "/hidden/" not in packet
     for n in (1, 2):
         files = git(w.bare, "ls-tree", "-r", "--name-only", f"vigil/{job}-w{n}")
@@ -1240,13 +1248,13 @@ def subprocess_has_object(repo: Path, sha: str) -> bool:
 def test_hidden_tests_decide_even_when_the_visible_test_passes(world: World) -> None:
     w = world
     _runner_world(w)
-    w.standin.worker_edit = _flag_edit("import os\n")  # visible test passes; FLAG_ON is never set
+    w.standin.worker_edit = _flag_edit('print("bad")\n')  # visible test passes; the tool says bad
     job = _approve(w)
     assert f"vigil/{job}-w1" not in [p["head"] for p in w.publisher.prs]
     item = _failure_item(w, job)
     body = json.dumps(item["body"])
     assert "hidden tests must pass on the head" in body
-    assert HIDDEN_NAME not in body and "test_hidden" not in body and "FLAG_ON" not in body
+    assert HIDDEN_NAME not in body and "test_hidden" not in body and "run_subject" not in body
     rec = json.loads(w.store.get_artifact(job, "tests.json", task_id=f"{job}-w1").content)
     assert rec["after"]["outcome"] == "pass" and rec["hidden"]["ok"] is False
 
@@ -1371,7 +1379,7 @@ def test_hidden_show_prints_the_tests_and_records_that_a_human_saw_them(world: W
     job = _request(w)
     _approve_item(w)
     out = show(w.store, w.runner.workspace, f"{job}-w1")
-    assert HIDDEN_NAME in out and "FLAG_ON" in out and "test_hidden.py" in out
+    assert HIDDEN_NAME in out and "run_subject" in out and "test_hidden.py" in out
     (ev,) = _events(w, "hidden_tests_shown")
     assert ev["task"] == f"{job}-w1" and ev["task_id"] == f"{job}-w1"
     row = w.store.q("SELECT provenance FROM events WHERE type='hidden_tests_shown'")[0]

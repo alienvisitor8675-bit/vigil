@@ -16,7 +16,7 @@ import shlex
 import shutil
 import socket
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
@@ -153,6 +153,37 @@ PREPARE = (
     f'head -c {MAX_REPORT} "$f" | base64 -w0; printf "\\n"; done; '
     'printf "%s END %s\\n" "$m" "$rc"; exit $rc'
 )
+# The verifier's script for a hidden run (hotfix 5, round 2). PID 1 is root with
+# only the capabilities below; it starts vigild's subject broker (as root), then
+# runs everything else as the agent uid with no capabilities and no new
+# privileges. The report dir and the broker's FIFO are the agent's, mode 0700, so
+# the subject, which the broker runs as another uid (10002), can reach neither.
+# No setpriv in the image means exit 125 (unknown), never a run as root.
+PREPARE_SUBJECT = (
+    "read -r m || exit 125; exec </dev/null; "
+    "command -v setpriv >/dev/null || exit 125; "
+    "A='setpriv --reuid={uid} --regid={uid} --clear-groups --inh-caps=-all "
+    "--bounding-set=-all --no-new-privs --'; "
+    f"mkdir -m 700 {REPORT_DIR} && chown {{uid}}:{{uid}} {REPORT_DIR} || exit 125; "
+    "mkfifo -m 600 /vigil-ipc/queue && chown {uid}:{uid} /vigil-ipc/queue || exit 125; "
+    # the subject: a copy owned by 10002, mode 0500/0400, in a tmpfs; the mount it
+    # came from sits under a root-only directory. The test process (10001) can't read
+    # either, so no import of subject code, by any syntax, can succeed in it.
+    "cp -a /vigil-src/subject/. /subject/ && chown -R {subj}:{subj} /subject "
+    "&& chmod -R u=rX,go= /subject || exit 125; "
+    "sh /vigil/broker.sh & "
+    "if [ -x /usr/local/bin/vigil-prepare ]; then $A /usr/local/bin/vigil-prepare || exit 125; "
+    "else $A cp -a /src/. /work/ || exit 125; fi; "
+    "cd /work; "
+    '$A bash -o pipefail -o errexit -c "$0"; rc=$?; '
+    'printf "\\n%s BEGIN\\n" "$m"; '
+    f"for f in {REPORT_DIR}/pytest.xml {REPORT_DIR}/vitest-*.xml; do "
+    '[ -f "$f" ] || continue; printf "%s %s\\n" "$m" "$(basename "$f")"; '
+    f'head -c {MAX_REPORT} "$f" | base64 -w0; printf "\\n"; done; '
+    'printf "%s END %s\\n" "$m" "$rc"; exit $rc'
+)
+SUBJECT_UID = 10002  # the uid every subject runs as (hiddenkit/broker.sh)
+SUBJECT_CAPS = ("SETUID", "SETGID", "SETPCAP", "KILL", "CHOWN", "DAC_OVERRIDE", "FOWNER")
 REPORT_NAME = re.compile(r"^(pytest|vitest-[0-9]{1,3})\.xml$")
 
 
@@ -186,7 +217,15 @@ def split_reports(text: str, marker: str) -> tuple[str, dict[str, bytes]]:
     return (out[:-1] if out.endswith("\n") else out), reports
 
 
-def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict[str, Any]:
+def verifier_kwargs(
+    cfg: Config,
+    image: str,
+    source: Path,
+    command: str,
+    env: Mapping[str, str] | None = None,
+    subject: Path | None = None,
+    kit: Path | None = None,
+) -> dict[str, Any]:
     """The verifier's container (owner direction, round 2): the repo's dev
     image, vigild's checkout read-only at /src, no network at all, the agent
     uid with no capabilities, and nothing else mounted. The suites write (build
@@ -197,13 +236,30 @@ def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict
     return {
         "image": image,
         "entrypoint": ["sh", "-c"],
-        "command": [PREPARE, command],
-        "user": f"{uid}:{uid}",
+        "command": [
+            PREPARE_SUBJECT.format(uid=uid, subj=SUBJECT_UID) if subject else PREPARE,
+            command,
+        ],
+        "user": "0:0" if subject else f"{uid}:{uid}",
         "network_mode": "none",
-        "mounts": [_mount(str(source), "/src", read_only=True)],
+        "mounts": [
+            _mount(str(source), "/src", read_only=True),
+            # the code under test, for a hidden run: read-only, and run only as a subprocess
+            *([_mount(str(subject), "/vigil-src/subject", read_only=True)] if subject else []),
+            *([_mount(str(kit), "/vigil", read_only=True)] if subject and kit else []),
+        ],
         "tmpfs": {
             "/tmp": f"{tmp},size=2g,mode=1777",  # noqa: S108
             "/work": f"{tmp},size=4g,mode=0755",
+            **(
+                {
+                    "/vigil-ipc": f"rw,uid={uid},gid={uid},mode=0700,size=64m",  # the queue
+                    "/vigil-src": "rw,uid=0,gid=0,mode=0700,size=1m",  # root-only
+                    "/subject": f"rw,exec,uid={SUBJECT_UID},gid={SUBJECT_UID},mode=0700,size=2g",
+                }
+                if subject
+                else {}
+            ),
         },
         "working_dir": "/work",
         "environment": {  # caches on the container's own tmpfs, never the source
@@ -214,13 +270,29 @@ def verifier_kwargs(cfg: Config, image: str, source: Path, command: str) -> dict
             "NO_COLOR": "1",
             "PYTEST_ADDOPTS": f"--junitxml={REPORT_DIR}/pytest.xml -p no:cacheprovider",
             "pnpm_config_verify_deps_before_run": "false",
+            **({"VIGIL_SUBJECT": "/subject", "VIGIL_BROKER": "/vigil-ipc"} if subject else {}),
+            **(env or {}),
         },
         "stdin_open": True,  # the report marker, then closed
         "labels": {LABEL: f"verify-{source.parent.name}", "dev.vigil.role": "verifier"},
         **_hardening(cfg),
+        **({"cap_add": list(SUBJECT_CAPS)} if subject else {}),
         "mem_limit": cfg.vigild.container.verifier_memory,
         "pids_limit": max(cfg.vigild.container.pids_limit, 2048),
     }
+
+
+def write_kit(dest: Path) -> Path:
+    """vigild's broker and its client, copied next to the checkout (never mounted
+    from the repo itself) for the container to mount read-only at /vigil."""
+    src = Path(__file__).resolve().parents[1] / "hiddenkit"
+    dest.mkdir(parents=True, exist_ok=True)
+    for name in ("broker.sh", "run.sh"):
+        target = dest / name
+        target.write_text((src / name).read_text())
+        target.chmod(0o644)
+    dest.chmod(0o755)
+    return dest
 
 
 class DockerTestRunner:
@@ -235,18 +307,43 @@ class DockerTestRunner:
         self._slots = threading.BoundedSemaphore(cfg.vigild.container.verifier_concurrency)
 
     def run(
-        self, image: str, source: Path, command: str, *, timeout_s: int, max_output: int
+        self,
+        image: str,
+        source: Path,
+        command: str,
+        *,
+        timeout_s: int,
+        max_output: int,
+        env: Mapping[str, str] | None = None,
+        subject: Path | None = None,
     ) -> RunResult:
         with self._slots:  # round 4, item 12: verifier containers one at a time
-            return self._run(image, source, command, timeout_s=timeout_s, max_output=max_output)
+            return self._run(
+                image,
+                source,
+                command,
+                timeout_s=timeout_s,
+                max_output=max_output,
+                env=env,
+                subject=subject,
+            )
 
     def _run(
-        self, image: str, source: Path, command: str, *, timeout_s: int, max_output: int
+        self,
+        image: str,
+        source: Path,
+        command: str,
+        *,
+        timeout_s: int,
+        max_output: int,
+        env: Mapping[str, str] | None = None,
+        subject: Path | None = None,
     ) -> RunResult:
         import docker.errors
 
         marker = f"VIGIL-REPORT-{secrets.token_hex(16)}"
-        kw = verifier_kwargs(self.cfg, image, source, command)
+        kit = write_kit(source.parent / "kit") if subject else None
+        kw = verifier_kwargs(self.cfg, image, source, command, env, subject, kit)
         kw["mounts"] = _docker_mounts(kw["mounts"])
         c = self.client.containers.create(**kw)
         timed_out = threading.Event()

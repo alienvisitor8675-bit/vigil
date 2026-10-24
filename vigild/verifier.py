@@ -38,16 +38,21 @@ is evidence of which tests failed, not a defence against a hostile test.
 
 from __future__ import annotations
 
+import fnmatch
+import hashlib
+import hmac
 import json
+import posixpath
 import re
 import shlex
 import shutil
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from vigild.blackbox import problems as blackbox_problems
 from vigild.intake.paths import in_scope
 from vigild.redact import redact
 from vigild.shellwords import Command, parse
@@ -79,7 +84,15 @@ class RunResult:
 
 class TestRunner(Protocol):
     def run(
-        self, image: str, source: Path, command: str, *, timeout_s: int, max_output: int
+        self,
+        image: str,
+        source: Path,
+        command: str,
+        *,
+        timeout_s: int,
+        max_output: int,
+        env: Mapping[str, str] | None = None,
+        subject: Path | None = None,
     ) -> RunResult: ...
 
 
@@ -180,6 +193,58 @@ class HiddenSuite:
     prefix: str
     files: tuple[str, ...]
     test_cmd: str
+    expected: int  # how many tests vigild stored; the runs must report exactly this many
+    project: str = ""  # a vitest project's dir (repo-relative)
+    vitest: bool = False  # vitest (helper is .mjs) rather than pytest
+
+
+# Files that decide how a runner collects and runs tests, at any depth. A worker's copy
+# of one on a hidden test's import or config path is tampering (hotfix 5).
+RUNNER_LIKE = (
+    "conftest.py", "pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml", "tox.ini",
+    "setup.cfg", "pyproject.toml", "package.json", "vitest*.config.*", "vitest.workspace.*",
+    "vitest.config.*", "vite.config.*", ".npmrc",
+)  # fmt: skip
+
+
+def runner_like(path: str) -> bool:
+    name = posixpath.basename(path)
+    return any(fnmatch.fnmatchcase(name, g) for g in RUNNER_LIKE)
+
+
+TAG_DOMAIN = "hidden-tag:"
+MIN_KEY_BYTES = 32
+
+
+def host_key(value: str | None) -> bytes | None:
+    """The VIGIL_HOST_KEY secret as key bytes: at least 64 hex characters (32
+    bytes), else no key."""
+    return value.encode() if value and len(value) >= 2 * MIN_KEY_BYTES else None
+
+
+TAG_ENV = "VIGIL_HIDDEN_TAG"
+HELPER_NAME = "vigil_hidden"
+KIT = Path(__file__).parent / "hiddenkit"
+HELPER_PY = (KIT / "vigil_hidden.py.txt").read_text()
+HELPER_JS = (KIT / "vigil_hidden.mjs.txt").read_text()
+
+
+def hidden_tag(key: bytes, task_id: str) -> str:
+    """The per-task tag a hidden test's assertion carries: HMAC(host key,
+    "hidden-tag:" + task id). It reaches only the hidden base run's container
+    (the base's own code, never a worker's); a worker can't make a failure
+    carry it without the key."""
+    return hmac.new(key, (TAG_DOMAIN + task_id).encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def helper_file(suite_prefix: str, vitest: bool) -> tuple[str, str]:
+    """(path, text) of vigild's helper, laid in the suite's directory for a hidden
+    run only (`vigil_hidden.py`, or `vigil_hidden.mjs` for vitest)."""
+    return (
+        (f"{suite_prefix}/{HELPER_NAME}.mjs", HELPER_JS)
+        if vitest
+        else (f"{suite_prefix}/{HELPER_NAME}.py", HELPER_PY)
+    )
 
 
 PACKAGE_MANAGERS = {"pnpm", "npm", "yarn"}
@@ -199,6 +264,7 @@ class ReportPlan:
     command: str
     reports: int
     problems: list[str]
+    vitest_dirs: tuple[str, ...] = ()  # repo-relative dirs of the vitest projects it runs
 
 
 def _flags(n: int) -> str:
@@ -222,6 +288,7 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
     to is a problem, never a silent drop."""
     problems: list[str] = []
     out, pos, n, reporting = [], 0, 0, 0
+    vitest_dirs: list[str] = []
     cwd = ""
     for c in parse(test_cmd).commands:
         if c.program == "cd" and c.args:
@@ -233,6 +300,7 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
         if _runs_vitest(c):
             n += 1
             reporting += 1
+            vitest_dirs.append(cwd)
             end = c.start + len(c.text.rstrip())
             out.append(test_cmd[pos:end] + _flags(n))
             pos = end
@@ -287,6 +355,7 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
         if _runs_pytest(last):
             continue  # PYTEST_ADDOPTS reaches it through pnpm
         n += 1
+        vitest_dirs.append(where)
         body = " ".join([script, *(shlex.quote(a) for a in extra)]) + _flags(n)
         lead = c.text[: len(c.text) - len(c.text.lstrip())]
         dir_opt = f"-C {shlex.quote(where)} " if where and where != cwd else ""
@@ -301,7 +370,7 @@ def plan_reports(test_cmd: str, read: ReadFile | None) -> ReportPlan:
         problems.append(
             "runs no test runner vigil can read (pytest, vitest, or a pnpm script that runs one)"
         )
-    return ReportPlan("".join(out), reporting, problems)
+    return ReportPlan("".join(out), reporting, problems, tuple(dict.fromkeys(vitest_dirs)))
 
 
 def can_report(test_cmd: str, read: ReadFile | None = None) -> bool:
@@ -317,9 +386,10 @@ class Case:
     id: str
     file: str
     status: str  # pass | failure | error | skipped | xfail
+    assertion: bool = False  # a failure carrying the task's HMAC tag (hidden runs only)
 
 
-def parse_junit(data: bytes) -> list[Case]:
+def parse_junit(data: bytes, tag: str = "") -> list[Case]:
     if len(data) > MAX_REPORT or b"<!DOCTYPE" in data or b"<!ENTITY" in data:
         return []
     try:
@@ -329,15 +399,26 @@ def parse_junit(data: bytes) -> list[Case]:
     cases: list[Case] = []
     for tc in root.iter("testcase"):
         classname = tc.get("classname", "")
-        status = "pass"
-        for tag in ("failure", "error", "skipped"):
-            el = tc.find(tag)
+        status, assertion = "pass", False
+        for tag_name in ("failure", "error", "skipped"):
+            el = tc.find(tag_name)
             if el is not None:
                 xfail = "xfail" in (el.get("type", "") + el.get("message", "")).lower()
-                status = "xfail" if tag == "skipped" and xfail else tag
+                status = "xfail" if tag_name == "skipped" and xfail else tag_name
+                # an assertion failure is a failure whose message carries this task's tag
+                assertion = (
+                    tag_name == "failure"
+                    and bool(tag)
+                    and f"[vigil-tag:{tag}]" in (el.get("message", "") + (el.text or ""))
+                )
                 break
         cases.append(
-            Case(f"{classname}::{tc.get('name', '')}", tc.get("file") or classname, status)
+            Case(
+                f"{classname}::{tc.get('name', '')}",
+                tc.get("file") or classname,
+                status,
+                assertion,
+            )
         )
     return cases
 
@@ -464,13 +545,46 @@ def compare_runs(
     return out
 
 
+def vitest_list_command(test_cmd: str, read: ReadFile | None) -> str | None:
+    """`test_cmd` turned into the project's own `vitest list --json` (same script,
+    same flags); None if it runs no vitest."""
+    plan = plan_reports(test_cmd, read)
+    if not plan.vitest_dirs or plan.problems:
+        return None
+    cmd = re.sub(r"\s+--reporter=\S+|\s+--outputFile\.junit=\S+", "", plan.command)
+    new, n = re.subn(r"\bvitest(\s+run)?\b", "vitest list --filesOnly --json", cmd, count=1)
+    return new if n else None
+
+
+def _listed_files(output: str) -> list[str] | None:
+    """The file names in `vitest list --json`'s output (a JSON array somewhere in it)."""
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\[", output):
+        try:
+            val, _ = dec.raw_decode(output[m.start() :])
+        except ValueError:
+            continue
+        if isinstance(val, list):
+            return [
+                str(x.get("file", x.get("name", ""))) if isinstance(x, dict) else str(x)
+                for x in val
+            ]
+    return None
+
+
 class Verifier:
     def __init__(
-        self, workspace: Workspace, runner: TestRunner, timeout_s: int = VERIFY_SECONDS
+        self,
+        workspace: Workspace,
+        runner: TestRunner,
+        timeout_s: int = VERIFY_SECONDS,
+        host_key: bytes | None = None,
     ) -> None:
         self.ws = workspace
         self.runner = runner
         self.timeout_s = timeout_s
+        # VIGIL_HOST_KEY; without a key of at least 32 bytes no hidden test can count
+        self.host_key = host_key if host_key and len(host_key) >= MIN_KEY_BYTES else None
 
     def verify(
         self,
@@ -485,6 +599,7 @@ class Verifier:
         runner_config: Iterable[str] = (),
         runner_overlap: Sequence[str] = (),
         hidden: HiddenSuite | None = None,
+        scope: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         """`test_cmd` is the approved spec's, never the worker's tree's.
 
@@ -563,7 +678,8 @@ class Verifier:
         if hidden is not None:
             record["hidden"] = self._hidden_pair(
                 repo, image, task_id, base_sha, head, hidden, cfg, overlap,
-                base_files, head_files,
+                base_files, head_files, changed,
+                list(scope) if scope is not None else list(overlap),
             )  # fmt: skip
         record["provenance"] = "human"  # observed by vigild, not reported by the model
         record["source"] = "verifier"
@@ -594,45 +710,120 @@ class Verifier:
         repo: str,
         image: str,
         name: str,
-        sha: str,
+        task_id: str,
         base_sha: str,
         hidden: HiddenSuite,
-        pinned: list[str],
+        *,
+        head: str | None = None,
+        scope: Sequence[str] = (),
+        changed: Sequence[tuple[str, str]] = (),
+        tagged: bool = False,
     ) -> dict[str, Any]:
+        """One hidden run, black-box (hotfix 5, round 2). The test process runs in
+        a checkout that is the base, every runner file included, plus vigild's
+        hidden files and helper: no head file is in it. The code under test is a
+        second, read-only checkout (the base, plus the worker's in-scope changes
+        for the head run) that the runner mounts at $VIGIL_SUBJECT; the helper
+        runs it only as a subprocess. Only the base run gets the tag in its
+        environment: the base's own code runs there, never a worker's."""
+        assert self.host_key is not None
         command = with_reports(
             hidden.test_cmd, lambda path: self.ws.read_blob(repo, base_sha, path)
         )
-        take = [(base_sha, pinned), (hidden.sha, list(hidden.files))]
-        run = self._run(repo, image, name, sha, hidden.test_cmd, command, take)
+        mine: list[str] = []
+        if head is not None:
+            mine = sorted(
+                p
+                for _, p in changed
+                if in_scope(p, scope) and not p.startswith(".vigil/") and p not in hidden.files
+            )
+        subject = self.ws.verify_checkout(
+            repo, f"{name}-sub", base_sha,
+            take=[(head, mine)] if head is not None else [],
+        )  # fmt: skip
+        tag = hidden_tag(self.host_key, task_id)
+        try:
+            run = self._run(
+                repo, image, name, base_sha, hidden.test_cmd, command,
+                [(hidden.sha, list(hidden.files))],
+                keep_output=True, tag=tag,
+                put=[helper_file(hidden.prefix.rstrip("/"), hidden.vitest)],
+                env={TAG_ENV: tag if tagged else "untagged"}, subject=subject,
+            )  # fmt: skip
+        finally:
+            shutil.rmtree(subject.parent, ignore_errors=True)
+        self.ws.keep_hidden_output(name, run.pop("_output", ""))
         if not run["_report"] and run["outcome"] == "pass":
             run["outcome"] = "unknown"
             run["note"] = "no test report: that any hidden test ran can't be confirmed"
         return run
 
     @staticmethod
-    def base_failure(run: dict[str, Any]) -> dict[str, Any]:
+    def hidden_summary(run: dict[str, Any]) -> dict[str, Any]:
+        """What tests.json keeps of a hidden run: counts, a hash of the ids and
+        the failure category. No output tail, no names, no source lines: the
+        code is only in the vault (B40); the full output is a file on the host."""
+        cases = run["_cases"] if run["_report"] else []
+        n = {
+            "passing": sum(1 for c in cases if c.status == "pass"),
+            "assertion_failures": sum(1 for c in cases if c.status == "failure" and c.assertion),
+            "other_failures": sum(1 for c in cases if c.status == "failure" and not c.assertion),
+            "errors": sum(1 for c in cases if c.status == "error"),
+        }
+        category = (
+            "none"
+            if not (n["assertion_failures"] or n["other_failures"] or n["errors"])
+            else "assertion"
+            if not (n["other_failures"] or n["errors"])
+            else "not_assertion"
+            if not n["assertion_failures"]
+            else "mixed"
+        )
+        ids = hashlib.sha256("\n".join(sorted(c.id for c in cases)).encode()).hexdigest()[:16]
+        out: dict[str, Any] = {k: run[k] for k in ("sha", "exit", "outcome", "tests") if k in run}
+        out.update(n, failure_category=category, ids_hash=ids)
+        for k in ("note", "truncated"):
+            if k in run:
+                out[k] = run[k]
+        return out
+
+    @staticmethod
+    def base_failure(run: dict[str, Any], expected: int | None = None) -> dict[str, Any]:
         """How a hidden run failed on the base. Every hidden test must fail an
-        assertion: a JUnit `<failure>`. An import, collection or setup error
-        (`<error>`), a pass, a skip, a timeout or a missing report is the wrong
-        way, and doesn't count (owner, 2026-10-23)."""
+        assertion: a JUnit `<failure>` whose message carries this task's HMAC tag
+        (the helper's `check`). An import, collection or setup error, a thrown error
+        or a timeout (pytest and vitest both report those under `<failure>`), a
+        pass, a skip or a missing report is the wrong way, and doesn't count
+        (owner, 2026-10-23). The number of tests that ran must be the number
+        stored, and zero is a fail."""
         cases = run["_cases"] if run["_report"] else []
         n = {k: sum(1 for c in cases if c.status == k) for k in ("failure", "error", "pass")}
-        wrong = len(cases) - n["failure"]
+        asserted = sum(1 for c in cases if c.status == "failure" and c.assertion)
+        other = n["failure"] - asserted + n["error"]
+        wrong = len(cases) - asserted
         out: dict[str, Any] = {
-            "outcome": run["outcome"], "tests": len(cases), "failing": n["failure"],
-            "errors": n["error"], "passing": n["pass"],
+            "outcome": run["outcome"], "tests": len(cases), "failing": asserted,
+            "errors": other, "passing": n["pass"],
         }  # fmt: skip
-        out["ok"] = run["outcome"] == "fail" and bool(cases) and wrong == 0
+        counted = expected is None or len(cases) == expected
+        out["ok"] = run["outcome"] == "fail" and bool(cases) and wrong == 0 and counted
         if not out["ok"]:
-            if run["outcome"] == "pass" or (n["pass"] and not n["error"]):
+            if run["outcome"] == "pass" or (n["pass"] and not other):
                 out["why"] = "the hidden tests pass on the base; they must fail there"
-            elif n["error"]:
+            elif other:
                 out["why"] = (
-                    f"{n['error']} hidden test(s) errored (import, collection or setup) on the "
-                    "base instead of failing an assertion"
+                    f"{other} hidden test(s) errored (import, collection or setup), threw, or "
+                    "timed out on the base instead of failing an assertion"
                 )
             elif run["outcome"] == "timeout":
                 out["why"] = "the hidden tests timed out on the base"
+            elif not cases:
+                out["why"] = "no hidden test ran on the base (zero tests in the report)"
+            elif wrong == 0 and not counted:
+                out["why"] = (
+                    f"{len(cases)} hidden test(s) ran on the base but {expected} are stored: "
+                    "the command must run exactly the author's tests, one entry per test"
+                )
             else:
                 out["why"] = (
                     f"the hidden tests must each fail an assertion on the base, with a report; "
@@ -650,14 +841,51 @@ class Verifier:
         hidden: HiddenSuite,
         runner_config: Iterable[str] = (),
         overlap: Sequence[str] = (),
+        scope: Sequence[str] = (),
     ) -> dict[str, Any]:
-        """Spec time: hidden tests must fail on the base, in their own run,
-        each with an assertion failure."""
-        base_files = self.ws.tree_paths(repo, base_sha)
-        pinned = self._pinned(base_files, set(), list(runner_config), hidden.test_cmd, overlap)
-        pinned = [p for p in pinned if p not in hidden.files]
-        run = self._hidden_run(repo, image, f"{task_id}-hspec", base_sha, base_sha, hidden, pinned)
-        return self.base_failure(run)
+        """Spec time: hidden tests must be black-box, fail on the base in their
+        own run, each with an assertion failure, and exactly the stored number
+        must run."""
+        if self.host_key is None:
+            return {"ok": False, "why": "VIGIL_HOST_KEY is not set: no hidden test can count"}
+        if why := self.whitebox(repo, hidden, scope):
+            return {"ok": False, "why": "the hidden tests are not black-box: " + "; ".join(why[:5])}
+        run = self._hidden_run(
+            repo, image, f"{task_id}-hspec", task_id, base_sha, hidden, tagged=True
+        )
+        return self.base_failure(run, hidden.expected)
+
+    def whitebox(self, repo: str, hidden: HiddenSuite, scope: Sequence[str]) -> list[str]:
+        """The black-box rule (`vigild.blackbox`), checked on the stored files."""
+        files = {f: self.ws.read_blob(repo, hidden.sha, f) or "" for f in hidden.files}
+        return blackbox_problems(files, scope)
+
+    def collect_probe(
+        self, repo: str, image: str, base_sha: str, test_cmd: str, probes: Sequence[str]
+    ) -> set[str] | None:
+        """Ask the project's own vitest which of these probe files it would collect
+        (`vitest list --json` with the test script's own flags), on the base in the
+        no-network dev image. None when it can't be asked: the caller refuses."""
+        command = vitest_list_command(test_cmd, lambda p: self.ws.read_blob(repo, base_sha, p))
+        if command is None:
+            return None
+        text = "import { test } from 'vitest'\ntest('probe', () => {})\n"
+        src = self.ws.verify_checkout(
+            repo, f"probe-{hashlib.sha256(test_cmd.encode()).hexdigest()[:8]}", base_sha,
+            put=[(p, text) for p in probes],
+        )  # fmt: skip
+        try:
+            r = self.runner.run(
+                image, src, command, timeout_s=self.timeout_s, max_output=MAX_OUTPUT
+            )
+        finally:
+            shutil.rmtree(src.parent, ignore_errors=True)
+        if r.exit != 0 or r.timed_out:
+            return None
+        listed = _listed_files(r.output)
+        if listed is None:
+            return None
+        return {p for p in probes if any(f.endswith("/" + p) or f == p for f in listed)}
 
     def _hidden_pair(
         self,
@@ -671,40 +899,84 @@ class Verifier:
         overlap: Sequence[str],
         base_files: set[str],
         head_files: set[str],
+        changed: Sequence[tuple[str, str]],
+        scope: Sequence[str],
     ) -> dict[str, Any]:
         """The hidden tests as their own run, base against head (learning
         ruling 14). They decide a runner-file task: they must fail on the base
-        and pass on the head, with a report, and head may run no fewer."""
-        out: dict[str, Any] = {"test_cmd": hidden.test_cmd, "files": len(hidden.files)}
-        planted = sorted(p for p in head_files if p.startswith(hidden.prefix.rstrip("/") + "/"))
-        if planted:
-            # a worker can't put files where the hidden tests run (a conftest.py there)
-            out.update(ok=False, tampered=planted[:20], failed_on_base=False, passed_on_head=False)
+        and pass on the head, with a report, the stored number of tests must
+        run in both, and head may run no fewer.
+
+        Black-box (hotfix 5, round 2): the test process runs in a base checkout
+        with the hidden files; the worker's in-scope changes are only in a
+        separate read-only subject checkout the tests run as a subprocess. Tampering
+        is any head file in the suite's directory, or an in-scope runner-config file
+        (`RUNNER_LIKE`) that isn't the flagged one. A hidden test that imports
+        in-scope code is refused before any run."""
+        out: dict[str, Any] = {
+            "test_cmd": hidden.test_cmd, "files": len(hidden.files), "expected": hidden.expected,
+        }  # fmt: skip
+        prefix = hidden.prefix.rstrip("/")
+        planted = sorted(p for p in head_files if p.startswith(prefix + "/"))
+        # second layer: an in-scope runner-config file that isn't the flagged runner
+        # file, in the suite's directory, any directory above it or anywhere below
+        config = sorted(
+            p for _, p in changed if runner_like(p) and in_scope(p, scope) and p not in overlap
+        )
+        tampered = sorted({*planted, *config})
+        if self.host_key is None:
+            out.update(ok=False, failed_on_base=False, passed_on_head=False)
+            out["why"] = "VIGIL_HOST_KEY is not set: no hidden test can count"
             return out
-        pinned = [
-            p
-            for p in self._pinned(base_files, head_files, runner_config, hidden.test_cmd, overlap)
-            if p not in hidden.files
-        ]
-        b = self._hidden_run(repo, image, f"{task_id}-hbase", base_sha, base_sha, hidden, pinned)
-        h = self._hidden_run(repo, image, f"{task_id}-hhead", head, base_sha, hidden, pinned)
-        failed_on_base = self.base_failure(b)["ok"]
-        passed_on_head = h["outcome"] == "pass" and h["_report"] and h["tests"] > 0
+        if tampered:
+            out.update(ok=False, tampered=tampered[:20], failed_on_base=False, passed_on_head=False)
+            return out
+        if why := self.whitebox(repo, hidden, scope):
+            out.update(ok=False, whitebox=why[:10], failed_on_base=False, passed_on_head=False)
+            return out
+        b = self._hidden_run(
+            repo, image, f"{task_id}-hbase", task_id, base_sha, hidden, tagged=True
+        )
+        h = self._hidden_run(
+            repo, image, f"{task_id}-hhead", task_id, base_sha, hidden,
+            head=head, scope=scope, changed=changed,
+        )  # fmt: skip
+        h["sha"] = head  # the head run is the base plus the head's in-scope changes
+        bf = self.base_failure(b, hidden.expected)
+        failed_on_base = bf["ok"]
+        head_ran = h["tests"] if h["_report"] else 0
+        passed_on_head = h["outcome"] == "pass" and h["_report"] and head_ran > 0
+        counts = {
+            "expected": hidden.expected,
+            "base": len(b["_cases"]) if b["_report"] else 0,
+            "head": head_ran,
+        }
+        counts["ok"] = counts["base"] == hidden.expected == counts["head"] and counts["head"] > 0
         ran: dict[str, Any] = {"checked": False}
         if b["_report"] and h["_report"]:
-            ran = {**compare_runs(b["_cases"], h["_cases"]), "against": "base"}
+            full = compare_runs(b["_cases"], h["_cases"])
+            # counts and flags only: ids and titles are the tests' names
+            ran = {
+                "checked": True, "against": "base", "ok": full["ok"], "ids": full["ids"],
+                "missing_ids": len(full["missing_ids"]),
+                "missing_files": len(full["missing_files"]),
+                "skipped": full["skipped"], "xfail": full["xfail"],
+            }  # fmt: skip
         out.update(
-            base=b,
-            head=h,
+            base=self.hidden_summary(b),
+            head=self.hidden_summary(h),
             failed_on_base=failed_on_base,
-            base_failure={k: v for k, v in self.base_failure(b).items() if k != "ok"},
-            passed_on_head=bool(passed_on_head),
+            base_failure={k: v for k, v in bf.items() if k not in ("ok", "why")},
+            passed_on_head=bool(passed_on_head and counts["head"] == hidden.expected),
+            count=counts,
             ran=ran,
-            ok=bool(failed_on_base and passed_on_head and (not ran.get("checked") or ran["ok"])),
         )
-        for run in (b, h):
-            run.pop("_cases", None)
-            run.pop("_report", None)
+        out["ok"] = bool(
+            failed_on_base
+            and out["passed_on_head"]
+            and counts["ok"]
+            and (not ran.get("checked") or ran["ok"])
+        )
         return out
 
     @staticmethod
@@ -731,15 +1003,27 @@ class Verifier:
         test_cmd: str,
         command: str,
         take: list[tuple[str, list[str]]],
+        *,
+        put: list[tuple[str, str]] | None = None,
+        keep_output: bool = False,
+        tag: str = "",
+        env: Mapping[str, str] | None = None,
+        subject: Path | None = None,
     ) -> dict[str, Any]:
-        src = self.ws.verify_checkout(repo, name, sha, take=take)
+        src = self.ws.verify_checkout(repo, name, sha, take=take, put=put)
         try:
             r = self.runner.run(
-                image, src, command, timeout_s=self.timeout_s, max_output=MAX_OUTPUT
+                image,
+                src,
+                command,
+                timeout_s=self.timeout_s,
+                max_output=MAX_OUTPUT,
+                env=env,
+                subject=subject,
             )
         finally:
             shutil.rmtree(src.parent, ignore_errors=True)
-        cases = [c for data in r.reports.values() for c in parse_junit(data)]
+        cases = [c for data in r.reports.values() for c in parse_junit(data, tag)]
         got = judge(test_cmd, r.exit, r.timed_out, r.output)
         out: dict[str, Any] = {
             "sha": sha,
@@ -761,4 +1045,6 @@ class Verifier:
             out["note"] = f"exit 0, but the report has {len(failing)} failing test(s)"
         if r.truncated:
             out["truncated"] = True
+        if keep_output:
+            out["_output"] = redact(r.output)
         return out

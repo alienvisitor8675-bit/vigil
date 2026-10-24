@@ -1,0 +1,188 @@
+// vigild's helper for hidden tests (vitest). vigild lays this file in the test
+// directory for a hidden run; the author and the worker never write it.
+//
+// A hidden test is black-box: it never imports the code under test. It asserts
+// through `check`, and reaches the subject (the worker's in-scope code, a
+// read-only checkout at $VIGIL_SUBJECT) only through `runSubject` (a command) or
+// `callSubject` (a function, called by a separate vigild-owned driver process).
+// In the verifier every subject runs as uid 10002 through vigild's root-owned
+// broker ($VIGIL_BROKER), in its own process group, killed when the call ends.
+import { spawnSync } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
+import { mkdtempSync, realpathSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+
+const SUBJECT = process.env.VIGIL_SUBJECT || ''
+const BROKER = process.env.VIGIL_BROKER || ''
+const KEEP = ['PATH', 'LANG', 'LC_ALL', 'TZ']
+
+const CHILD = String.raw`
+import { writeSync } from 'node:fs'
+import { pathToFileURL } from 'node:url'
+import path from 'node:path'
+let raw = ''
+for await (const d of process.stdin) raw += d
+const spec = JSON.parse(raw)
+for (const c of spec.calls) {
+  let r
+  try {
+    const m = await import(pathToFileURL(path.resolve(spec.cwd, c.module)).href)
+    let fn = m
+    for (const part of c.func.split('.')) fn = fn[part]
+    const val = await fn(...(c.args || []))
+    JSON.stringify(val)
+    r = { ok: true, value: val === undefined ? null : val }
+  } catch (e) {
+    r = { ok: false, type: (e && e.constructor && e.constructor.name) || 'Error', message: String((e && e.message) || e).slice(0, 2000) }
+  }
+  writeSync(3, JSON.stringify(r) + '\n')
+}
+`
+
+const DRIVER = String.raw`
+import { spawnSync } from 'node:child_process'
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+const lines = readFileSync(0, 'utf8').split('\n')
+const nonce = lines[0]
+const spec = JSON.parse(lines.slice(1).join('\n'))
+const KEEP = ['PATH', 'LANG', 'LC_ALL', 'TZ']
+const keep = {}
+for (const k of KEEP) if (process.env[k] !== undefined) keep[k] = process.env[k]
+const broker = process.env.VIGIL_BROKER || ''
+const BOOT = ['--input-type=module', '-e', "await import('data:text/javascript;base64,' + process.argv[1])", Buffer.from(CHILD_SRC).toString('base64')]
+const dir = mkdtempSync(path.join(tmpdir(), 'vigil-res-'))
+const rpath = path.join(dir, 'results')
+const input = JSON.stringify({ cwd: spec.cwd, calls: spec.calls })
+let p
+if (broker) {
+  const senv = Object.entries(keep).map(([k, v]) => k + '=' + v).join('\n')
+  openSync(rpath, 'w')
+  p = spawnSync('sh', ['/vigil/run.sh', spec.cwd, String(spec.timeout), rpath, '--', process.execPath, ...BOOT], {
+    input, env: { PATH: keep.PATH || '', VIGIL_BROKER: broker, VIGIL_SUBJ_ENV: senv },
+    killSignal: 'SIGKILL', maxBuffer: 16 << 20, // the broker times the call
+
+  })
+} else {
+  const fd = openSync(rpath, 'w')
+  keep.HOME = spec.home
+  p = spawnSync(process.execPath, BOOT, {
+    input, cwd: spec.cwd, env: keep, timeout: spec.timeout * 1000, killSignal: 'SIGKILL',
+    stdio: ['pipe', 'pipe', 'pipe', fd], maxBuffer: 16 << 20,
+  })
+  closeSync(fd)
+}
+const timedOut = !!(p.error && p.error.code === 'ETIMEDOUT') || p.status === 124 || p.status === 137 || p.status === 13
+let malformed = false
+const results = []
+let out3 = ''
+try { out3 = readFileSync(rpath, 'utf8') } catch (e) {}
+rmSync(dir, { recursive: true, force: true })
+for (const line of out3.split('\n')) {
+  if (!line) continue
+  try {
+    const r = JSON.parse(line)
+    if (typeof r !== 'object' || r === null || !('ok' in r)) throw new Error('shape')
+    results.push(r)
+  } catch (e) {
+    malformed = true
+  }
+}
+if (results.length !== spec.calls.length && !timedOut) malformed = true
+console.log(nonce + ' ' + JSON.stringify({ results, malformed, timed_out: timedOut, exit: p.status }))
+`
+
+export function check(condition, message = 'assertion failed') {
+  if (!condition) {
+    const e = new Error('[vigil-tag:' + process.env.VIGIL_HIDDEN_TAG + '] ' + message)
+    e.name = 'AssertionError'
+    throw e
+  }
+}
+
+function root() {
+  if (!SUBJECT) throw new Error('VIGIL_SUBJECT is not set')
+  return realpathSync(SUBJECT)
+}
+
+function cwdOf(cwd) {
+  const r = root()
+  const p = path.resolve(r, cwd)
+  if (p !== r && !p.startsWith(r + path.sep)) check(false, 'cwd leaves the subject checkout')
+  return p
+}
+
+function subjectEnv(extra) {
+  const env = {}
+  for (const k of KEEP) if (process.env[k] !== undefined) env[k] = process.env[k]
+  env.NO_COLOR = '1'
+  return Object.assign(env, extra || {})
+}
+
+/** Run a command in the read-only subject checkout, in its own process (as uid
+ *  10002 in the verifier), with a minimal environment. Returns
+ *  { returncode, stdout, stderr }. */
+export function runSubject(cmd, { cwd = '.', env = {}, input, timeout = 60 } = {}) {
+  const dir = cwdOf(cwd)
+  const senv = subjectEnv(env)
+  let argv
+  let opts
+  if (BROKER) {
+    argv = ['sh', '/vigil/run.sh', dir, String(timeout), '-', '--', ...cmd]
+    opts = {
+      cwd: process.cwd(),
+      env: {
+        PATH: process.env.PATH || '', VIGIL_BROKER: BROKER,
+        VIGIL_SUBJ_ENV: Object.entries(senv).map(([k, v]) => k + '=' + v).join('\n'),
+      },
+    }
+  } else {
+    senv.HOME = mkdtempSync(path.join(tmpdir(), 'vigil-subject-'))
+    argv = cmd
+    opts = { cwd: dir, env: senv, timeout: timeout * 1000 }
+  }
+  const p = spawnSync(argv[0], argv.slice(1), {
+    ...opts, input: input === undefined ? '' : input, encoding: 'utf8', killSignal: 'SIGKILL', maxBuffer: 16 << 20,
+  })
+  check(!(p.error && p.error.code === 'ETIMEDOUT') && p.status !== 124, JSON.stringify(cmd) + ' timed out after ' + timeout + 's')
+  return { returncode: p.status, stdout: p.stdout || '', stderr: p.stderr || '' }
+}
+
+/** Call functions of the subject, named as { module, func, args } (module is a
+ *  path relative to `cwd`), in a separate driver process. Each result is
+ *  { ok: true, value } or { ok: false, type, message }. Output is framed with a
+ *  per-run nonce that only this process and the driver's supervisor know. */
+export function callSubjectBatch(calls, { cwd = '.', timeout = 60 } = {}) {
+  const nonce = randomBytes(16).toString('hex')
+  const spec = {
+    calls: calls.map((c) => ({ module: c.module, func: c.func, args: c.args || [] })),
+    cwd: cwdOf(cwd), home: mkdtempSync(path.join(tmpdir(), 'vigil-subject-')), timeout,
+  }
+  const driver = DRIVER.replace('CHILD_SRC', () => JSON.stringify(CHILD)).replace('CHILD_SRC', () => JSON.stringify(CHILD))
+  const denv = subjectEnv()
+  denv.HOME = spec.home
+  if (BROKER) denv.VIGIL_BROKER = BROKER
+  const p = spawnSync(process.execPath, ['--input-type=module', '-e', driver], {
+    input: nonce + '\n' + JSON.stringify(spec), env: denv, encoding: 'utf8',
+    timeout: BROKER ? undefined : (timeout + 60) * 1000, killSignal: 'SIGKILL', maxBuffer: 16 << 20,
+  })
+  check(!(p.error), 'the driver failed: ' + (p.error ? p.error.message : ''))
+  const frames = (p.stdout || '').split('\n').filter((l) => l.startsWith(nonce + ' '))
+  check(frames.length === 1, 'the driver gave ' + frames.length + ' result frames, not 1')
+  let frame
+  try {
+    frame = JSON.parse(frames[0].slice(nonce.length + 1))
+  } catch (e) {
+    check(false, "the driver's frame is not JSON")
+  }
+  check(!frame.malformed, 'the subject wrote a malformed result stream')
+  check(!frame.timed_out, 'the subject timed out after ' + timeout + 's')
+  check(frame.results.length === calls.length, 'the subject returned the wrong number of results')
+  return frame.results
+}
+
+export function callSubject(module, func, args = [], { cwd = '.', timeout = 60 } = {}) {
+  return callSubjectBatch([{ module, func, args }], { cwd, timeout })[0]
+}

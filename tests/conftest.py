@@ -45,7 +45,7 @@ class RecordingRunner:
     def on_approved(self, job_id: str) -> None:
         self.approved.append(job_id)
 
-    def on_resume(self, job_id: str) -> None:
+    def on_resume(self, job_id: str, *, replan: bool = False) -> None:
         self.resumed.append(job_id)
 
     def on_rebuild(self, repo: str, base_sha: str) -> None:

@@ -10,18 +10,46 @@ not. The tests are kept by vigild, run only in its verifier, and are never shown
 to the worker.
 
 Rules:
-1. Put every test file under `.vigil/<job>/hidden/<task>/` (the exact directory
-   is in the contract). Nothing outside it, no `conftest.py`, no config.
-2. Each test must fail on the base **by an assertion failure**. A test that fails
-   because of an import error, a missing file the task creates, a syntax error or
-   a setup error is rejected: assert on the behaviour, and import or read only
-   what the base already has. Run the tests against the base to check.
+1. Put every test file under the directory the contract names. vigild chose it:
+   the repo's own test runner already collects it, and vigild runs your files
+   from exactly there, so relative imports resolve from it. Nothing outside it
+   except the manifest below, no `conftest.py`, no config, no `package.json`.
+2. **Black-box only.** Your tests never import, require or load the code under
+   test: not its modules, not a module of the repo that the task changes
+   (vigild rejects the file, you get one regeneration, then the task escalates).
+   Reach the subject (the worker's code, on a read-only checkout) only through
+   vigild's helper, which vigild puts in your directory when it runs your tests
+   (do not write or commit a `vigil_hidden` file):
+   - a command: `run_subject(cmd, cwd=".", env=None, input=None)` returns
+     `{"returncode", "stdout", "stderr"}`; for a script, e.g.
+     `run_subject(["node", "scripts/check-feature-map.mjs"])` or
+     `run_subject(["python3", "-m", "pkg.cli", "--flag"])`, against fixtures you
+     create in a temp dir of your own;
+   - a function: `call_subject(module, func, args, kwargs, cwd=".")` returns
+     `{"ok": true, "value": ...}` or `{"ok": false, "type", "message"}`; inputs
+     and outputs must be JSON; a separate vigild-owned process imports the module
+     (pytest: a dotted module name; vitest: `callSubject("src/lib.ts", "func", [args])`
+     from `./vigil_hidden.mjs`, which also has `runSubject`).
+   Assert only through the helper's `check(cond, message)` (pytest
+   `from vigil_hidden import check`; vitest `import { check } from './vigil_hidden.mjs'`),
+   never a bare `assert` or `expect`: a failure counts as "failed an assertion"
+   only if it came through `check`. Compare values and exit codes; the subject's
+   stdout is data, not a verdict.
+   Each test must fail on the base **by an assertion failure**. A test that fails
+   because of an import error, a missing file the task creates, a syntax error, a
+   setup error, a thrown error or a timeout is rejected, and so is a failed bare
+   `assert`: assert, through `check`, on the subject's behaviour.
 3. Cover what the spec's criteria and the contract's `done_when` say, including
    the empty and failing cases. Give each test a one-word category (for example
    `happy-path`, `empty-input`, `error-case`, `regression`).
 4. Tests must be deterministic and need no network.
 5. Write `.vigil/<job>/hidden/<task>.json`:
    `{"test_cmd": "<one command that runs only your tests>", "tests": [{"name": "...", "category": "..."}]}`.
-   The command must use the repo's test runner so it reports JUnit (pytest, or a
-   direct `node --test`/`vitest run`); it may not use `||`, `&`, `!` or `set`.
-6. Commit. Never approve or merge.
+   List exactly one entry per test case the runner will report (each parametrized
+   case is one): vigild requires the number of tests that run to equal the number
+   listed, on the base and on the head, and zero is a failure. The command uses the
+   repo's existing test runner, pointed at your directory only, so that it reports
+   JUnit: `pytest <your directory>`, `vitest run <your directory>`, or the repo's
+   own `pnpm [-C <dir>] test <your directory>` when that script runs vitest. Do not
+   use `node --test` or any other runner, and no `||`, `&`, `!` or `set`.
+6. Commit. Stop there; the owner reads your test names at spec review.

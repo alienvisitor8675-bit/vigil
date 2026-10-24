@@ -67,9 +67,24 @@ class RestPulls:
         return url
 
 
+def artifact_paths(job_id: str, task_id: str) -> list[str]:
+    """The only places under `.vigil/` a worker may write: its own task's
+    folder and the task contract (#14 line 992). Its job's other paths, other
+    tasks' folders and the playbook paths are out of scope like any file."""
+    return [f".vigil/{job_id}/{task_id}/**", ".vigil/task.json"]
+
+
+def vigild_paths(job_id: str) -> list[str]:
+    """What vigild itself commits to a worker's branch before the session (the
+    spec, plan and approval). They go in the PR; a worker's edit to one is
+    refused by acceptance, which counts changes from after that commit."""
+    return [f".vigil/{job_id}/{n}" for n in ("spec.md", "plan.md", "approval.json")]
+
+
 def out_of_scope(changed: Sequence[str], scope: Sequence[str]) -> list[str]:
-    """Changed files that are neither in scope nor vigil's own artifacts."""
-    return [f for f in changed if not f.startswith(".vigil/") and not in_scope(f, scope)]
+    """Changed files outside `scope`, which the caller extends with the task's
+    own `artifact_paths`; there is no blanket exemption for `.vigil/`."""
+    return [f for f in changed if not in_scope(f, scope)]
 
 
 def publish(
