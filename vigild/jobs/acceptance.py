@@ -159,6 +159,13 @@ def check_worker(
     if report.task_id != contract["task_id"]:
         errors.append(f"report task_id {report.task_id} is not {contract['task_id']}")
     errors += check_tests(spec, tests)
+    if session_base and not ws.is_ancestor(repo, session_base, head):
+        # the branch was rewritten (reset, amend, rebase): what vigild committed is gone
+        errors.append(
+            "vigild's pre-session commit is missing from the branch (history was rewritten); "
+            "the files can't be checked against scope"
+        )
+        return errors
     changed = [path for _, path in ws.changed(repo, session_base or base_sha, head)]
     own = artifact_paths(str(contract.get("job_id") or ""), str(contract.get("task_id") or ""))
     outside = out_of_scope(changed, [*(spec.get("files_in_scope") or []), *own])

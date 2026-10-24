@@ -405,6 +405,16 @@ class Workspace:
         parts = out.split("\0")
         return [(parts[i], parts[i + 1]) for i in range(0, len(parts) - 1, 2) if parts[i]]
 
+    def is_ancestor(self, repo: str, ancestor: str, head: str) -> bool:
+        """Is `ancestor` in `head`'s history, in the vault?"""
+        if not (SHA.match(ancestor) and SHA.match(head)):
+            return False
+        try:
+            self._git(self.vault(repo), "merge-base", "--is-ancestor", ancestor, head)
+        except WorkspaceError:
+            return False
+        return True
+
     def diff(self, repo: str, base_sha: str, head: str, path: str) -> str:
         return self._git(
             self.vault(repo), "diff", "--no-renames", "--no-ext-diff", "--no-textconv",

@@ -459,3 +459,101 @@ def test_the_runner_files_a_private_repo_as_missing(world: World) -> None:
     entry = json.loads(w.store.get_artifact(job, "hidden_tests.json").content)["tasks"][f"{job}-w1"]
     assert entry["status"] == "missing" and "hidden-test authoring" in entry["reason"]
     assert [c[0] for c in w.standin.calls].count("hidden_test_author") == 0
+
+
+def test_a_replan_never_rewrites_a_human_written_spec(world: World) -> None:
+    """The coord is asked for a new plan only; spec.md stays the human's."""
+    w = world
+    w.standin.worker_edit = _flaky({"w1"})  # the one worker strays out of scope once
+    r = w.client.post(
+        "/api/tasks",
+        headers=auth(w.tokens.admin),
+        json={
+            "repo": REPO, "why": "w", "value": 3, "risk": 1,
+            "spec": {"goal": "document the rate limit", "test_cmd": "pytest -q tests/test_feature_map.py",
+                     "done_when": "d",
+                     "files_in_scope": ["docs/feature-map.md", "tests/test_feature_map.py"]},
+        },
+    )  # fmt: skip
+    assert r.status_code in (200, 202), r.text
+    job = r.json()["job_id"]
+    spec = w.store.get_artifact(job, "spec.md")
+    assert spec.provenance == "human"
+    (item,) = _specs(w, job)
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    page = _failure_item(w, job)
+    assert "replan" in page["body"]["actions"]
+    w.client.post(f"/api/inbox/{page['id']}/replan", headers=auth(w.tokens.admin))
+    assert "coord" in [c[0] for c in w.standin.calls]  # the coord did run, for a plan
+    after = w.store.get_artifact(job, "spec.md")
+    assert after.content == spec.content and after.provenance == "human"
+    assert w.store.get_artifact(job, "plan.md").provenance == "claude"
+
+
+def test_a_replan_starts_the_author_cap_at_zero(world: World) -> None:
+    """Per task per plan: the replan reuses the task id but is a new plan."""
+    w = world
+    _runner_world(w)
+    w.standin.on_session = _book(w, 80_000, (Role.HIDDEN_TEST_AUTHOR,))  # $0.80 a session
+    job_id = _request(w)
+    plan = w.store.get_artifact(job_id, "plan.md")
+    spec_md = w.store.get_artifact(job_id, "spec.md").content
+    job = w.store.get_job(job_id)
+    contract = {
+        "task_id": f"{job_id}-w1", "job_id": job_id, "branch": f"vigil/{job_id}-w1",
+        "spec": {"test_cmd": "pytest -q tests/test_feature_map.py", "files_in_scope": ["tools/check.py"]},
+    }  # fmt: skip
+    assert w.runner._author_spent(job_id, f"{job_id}-w1") == pytest.approx(0.80)
+    # the same plan: a second stage on this task has $0.20 left
+    # a replan: the coord writes a new plan, same task ids
+    w.store.add_artifact(job_id, "plan.md", plan.content + "\n<!-- replanned -->\n", "claude")
+    assert w.runner._author_spent(job_id, f"{job_id}-w1") == 0.0
+    w.runner._author_one(job, spec_md, contract, [])
+    amounts = [
+        r["amount_usd"]
+        for r in w.store.q("SELECT amount_usd FROM reservations WHERE purpose='hidden_tests'")
+    ]
+    assert amounts == [1.0, 1.0]
+
+
+def test_a_missing_host_key_at_verify_time_escalates_instead_of_retrying(world: World) -> None:
+    w = world
+    _runner_world(w)
+    w.standin.worker_edit = _flag_edit()
+    job = _request(w)  # authored with a key
+    (item,) = _specs(w, job)
+    w.runner.verifier.host_key = None  # the key is gone by the time the worker is verified
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    assert w.store.get_task(f"{job}-w1").state == "escalated"
+    page = _failure_item(w, job, kind="escalated")
+    assert "retry" not in page["body"]["actions"] or set(page["body"]["tasks"]) != {f"{job}-w1"}
+    assert f"vigil/{job}-w1" not in [p["head"] for p in w.publisher.prs]
+
+
+def test_a_host_key_under_32_bytes_is_no_key() -> None:
+    from vigild.verifier import Verifier
+
+    v = Verifier(None, None, host_key=b"k" * 31)  # type: ignore[arg-type]
+    assert v.host_key is None
+    assert Verifier(None, None, host_key=b"k" * 32).host_key == b"k" * 32  # type: ignore[arg-type]
+
+
+def test_a_worker_that_drops_vigilds_pre_session_commit_is_a_scope_refusal(world: World) -> None:
+    import subprocess
+
+    w = world
+    _runner_world(w)
+    flag = _flag_edit()
+
+    def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
+        if str(spec.task_id).endswith("w1"):
+            subprocess.run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=spec.clone, check=True)
+        flag(spec, task)
+
+    w.standin.worker_edit = edit
+    job = _approve(w)
+    page = _failure_item(w, job)
+    body = json.dumps(page["body"])
+    assert "pre-session commit" in body and "vigild error" not in body
+    assert "stage 3 acceptance failed" in body
+    assert f"vigil/{job}-w1" not in [p["head"] for p in w.publisher.prs]

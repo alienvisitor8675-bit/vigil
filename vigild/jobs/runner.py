@@ -32,6 +32,7 @@ and writes its events (secrets redacted).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -737,7 +738,14 @@ class JobRunner:
             )
             return None
         drafts: dict[str, str] = {}
+        kept = self.store.get_artifact(job_id, "spec.md")
+        human = kept is not None and kept.provenance == Provenance.HUMAN.value
         for name in ("spec.md", "plan.md"):
+            if name == "spec.md" and human:
+                # a coord never rewrites a human-written spec: a replan re-plans only
+                assert kept is not None
+                drafts["spec"] = kept.content
+                continue
             text = self.workspace.read_blob(job.repo, head, f".vigil/{job_id}/{name}") or ""
             drafts[name.removesuffix(".md")] = text
             self.store.add_artifact(
@@ -855,12 +863,21 @@ class JobRunner:
             feedback = reason
         return {"status": "missing", "reason": reason, "attempts": AUTHOR_ATTEMPTS}
 
+    def _plan_key(self, job_id: str) -> str:
+        """Which plan a stage belongs to. A replan reuses task ids but writes a new
+        plan.md, so the author's $1 cap is per task per plan (owner to confirm)."""
+        plan = self.store.get_artifact(job_id, "plan.md")
+        return hashlib.sha256((plan.content if plan else "").encode()).hexdigest()[:12]
+
     def _author_spent(self, job_id: str, task_id: str) -> float:
-        """What this task's author stage has spent so far, across its sessions."""
+        """What this task's author stage has spent so far under the current plan."""
+        key = self._plan_key(job_id)
         return sum(
             session_cost(self.store, s.id)
             for s in self.store.list_sessions(job_id)
-            if s.role is Role.HIDDEN_TEST_AUTHOR and (s.detail or {}).get("for_task") == task_id
+            if s.role is Role.HIDDEN_TEST_AUTHOR
+            and (s.detail or {}).get("for_task") == task_id
+            and (s.detail or {}).get("plan") == key
         )
 
     def _author_attempt(
@@ -914,7 +931,9 @@ class JobRunner:
         )  # no parent: a fresh context, never the coord's or a worker's
         held["s"] = s
         # the task has no row yet at spec time, so the session names it in its detail
-        self.store.update_session(s.id, detail={"for_task": task_id, "attempt": attempt})
+        self.store.update_session(
+            s.id, detail={"for_task": task_id, "attempt": attempt, "plan": self._plan_key(job_id)}
+        )
         try:
             rid = self._reserve_queued(
                 job_id, "hidden_test_author", session_id=s.id, task_id=None,
@@ -1544,6 +1563,9 @@ class JobRunner:
             test_cmd,
         )
         hidden_entry = self._hidden_entry(job_id, task_id) if overlap else None
+        if overlap and self.verifier.host_key is None:
+            # without the key nothing hidden can count: escalate, never retry forever
+            hidden_entry = {"status": "missing", "reason": "VIGIL_HOST_KEY is not set"}
         if test_cmd.strip():
             try:
                 tests = self.verifier.verify(

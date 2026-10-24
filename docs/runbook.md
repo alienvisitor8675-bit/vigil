@@ -268,7 +268,7 @@ the class is flagged and handled differently:
   imports in-scope code is rejected and regenerated once.
 - **The host key.** Hidden tests only count with a key only you create, once:
   `printf 'VIGIL_HOST_KEY=%s\n' "$(openssl rand -hex 32)" >> ~/.config/vigil/env`
-  (mode 600 stays). Without it every flagged task is recorded "hidden tests
+  (mode 600 stays; at least 64 hex characters). Without it every flagged task is recorded "hidden tests
   missing" and escalates; `vigil doctor` shows whether it is set, never the value.
   Authors assert through vigild's `check` helper; a bare `assert` doesn't count.
 - **Where the hidden tests live.** For a vitest repo (ParkAgent) vigild picks a

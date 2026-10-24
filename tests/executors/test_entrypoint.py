@@ -314,3 +314,25 @@ def test_the_entrypoint_maps_the_output_cap_to_the_cli(monkeypatch: pytest.Monke
     assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in _agent_env(monkeypatch)
     monkeypatch.setenv("VIGIL_MAX_OUTPUT_TOKENS", "lots")  # not a number: ignored
     assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in _agent_env(monkeypatch)
+
+
+def test_an_authors_files_at_its_vitest_placement_are_committed_only_with_its_own_scope(
+    tmp_path: Path,
+) -> None:
+    """Round 2, item 3: the worker's contract kept new files only under `.vigil/` or in
+    scope, so files at `server/test/vigil-hidden/...` were dropped. The author's own
+    contract names exactly that directory, and nothing else is kept."""
+    folder = "server/test/vigil-hidden/fx-0001/fx-0001-w1"
+    work, base = _work(tmp_path)
+    (work / folder).mkdir(parents=True)
+    (work / folder / "a.test.ts").write_text("test\n")
+    (work / "server" / "stray.ts").write_text("x\n")
+    ep = _harness(tmp_path, work)
+    # the worker's contract (scope: a script) drops the placed file
+    head, left_out = ep.snapshot(_task(base, ["scripts/check.mjs"]), "hidden_test_author")
+    assert f"{folder}/a.test.ts" in left_out
+    # the author's own contract keeps it, and still not a file outside the placement
+    head, left_out = ep.snapshot(_task(base, [f"{folder}/**"]), "hidden_test_author")
+    shown = _run(work, "show", "--name-only", "--format=", head)
+    assert f"{folder}/a.test.ts" in shown and "stray.ts" not in shown
+    assert "server/stray.ts" in left_out

@@ -213,6 +213,15 @@ def runner_like(path: str) -> bool:
 
 
 TAG_DOMAIN = "hidden-tag:"
+MIN_KEY_BYTES = 32
+
+
+def host_key(value: str | None) -> bytes | None:
+    """The VIGIL_HOST_KEY secret as key bytes: at least 64 hex characters (32
+    bytes), else no key."""
+    return value.encode() if value and len(value) >= 2 * MIN_KEY_BYTES else None
+
+
 TAG_ENV = "VIGIL_HIDDEN_TAG"
 HELPER_NAME = "vigil_hidden"
 KIT = Path(__file__).parent / "hiddenkit"
@@ -574,7 +583,8 @@ class Verifier:
         self.ws = workspace
         self.runner = runner
         self.timeout_s = timeout_s
-        self.host_key = host_key  # VIGIL_HOST_KEY; without it no hidden test can count
+        # VIGIL_HOST_KEY; without a key of at least 32 bytes no hidden test can count
+        self.host_key = host_key if host_key and len(host_key) >= MIN_KEY_BYTES else None
 
     def verify(
         self,

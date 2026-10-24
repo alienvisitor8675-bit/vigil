@@ -166,7 +166,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     from vigild.executors.runtime import DockerRuntime, DockerTestRunner
     from vigild.github.app import READ_ONLY
     from vigild.jobs.runner import GitHubPublisher, NoPublisher, Publisher
-    from vigild.verifier import Verifier
+    from vigild.verifier import Verifier, host_key
     from vigild.workspace import Workspace
 
     client = docker.from_env()
@@ -199,7 +199,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         publisher,
         v.telemetry,
         images,
-        Verifier(ws, tests, host_key=(v.secrets.get("VIGIL_HOST_KEY") or "").encode() or None),
+        Verifier(ws, tests, host_key=host_key(v.secrets.get("VIGIL_HOST_KEY"))),
         reaper=runtime.reap,
         session_images=sessions,
     )
