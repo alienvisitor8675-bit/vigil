@@ -349,13 +349,40 @@ gets its own plan file and done-when.
      coord's redraft and $0.10 on w1's retry.
   3. **Per-role output and thinking budgets,** with terse output
      templates. Output was 25% of the coord's cost.
-  4. **Tool-output trimming in the harness:** keep the head, the tail and
-     the failure lines, capped. The harness logged 43 tool results on
-     pa-0002, with sizes not recorded; record them first.
+  4. **Tool-output trimming in the harness, rule-based** before any model
+     summary (owner, after the Grok review):
+     - truncate, deduplicate repeated lines, and always keep the head, the
+       tail and the failure lines, capped;
+     - a model summary, if one is ever added, runs only on the trimmed
+       output.
+
+     The harness logged 43 tool results on pa-0002 without their sizes, so
+     record the sizes first.
   5. **Retries without caching** start from the spec, the plan and the
      failure categories, not the full history.
   6. **Batch API** for seeded-defect runs, benchmark validation, scorers
      and nightly audits.
+- **Comprehension** (owner, 2026-10-23, from the Grok review):
+  - **PR summary:** every PR body opens with a three-sentence "what
+    changed and why", written by vigild from the spec and the diff.
+  - **Docs freshness:** after each merge, a check flags any doc layer
+    that cites changed code, and files it as `vigil:proposed`.
+  - **Explain-back:** an occasional inbox prompt asks the owner to explain
+    a recent merge in their own words.
+- **Structured docs instead of an ontology** (owner, 2026-10-23):
+  - **Data format:** product invariants (layer 9, `docs/product/`) and
+    feature-map rows are kept in a machine-readable form. Each has an ID,
+    its owning files and its tests.
+  - **Packets** cite them by ID.
+  - **Hidden-test author:** it receives the invariants relevant to its
+    task, which links this to the hidden-test system from #18 and #19.
+- **Harness ablation** as a Stage B experiment type (#14 "Factory
+  engineering"; owner, 2026-10-23):
+  - **Design:** hold the model fixed, toggle one harness feature, and run
+    on the benchmark set, locally on the tower.
+  - **Docs:** this goes into design.md's Stage B when that work starts.
+- **Industry figures** in the Grok review aren't used unless they've been
+  verified (owner, 2026-10-23).
 - **Hardening for unattended runs** (owner, 2026-10-23):
   - **Kill switch:** a host-side flag outside any repo, not in `configs/`.
     - `vigil stop` sets it and `vigil resume` clears it.
