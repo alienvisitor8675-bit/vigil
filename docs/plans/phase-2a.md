@@ -158,34 +158,21 @@ move with them.
   - the cap releases it;
   - a missing report blocks the stop.
 
-## 7. Carry-overs from the phase 1 run and main's hotfixes (#15–#17, the runner-file hotfix)
+## 7. Carry-overs from the phase 1 run and main's hotfixes (#15–#19)
 
-Fold these in when 2a rebases onto main:
-- **`depends_on` in the scheduler** (phase 1 run finding #3): a task that
-  depends on another is dispatched only after it, and branches from that
-  task's head. Today main starts both from base in parallel.
-- **Mid-run budget refusal:** pause at the last checkpoint with
-  raise-cap, resume and abandon actions. On #15 the session fails.
-- **A queued session waiting more than 2 hours pages the owner.**
+Fold these in when 2a rebases onto main. `depends_on`, the pause at
+checkpoint, the queued page and the vault rule moved to the 2b backlog's
+Tier 1 (1.5–1.8).
 - **The budget queue:**
   - a waiter re-checks the job's state and stops if the job was
     abandoned;
   - the queue is first-in, first-out;
   - tests cover abandon and restart while a session is waiting.
-- **The peak test includes the review-stage reserve.**
+- **The peak test** includes the review-stage reserve.
 - **Runner-file tasks** (finding #2): permanently rung 0, never counted
   toward ladder graduation, with a test.
-- **Job artifacts go to the vault, not the target repo** (owner,
-  2026-10-23):
-  - `.vigil/<job>/` stays on the job branch while the job runs, because
-    the worker needs it (layer 6).
-  - Before a PR is marked ready, vigild adds a commit that removes
-    `.vigil/<job>/`. The artifacts stay in the vault, and the PR body links
-    to them with an opaque `vigil:` reference.
-  - This doesn't apply to #14's `.vigil/` playbook folder.
-  - Test: a ready PR's diff contains no `.vigil/<job>/` path.
-- **Migrations:** 2a's steps append after main's; there's no
-  renumbering. 2a's development runs never use `~/vigil-data` and set
+- **Migrations:** 2a's steps append after main's; nothing is renumbered.
+  2a's development runs never use `~/vigil-data`; they set
   `VIGIL_DATA_DIR`.
 
 ## Done when (2a)
@@ -205,244 +192,84 @@ Nothing writes to ParkAgent.
 **Spend.** If the done-when would cross one day's $5, it runs over two
 days and is reported per day.
 
-## 2b (next PR, branches from 2a's merge)
+## 2b backlog (one list, consolidated by the owner on 2026-10-23)
 
-This section is recorded here so the decisions travel with the plan. 2b
-gets its own plan file and done-when.
+This replaces the 2b notes added during 2026-10-23. Nothing new is added
+here: items are only deduplicated and tiered.
 
-- **Clients:**
-  - the `vigil` CLI (`run`, `batch`, `ls --live`, `trace`, `kill`);
-  - `vigil mcp` (B8), with `vigil_run`, `vigil_status`, `vigil_trace`,
-    `vigil_kill`, `vigil_jobs` and `vigil_approve`.
-  - **`vigil_approve`** (owner, 2026-10-23):
-    - It acts on inbox items: `approve_spec`, `ready_to_merge`, and
-      answering a question.
-    - Each call is scoped by item id and logged with `provenance: human`
-      and the channel.
-    - It is **the only MCP tool that changes job state.** `vigil_talk`
-      never does.
-- **Session proxy:**
-  - read and join a live transcript, with owner messages logged as
-    `provenance: human`;
-  - the `code` event (the last edit, redacted) that phase 3's `/watch`
-    reads.
-- **Bridge:** the bus, `vigil_talk` and `vigil_listen` (the text is quoted
-  verbatim and logged with the relay model), and `vigil-bridge`.
-- **Documentation:**
-  - doc layers 4, 5 and 7, the search subagent and the staleness score;
-  - **ADR-0002:** plain Git only in vigil-owned clones.
-- **Layer 9, the product model:**
-  - `docs/product/` per repo, in pdd-kit's shape. Evaluate `npx
-    pdd-toolkit` against the no-build-step and pin rules.
-  - Specs cite the product entries they change; stage 10 updates them, and
-    a stage-4 contradiction check runs.
-  - Seed vigil's own model.
-  - **ParkAgent's is seeded by the owner, with Opus, as a ParkAgent PR**,
-    not generated. 2b leaves a stub and a seeding guide only.
-- **Verify level 1:** Hypothesis (including stateful tests for the FSM)
-  and Schemathesis. SwiftCheck/swift-testing waits on the iOS image
-  question.
-- **Per-attempt event sequence** (owner ruling on #14, line 1095): every
-  attempt gets its own event sequence, so the PR footer's event-log range
-  can point at one attempt. Until it exists, the footer shows `pending`.
-- **Context engineering** (owner, 2026-10-23):
-  - **Prefix order:** tools, then system, then the fixed packet, then
-    volatile content.
-    - A cache breakpoint goes after the fixed packet.
-    - Cached and uncached input are metered separately, and each session
-      records its cache-hit rate.
-  - **Research:** a sub-session that returns a summary of at most 2k
-    tokens. The coord plans from the summary. Workers start fresh, with
-    only the spec, the plan and their scoped files.
-  - **Compaction:** at 50% of the context window, the session writes
-    `progress.md` (done, next, decisions) and continues from it in a fresh
-    context. The event log records each compaction.
-  - **Packet budgets per role,** enforced by `packets`:
-    - worker: 30k tokens;
-    - coord: 60k tokens;
-    - reviewer: the diff, the spec and the issue.
+Every item has one **owning module**, and either a **tier** or a
+**trigger**. 2b gets its own plan file and done-when. This list is its
+source.
 
-    Every packet's token count is logged.
-  - **After phase 5:** research sub-sessions route to the local model by
-    default.
-  - **Baseline: the coord on pa-0002** (ParkAgent #272, 2026-10-23), from
-    its metered calls:
-    - **Shape:** 2 coord sessions, 14 Opus calls, 1.24M input tokens and
-      18.7k output. Session 1 was the first draft, 10 calls. Session 2
-      followed a spec-gate failure, 4 calls.
-    - **Cost:** $1.48 as run. The CLI already caches with 5-minute writes,
-      and every call after the first in each session read the prefix from
-      cache. Uncached, the same calls would have cost $5.34.
-    - **Where the money went:**
-      - Each session's first call wrote a 74–79k-token prefix: $0.40 and
-        $0.38. That's 52% of the $1.48.
-      - A cache breakpoint shared across the two sessions would have
-        turned session 2's write into a read, saving about $0.36 (24%).
-      - A 60k coord budget would also cut both prefix writes.
-    - An earlier attempt of the same job (11 calls) went unmetered because
-      of the migration bug fixed in #16. It isn't in this baseline.
-- **Hash-chained events** (owner, 2026-10-23, after reviewing Bernstein):
-  - **The column:** `events.prev_hash`, added as a new step at the end of
-    `MIGRATIONS`.
-  - **The hash:** HMAC(host key, the previous row's hash plus this row's
-    canonical JSON).
-  - **The key** lives in `~/.config/vigil/env`. The owner creates it with
-    the runbook's rule for self-generated secrets; no session generates
-    it. Proposed name: `VIGIL_EVENTS_HMAC_KEY`.
-  - **`vigil doctor`** verifies the chain.
-  - **Tests:** an edited row breaks the chain, and so does a deleted or
-    reordered row.
-- **Invariants check before Stage C** (#14 "Factory engineering"; owner,
-  2026-10-23):
-  - Before writing Stage C's proposal rules, read
-    `chernistry/bernstein`'s `src/bernstein/evolution/invariants.py` and
-    `circuit.py` (Apache-2.0), and list any invariant vigil is missing.
-  - Take ideas only, and copy no code. Any adapted text goes in
-    `docs/sources.md` with its licence.
-- **Token efficiency** (owner, 2026-10-23). The order follows the pa-0002
-  audit.
-  - **The audit:** pa-0002 spent $1.97 over 36 metered calls. The 11
-    calls of the first coord attempt went unmetered (before #16).
-    - The coord accounted for $1.48, 75% of the total: 14 Opus calls over 2
-      sessions, with cache-hit rates of 89% and 77%.
-    - The workers accounted for $0.50: 22 Sonnet calls with cache-hit
-      rates of 81–91%.
-    - Prefix cache writes cost about $0.89, 45% of the total. Every
-      session wrote its whole prefix fresh: 79–98k tokens for a coord and
-      39–43k for a worker. Nothing was reused across sessions.
-    - The gateway passes `cache_control` through unchanged. It only refuses
-      block types, and its one rewrite, the #15 `max_tokens` clamp,
-      re-serialises the same keys.
-    - The prefix varies between sessions for two reasons:
-      - `packets.fence()` draws a random nonce per assembly, so the same
-        job's packet differs byte for byte between the coord's draft and
-        its redraft, and between a worker's attempts;
-      - the 5-minute cache write expires between attempts that are hours
-        apart.
-    - Packet section sizes aren't logged. The `packet` event records only
-      `dropped`, so the largest section can't be named from the record.
-  1. **Slot 1: coord model by change type, plus packet maps** (owner,
-     2026-10-23: together, because prefix writes are 45% of spend and
-     scale with packet size for both models).
-     - **Coord model:** Sonnet for docs, tests and refactors; Opus for
-       money, auth and consent paths, and on escalation. The rule goes in
-       `configs/routing.yaml`.
-     - **Packet maps:** paths plus one-line summaries instead of full
-       documents. Per-role packet budgets are enforced. **Every packet
-       logs the size of each section.**
-     - **Re-audit after slot 1:** run the token audit again on the next
-       ParkAgent job and compare it with pa-0002's $1.97.
-  2. **Caching:**
-     - **Packet order:** repo-wide, then job-wide, then task-specific. The
-       prefix is byte-identical across sessions of the same model, so
-       parallel workers share one cache write.
-     - **The fence nonce:** HMAC(host key, job id). It must never be
-       derivable from job metadata alone. The check that content doesn't
-       contain the nonce stays. Test: an issue body can't predict the
-       nonce.
-     - **Redrafts:** a coord redraft continues the existing session while
-       the cache is warm, instead of starting a new one.
-     - **Checks:** a caching check in CI, and the cache-hit rate on the Run
-       page.
+**Standing decisions:**
+- **No change to the verifier's stance.** Vigil keeps fresh-checkout
+  verification, with no verdict cache and no flaky-test quarantine.
+  Unstable test IDs are handled by #17's double base run.
+- **Unverified industry figures** from outside reviews are not used.
+- **One host key** for every HMAC: `VIGIL_HOST_KEY`, domain-separated
+  (`"hidden-tag:"`, `"fence:"`, and so on). The owner creates it; no
+  session ever does.
 
-     On pa-0002, a shared prefix would have saved about $0.38 on the
-     coord's redraft and $0.10 on w1's retry.
-  3. **Per-role output and thinking budgets,** with terse output
-     templates. Output was 25% of the coord's cost.
-  4. **Tool-output trimming in the harness, rule-based** before any model
-     summary (owner, after the Grok review):
-     - truncate, deduplicate repeated lines, and always keep the head, the
-       tail and the failure lines, capped;
-     - a model summary, if one is ever added, runs only on the trimmed
-       output.
+**pa-0002 token audit** (the baseline): $1.97 over 36 metered calls. The
+coord was 75% of that ($1.48 for 14 Opus calls over 2 sessions). Writing
+the prompt prefix to cache was 45% (79–98k tokens per coord session, 39–43k
+per worker), and no session reused another's prefix. Two causes: the fence
+nonce is random on every assembly, and 5-minute cache writes expire between
+attempts. `cache_control` passes through the gateway unchanged. Packet
+section sizes aren't logged. The 11 calls of the first coord attempt went
+unmetered, before #16.
 
-     The harness logged 43 tool results on pa-0002 without their sizes, so
-     record the sizes first.
-  5. **Retries without caching** start from the spec, the plan and the
-     failure categories, not the full history.
-  6. **Batch API** for seeded-defect runs, benchmark validation, scorers
-     and nightly audits.
-- **Comprehension** (owner, 2026-10-23, from the Grok review):
-  - **PR summary:** every PR body opens with a three-sentence "what
-    changed and why", written by vigild from the spec and the diff.
-  - **Docs freshness:** after each merge, a check flags any doc layer
-    that cites changed code, and files it as `vigil:proposed`.
-  - **Explain-back:** an occasional inbox prompt asks the owner to explain
-    a recent merge in their own words.
-- **Structured docs instead of an ontology** (owner, 2026-10-23):
-  - **Data format:** product invariants (layer 9, `docs/product/`) and
-    feature-map rows are kept in a machine-readable form. Each has an ID,
-    its owning files and its tests.
-  - **Packets** cite them by ID.
-  - **Hidden-test author:** it receives the invariants relevant to its
-    task, which links this to the hidden-test system from #18 and #19.
-- **Harness ablation** as a Stage B experiment type (#14 "Factory
-  engineering"; owner, 2026-10-23):
-  - **Design:** hold the model fixed, toggle one harness feature, and run
-    on the benchmark set, locally on the tower.
-  - **Docs:** this goes into design.md's Stage B when that work starts.
-- **Industry figures** in the Grok review aren't used unless they've been
-  verified (owner, 2026-10-23).
-- **Hardening for unattended runs** (owner, 2026-10-23):
-  - **Kill switch:** a host-side flag outside any repo, not in `configs/`.
-    - `vigil stop` sets it and `vigil resume` clears it.
-    - The gateway checks it on every call; vigild checks it before every
-      dispatch, push and PR.
-    - Test: a session can neither set nor clear it.
-  - **Canary tokens:** plant fake AWS, `.env` and GitHub credentials in
-    every session container.
-    - Reading one, or trying to send one out, pages the owner and stops the
-      session.
-    - Matching: the egress proxy matches the token values. Every container
-      already reaches only the gateway, so the gateway scans request bodies
-      for them too.
-    - These are fake values, so they don't break "no secret in a
-      container".
-    - Test: reading or exfiltrating a canary pages and stops the session.
-  - **Exactly-once side effects:**
-    - push, PR open and PR comments carry idempotency keys derived from the
-      job, task and attempt;
-    - status is written before the action, and the result is re-read from
-      GitHub afterwards;
-    - a resume never re-fires an irreversible action without re-checking
-      its approval;
-    - rehearsal test: crash mid-commit, resume, and assert the action
-      happened exactly once.
-  - **Failure detectors on traces:** pattern-based only, no LLM.
-    - Tags: `scope_creep`, `success_hallucination` (the worker reports
-      pass, the verifier fails), `tool_misuse`, `cascading_errors` and
-      `context_loss`.
-    - Show the daily tag distribution, and page above 5%.
-  - **Review independence:**
-    - Prefer a reviewer from a different model family from the worker.
-      Every review records the model pair.
-      - Today every role is Claude: Sonnet reviews and Opus audits, by
-        ruling. So until phase 5's local models land, this is recorded
-        but rarely satisfiable.
-    - A random owner audit of 10% of passed PRs arrives as an inbox item,
-      and its results are stored as labelled data.
-  - **Findings taxonomy:** every finding is tagged spec, coordination or
-    verification. Phase 1's run findings:
-    - #1 (unstable test IDs): verification;
-    - #2 (runner-file pin): verification;
-    - #3 (`depends_on` ignored): coordination.
-  - **Fault drill:** scripted, each with an expected outcome, and all run
-    once before the first overnight run:
-    - provider 429 and 500;
-    - the tower offline;
-    - vigild killed mid-job;
-    - disk full.
-  - **Spend-rate alert:** page when hourly spend exceeds 3× the trailing
-    median, separately from the caps.
-- **No change to the verifier** (owner, 2026-10-23):
-  - Bernstein runs gates in the agent's worktree, caches verdicts and
-    quarantines flaky tests.
-  - Vigil keeps fresh-checkout verification, with no verdict cache and no
-    quarantine. Unstable test IDs are handled by the double base run from
-    phase 1 run finding #1 (#17).
-- **Done-when:**
-  - one task is dispatched from a Claude Code session through `vigil mcp`;
-  - `vigil kill` works;
-  - `vigil_approve` approves a spec, and `vigil_talk` can't change state;
-  - a joined message is tagged `human`;
-  - all of it runs on the test repo and vigil only.
+### Tier 1: next
+
+| # | Item | Owning module |
+|---|---|---|
+| 1.1 | **Kill switch.** A host-side flag outside any repo and outside `configs/`. `vigil stop` sets it and `vigil resume` clears it. The gateway checks it on every call; vigild checks it before every dispatch, push and PR. Test: a session can neither set nor clear it. | `vigild/killswitch.py` |
+| 1.2 | **Exactly-once push and PR on resume.** Push, PR open and PR comments carry idempotency keys derived from job, task and attempt. Status is written before the action, and the result is re-read from GitHub afterwards. A resume never re-fires an irreversible action without re-checking its approval. Rehearsal test: crash mid-commit, resume, and assert the action happened exactly once. | `vigild/github/publish.py` |
+| 1.3 | **Coord model by change type.** Sonnet for docs, tests and refactors; Opus for money, auth and consent paths, and on escalation. The rule lives in `configs/routing.yaml`. | `vigild/router/` |
+| 1.4 | **Stable prefix with the HMAC nonce.** Order: tools, then system, then the fixed packet, then volatile content, with a cache breakpoint after the fixed packet. Within the fixed packet: repo-wide, then job-wide, then task-specific, byte-identical across sessions of one model. The fence nonce is `HMAC(VIGIL_HOST_KEY, "fence:" + job_id)`, and the content-must-not-contain-nonce check stays. Test: an issue body can't predict the nonce. A coord redraft continues its warm session. Cached and uncached input are metered separately, with the cache-hit rate per session; a caching check runs in CI. | `vigild/packets/fence.py` |
+| 1.5 | **`.vigil/<job>/` kept in the vault.** It stays on the job branch while the job runs. Before the PR is marked ready, vigild commits its removal and links the vault copy with a `vigil:` reference. #14's playbook folder is unaffected. Test: a ready PR's diff has no `.vigil/<job>/` path. | `vigild/github/publish.py` |
+| 1.6 | **`depends_on`** (phase 1 run finding #3). A dependent task is dispatched after the task it depends on, from that task's head. | `vigild/scheduler/` |
+| 1.7 | **Pause at checkpoint.** A mid-run budget refusal pauses the session at its last checkpoint, with raise-cap, resume and abandon actions. | `vigild/jobs/runner.py` |
+| 1.8 | **Queued page.** A session queued for more than 2 hours pages the owner. | `vigild/jobs/runner.py` |
+| 1.9 | **Re-audit** (trigger: tiers 1.3 and 1.4 landed). Run the token audit on the next ParkAgent job and compare against $1.97. Repeat after 2.1. | `vigild/kpis.py` |
+
+### Tier 2: 2b core
+
+| # | Item | Owning module |
+|---|---|---|
+| 2.1 | **Packets v2**, one epic, covering: the repo map (paths plus one-line summaries in place of full documents; this is the packet map); per-role budgets enforced, worker 30k, coord 60k, reviewer = diff + spec + issue, with every section's size logged; per-file git context; lessons by glob (`.vigil/lessons/` in place of layer 5, per #14); rule-based tool-output trimming (truncate, deduplicate, keep head, tail and failure lines, capped, before any model summary, with tool-result sizes recorded first); compaction at 50% of the context window into `progress.md`, logged in the event log; packets citing invariant IDs (2.7). | `vigild/packets/` |
+| 2.2 | **#14 Stage A metrics and failure detectors.** The metrics are the list in #14. The detectors are pattern-based, with no LLM: `scope_creep`, `success_hallucination`, `tool_misuse`, `cascading_errors`, `context_loss`. Daily tag distribution, with a page above 5%. Every finding is tagged spec, coordination or verification; phase 1's run findings are #1 verification, #2 verification and #3 coordination. | `vigild/kpis.py` |
+| 2.3 | **Evidence footer with "what changed and why".** #14's Stage A footer, written by vigild and opening with a three-sentence summary drawn from the spec and the diff. The per-attempt event sequence goes in the footer's event-log range; until it exists, the range shows `pending`. | `vigild/github/publish.py` |
+| 2.4 | **Merge-risk grade.** #14 Stage A. Advisory; it only ever raises review. | `vigild/review/risk.py` |
+| 2.5 | **Canary tokens.** Fake AWS, `.env` and GitHub credentials in every session container. Reading or exfiltrating one pages the owner and stops the session. The egress proxy and the gateway's body scan both match on them. Test it. | `vigild/executors/canary.py` |
+| 2.6 | **The original 2b scope**, unchanged: the CLI (`run`, `batch`, `ls --live`, `trace`, `kill`); `vigil mcp` (B8) with `vigil_approve` as the only state-changing tool; the session proxy (read, join, the `code` event); the bridge (`vigil_talk`, `vigil_listen`, `vigil-bridge`); doc layers 4, 5 and 7, with the search subagent and the staleness score; ADR-0002; verify level 1 (Hypothesis, Schemathesis). | `cli/vigil/`, `vigild/mcp/`, `vigild/proxy/`, `vigild/bridge/` (one per sub-item) |
+| 2.7 | **Layer 9 with invariant IDs.** `docs/product/` per repo, with invariant IDs plus their owning files and tests. Packets cite them by ID, and the hidden-test author receives the invariants relevant to its task. vigil's own model is seeded; ParkAgent's is seeded by the owner. | `vigild/product.py` |
+| 2.8 | **Per-role output and thinking budgets**, with terse output templates. *Untiered by the owner; placed here.* | `vigild/gateway/service.py` |
+| 2.9 | **Lean retries.** A retry starts from the spec, the plan and the failure categories, not the full history. *Untiered; placed here.* | `vigild/jobs/runner.py` |
+| 2.10 | **Spend-rate alert.** Page when hourly spend exceeds 3× the trailing median, separately from the caps. *Untiered; placed here.* | `vigild/breakers.py` |
+| 2.11 | **Docs-freshness check.** After a merge, flag any doc layer that cites changed code, and file it as `vigil:proposed`. This merges with 2.6's staleness score: one check. *Untiered; placed here.* | `vigild/docs/staleness.py` |
+
+### Tier 3: trigger-gated
+
+| # | Item | Trigger | Owning module |
+|---|---|---|---|
+| 3.1 | **Fault drill**: provider 429 and 500, the tower offline, vigild killed mid-job, disk full; each with its expected outcome. | before the first overnight run | `tests/drills/` |
+| 3.2 | **Benchmarks, scorers, harness ablations** (model fixed, one harness feature toggled, run locally) and the **Batch API** (seeded-defect runs, benchmark validation, scorers, nightly audits). | #14 Stage B | `vigild/bench/` |
+| 3.3 | **Owner audit plus explain-back, one inbox item.** A random 10% of passed PRs asks the owner to audit the PR and explain the change, stored as labelled data. **Review-independence data:** every review records its worker/reviewer model pair, with a different family preferred. | 30 merged jobs | `vigild/review/audit.py` |
+| 3.4 | **Improvement proposals and evolution invariants.** Before writing Stage C's rules, read Bernstein's `invariants.py` and `circuit.py` (Apache-2.0) for ideas only; adapted text goes in `docs/sources.md` with the licence. | #14 Stage C | `vigild/proposals/` |
+| 3.5 | **Research sub-sessions.** A summary of at most 2k tokens for the coord, routed to the local model. | phase 5 | `vigild/research.py` |
+
+### Dropped for now
+- **Hash-chained events** (`events.prev_hash`).
+- **FTS5.**
+- **Structured docs beyond invariant IDs:** the machine-readable feature-map rows.
+
+### Overlaps and conflicts with design.md, flagged for the owner
+1. **Coord model (1.3).** design.md and `configs/routing.yaml` say `coord: claude-opus  # the coord is the one place to spend quality`. Tier 1.3 changes that rule, so design.md's routing section needs the change-type rule.
+2. **Review independence (3.3).** The rule is "Sonnet reviewer, Opus auditor", both Claude. A different model family is satisfiable only once phase 5 lands, so until then this item is recorded, not enforced.
+3. **Batch API (3.2).** CLAUDE.md says every hosted model call goes through vigild's gateway, and the gateway has no batch path. Batch calls need gateway metering and budget reservations before they're allowed.
+4. **Packet budgets (2.1).** design.md's packet assembler budgets per layer, but 2.1 sets per-role totals. Packets v2 must reconcile them: per-layer budgets inside each role's total.
+5. **The "what changed and why" summary (2.3).** #14's footer is built with no model calls. The summary needs a model, or a rule-based template. If it's a model, name the model and its cost line, and pass the text through `redact`.
+6. **Owner audit sample (3.3).** #12 ruling 12 says the ladder's statistics come from the random audit sample only. The owner audit is a third, also random, sample. Decide whether it feeds the ladder or stays labelled data only.
+7. **Kill switch (1.1).** #14 puts host policy in vigild's own config. The kill switch is state, not policy, so it lives outside `configs/` as ruled. Note it in #14's host-policy list.
+8. **2a's §7.** Items 1.5–1.8 used to sit there. They now live in this backlog; §7 keeps only the mechanics of 2a's rebase.
