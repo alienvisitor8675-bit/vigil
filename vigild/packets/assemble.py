@@ -308,7 +308,8 @@ def assemble_hidden_test_author(
     *,
     feedback: str | None = None,
     folder: str | None = None,
-    include: tuple[str, ...] | None = None,
+    vitest: bool = False,
+    suffix: str = ".test.ts",
 ) -> Packet:
     """The packet for a hidden-test author: the approved spec.md and this one
     task's contract, nothing else (learning ruling 13). Not plan.md, not the
@@ -322,10 +323,10 @@ def assemble_hidden_test_author(
         "collects that directory; vigild runs your files from exactly there, so relative "
         "imports resolve from it).\n"
     )
-    if include is not None:
-        names = ", ".join(f"`{g}`" for g in include) or "`*.test.*` and `*.spec.*` files"
+    if vitest:
         contract_part += (
-            f"Name each test file so the project's vitest include collects it: {names}.\n"
+            f"Name each test file `*{suffix}` (the project's vitest collects that name in this "
+            "directory) and import vigild's helper as `./vigil_hidden.mjs`.\n"
         )
     if feedback:
         contract_part += (

@@ -95,6 +95,7 @@ class LocalTestRunner:
         timeout_s: int,
         max_output: int,
         env: Mapping[str, str] | None = None,
+        subject: Path | None = None,
     ) -> RunResult:
         hooks = subprocess.run(
             ["git", "config", "--get", "core.hooksPath"], cwd=source, capture_output=True, text=True
@@ -107,6 +108,7 @@ class LocalTestRunner:
                 "hooksPath": hooks,
                 "worker_files": planted,
                 "image": image,
+                "subject": str(subject) if subject else "",
             }
         )
         # as in the container: bash with pipefail and errexit, pytest asked for
@@ -115,6 +117,7 @@ class LocalTestRunner:
         env = {
             **os.environ,
             "PYTEST_ADDOPTS": f"--junitxml={reports}/pytest.xml -p no:cacheprovider",
+            **({"VIGIL_SUBJECT": str(subject)} if subject else {}),
             **(env or {}),
         }
         try:

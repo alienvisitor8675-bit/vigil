@@ -52,6 +52,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from vigild.blackbox import problems as blackbox_problems
 from vigild.intake.paths import in_scope
 from vigild.redact import redact
 from vigild.shellwords import Command, parse
@@ -91,6 +92,7 @@ class TestRunner(Protocol):
         timeout_s: int,
         max_output: int,
         env: Mapping[str, str] | None = None,
+        subject: Path | None = None,
     ) -> RunResult: ...
 
 
@@ -192,15 +194,16 @@ class HiddenSuite:
     files: tuple[str, ...]
     test_cmd: str
     expected: int  # how many tests vigild stored; the runs must report exactly this many
-    project: str = ""  # a vitest project's dir (repo-relative), when its include decides
-    include: tuple[str, ...] | None = None  # that project's `include` globs, from the base
+    project: str = ""  # a vitest project's dir (repo-relative)
+    vitest: bool = False  # vitest (helper is .mjs) rather than pytest
 
 
 # Files that decide how a runner collects and runs tests, at any depth. A worker's copy
 # of one on a hidden test's import or config path is tampering (hotfix 5).
 RUNNER_LIKE = (
-    "pytest.ini", "conftest.py", "tox.ini", "setup.cfg", "pyproject.toml", "package.json",
-    "vitest*.config.*", "vite.config.*", ".npmrc",
+    "conftest.py", "pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml", "tox.ini",
+    "setup.cfg", "pyproject.toml", "package.json", "vitest*.config.*", "vitest.workspace.*",
+    "vitest.config.*", "vite.config.*", ".npmrc",
 )  # fmt: skip
 
 
@@ -212,24 +215,9 @@ def runner_like(path: str) -> bool:
 TAG_DOMAIN = "hidden-tag:"
 TAG_ENV = "VIGIL_HIDDEN_TAG"
 HELPER_NAME = "vigil_hidden"
-HELPER_PY = f"""import os
-
-
-def check(condition, message="assertion failed"):
-    if not condition:
-        raise AssertionError(f"[vigil-tag:{{os.environ['{TAG_ENV}']}}] {{message}}")
-"""
-HELPER_TS = f"""export function check(
-  condition: unknown,
-  message = 'assertion failed',
-): asserts condition {{
-  if (!condition) {{
-    const e = new Error(`[vigil-tag:${{process.env.{TAG_ENV}}}] ${{message}}`)
-    e.name = 'AssertionError'
-    throw e
-  }}
-}}
-"""
+KIT = Path(__file__).parent / "hiddenkit"
+HELPER_PY = (KIT / "vigil_hidden.py.txt").read_text()
+HELPER_JS = (KIT / "vigil_hidden.mjs.txt").read_text()
 
 
 def hidden_tag(key: bytes, task_id: str) -> str:
@@ -241,80 +229,13 @@ def hidden_tag(key: bytes, task_id: str) -> str:
 
 
 def helper_file(suite_prefix: str, vitest: bool) -> tuple[str, str]:
-    """(path, text) of the assertion helper vigild lays in the suite's directory
-    for a hidden run only."""
+    """(path, text) of vigild's helper, laid in the suite's directory for a hidden
+    run only (`vigil_hidden.py`, or `vigil_hidden.mjs` for vitest)."""
     return (
-        (f"{suite_prefix}/{HELPER_NAME}.ts", HELPER_TS)
+        (f"{suite_prefix}/{HELPER_NAME}.mjs", HELPER_JS)
         if vitest
         else (f"{suite_prefix}/{HELPER_NAME}.py", HELPER_PY)
     )
-
-
-def _glob_re(glob: str) -> re.Pattern[str]:
-    """A vitest `include` glob as a regex: `**`, `*`, `?`, `{a,b}`, `[..]`."""
-    g = glob.removeprefix("./")
-    out, i, depth = [], 0, 0
-    while i < len(g):
-        c = g[i]
-        if g.startswith("**/", i):
-            out.append("(?:.*/)?")
-            i += 3
-            continue
-        if g.startswith("**", i):
-            out.append(".*")
-            i += 2
-            continue
-        if c == "*":
-            out.append("[^/]*")
-        elif c == "?":
-            out.append("[^/]")
-        elif c == "{":
-            out.append("(?:")
-            depth += 1
-        elif c == "}" and depth:
-            out.append(")")
-            depth -= 1
-        elif c == "," and depth:
-            out.append("|")
-        elif c in "[]":
-            out.append(c)
-        else:
-            out.append(re.escape(c))
-        i += 1
-    return re.compile("^" + "".join(out) + "$")
-
-
-DEFAULT_VITEST_INCLUDE = r"(?:^|.*/)[^/]*\.(?:test|spec)\.[cm]?[jt]sx?$"
-
-
-def glob_match(globs: Sequence[str], rel: str) -> bool:
-    return any(_glob_re(g).match(rel) for g in globs)
-
-
-def collected(include: Sequence[str] | None, rel: str) -> bool:
-    """Would vitest, with this `include`, collect the file at `rel` (relative to
-    its project dir)? No include at all means vitest's default pattern."""
-    if not include:
-        return re.match(DEFAULT_VITEST_INCLUDE, rel) is not None
-    return glob_match(include, rel)
-
-
-def uncollected(suite: HiddenSuite) -> list[str]:
-    """Hidden test files the runner would not collect from where they are
-    injected (empty for a suite that doesn't run under a vitest include). At
-    least one file must be collected, and every file named like a test."""
-    if suite.include is None:
-        return []
-    cut = len(suite.project.rstrip("/")) + 1 if suite.project else 0
-    rels = {f: f[cut:] for f in suite.files}
-    miss = [
-        f
-        for f, r in rels.items()
-        if not collected(suite.include, r) and re.search(r"\.(test|spec)\.", r)
-    ]
-    if not any(collected(suite.include, r) for r in rels.values()):
-        return sorted(rels) or ["(no files)"]
-    return sorted(miss)
 
 
 PACKAGE_MANAGERS = {"pnpm", "npm", "yarn"}
@@ -615,6 +536,33 @@ def compare_runs(
     return out
 
 
+def vitest_list_command(test_cmd: str, read: ReadFile | None) -> str | None:
+    """`test_cmd` turned into the project's own `vitest list --json` (same script,
+    same flags); None if it runs no vitest."""
+    plan = plan_reports(test_cmd, read)
+    if not plan.vitest_dirs or plan.problems:
+        return None
+    cmd = re.sub(r"\s+--reporter=\S+|\s+--outputFile\.junit=\S+", "", plan.command)
+    new, n = re.subn(r"\bvitest(\s+run)?\b", "vitest list --filesOnly --json", cmd, count=1)
+    return new if n else None
+
+
+def _listed_files(output: str) -> list[str] | None:
+    """The file names in `vitest list --json`'s output (a JSON array somewhere in it)."""
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\[", output):
+        try:
+            val, _ = dec.raw_decode(output[m.start() :])
+        except ValueError:
+            continue
+        if isinstance(val, list):
+            return [
+                str(x.get("file", x.get("name", ""))) if isinstance(x, dict) else str(x)
+                for x in val
+            ]
+    return None
+
+
 class Verifier:
     def __init__(
         self,
@@ -755,40 +703,45 @@ class Verifier:
         task_id: str,
         base_sha: str,
         hidden: HiddenSuite,
-        pinned: list[str],
         *,
         head: str | None = None,
         scope: Sequence[str] = (),
         changed: Sequence[tuple[str, str]] = (),
         tagged: bool = False,
     ) -> dict[str, Any]:
-        """One hidden run. The checkout is the base, plus only the worker's
-        changes to files in the task's scope (same strict matcher), minus the
-        pinned runner files, plus vigild's hidden files and assertion helper:
-        nothing outside scope exists in it, so nothing a worker planted can sit
-        on the tests' import or config path (hotfix 5). Only the base run gets
-        the tag in its environment: the base's own code runs there, never a
-        worker's."""
+        """One hidden run, black-box (hotfix 5, round 2). The test process runs in
+        a checkout that is the base, every runner file included, plus vigild's
+        hidden files and helper: no head file is in it. The code under test is a
+        second, read-only checkout (the base, plus the worker's in-scope changes
+        for the head run) that the runner mounts at $VIGIL_SUBJECT; the helper
+        runs it only as a subprocess. Only the base run gets the tag in its
+        environment: the base's own code runs there, never a worker's."""
         assert self.host_key is not None
         command = with_reports(
             hidden.test_cmd, lambda path: self.ws.read_blob(repo, base_sha, path)
         )
-        take: list[tuple[str, list[str]]] = []
+        mine: list[str] = []
         if head is not None:
             mine = sorted(
                 p
                 for _, p in changed
-                if in_scope(p, scope) and p not in pinned and p not in hidden.files
+                if in_scope(p, scope) and not p.startswith(".vigil/") and p not in hidden.files
             )
-            take.append((head, mine))
-        take += [(base_sha, pinned), (hidden.sha, list(hidden.files))]
-        tag = hidden_tag(self.host_key, task_id)
-        vitest = hidden.include is not None
-        run = self._run(
-            repo, image, name, base_sha, hidden.test_cmd, command, take,
-            keep_output=True, tag=tag, put=[helper_file(hidden.prefix.rstrip("/"), vitest)],
-            env={TAG_ENV: tag if tagged else "untagged"},
+        subject = self.ws.verify_checkout(
+            repo, f"{name}-sub", base_sha,
+            take=[(head, mine)] if head is not None else [],
         )  # fmt: skip
+        tag = hidden_tag(self.host_key, task_id)
+        try:
+            run = self._run(
+                repo, image, name, base_sha, hidden.test_cmd, command,
+                [(hidden.sha, list(hidden.files))],
+                keep_output=True, tag=tag,
+                put=[helper_file(hidden.prefix.rstrip("/"), hidden.vitest)],
+                env={TAG_ENV: tag if tagged else "untagged"}, subject=subject,
+            )  # fmt: skip
+        finally:
+            shutil.rmtree(subject.parent, ignore_errors=True)
         self.ws.keep_hidden_output(name, run.pop("_output", ""))
         if not run["_report"] and run["outcome"] == "pass":
             run["outcome"] = "unknown"
@@ -878,23 +831,51 @@ class Verifier:
         hidden: HiddenSuite,
         runner_config: Iterable[str] = (),
         overlap: Sequence[str] = (),
+        scope: Sequence[str] = (),
     ) -> dict[str, Any]:
-        """Spec time: hidden tests must fail on the base, in their own run,
-        each with an assertion failure, and exactly the stored number must run."""
+        """Spec time: hidden tests must be black-box, fail on the base in their
+        own run, each with an assertion failure, and exactly the stored number
+        must run."""
         if self.host_key is None:
             return {"ok": False, "why": "VIGIL_HOST_KEY is not set: no hidden test can count"}
-        if missed := uncollected(hidden):
-            return {
-                "ok": False,
-                "why": f"the runner's include would not collect the hidden tests: {missed[:5]}",
-            }
-        base_files = self.ws.tree_paths(repo, base_sha)
-        pinned = self._pinned(base_files, set(), list(runner_config), hidden.test_cmd, overlap)
-        pinned = [p for p in pinned if p not in hidden.files]
+        if why := self.whitebox(repo, hidden, scope):
+            return {"ok": False, "why": "the hidden tests are not black-box: " + "; ".join(why[:5])}
         run = self._hidden_run(
-            repo, image, f"{task_id}-hspec", task_id, base_sha, hidden, pinned, tagged=True
+            repo, image, f"{task_id}-hspec", task_id, base_sha, hidden, tagged=True
         )
         return self.base_failure(run, hidden.expected)
+
+    def whitebox(self, repo: str, hidden: HiddenSuite, scope: Sequence[str]) -> list[str]:
+        """The black-box rule (`vigild.blackbox`), checked on the stored files."""
+        files = {f: self.ws.read_blob(repo, hidden.sha, f) or "" for f in hidden.files}
+        return blackbox_problems(files, scope)
+
+    def collect_probe(
+        self, repo: str, image: str, base_sha: str, test_cmd: str, probes: Sequence[str]
+    ) -> set[str] | None:
+        """Ask the project's own vitest which of these probe files it would collect
+        (`vitest list --json` with the test script's own flags), on the base in the
+        no-network dev image. None when it can't be asked: the caller refuses."""
+        command = vitest_list_command(test_cmd, lambda p: self.ws.read_blob(repo, base_sha, p))
+        if command is None:
+            return None
+        text = "import { test } from 'vitest'\ntest('probe', () => {})\n"
+        src = self.ws.verify_checkout(
+            repo, f"probe-{hashlib.sha256(test_cmd.encode()).hexdigest()[:8]}", base_sha,
+            put=[(p, text) for p in probes],
+        )  # fmt: skip
+        try:
+            r = self.runner.run(
+                image, src, command, timeout_s=self.timeout_s, max_output=MAX_OUTPUT
+            )
+        finally:
+            shutil.rmtree(src.parent, ignore_errors=True)
+        if r.exit != 0 or r.timed_out:
+            return None
+        listed = _listed_files(r.output)
+        if listed is None:
+            return None
+        return {p for p in probes if any(f.endswith("/" + p) or f == p for f in listed)}
 
     def _hidden_pair(
         self,
@@ -916,19 +897,15 @@ class Verifier:
         and pass on the head, with a report, the stored number of tests must
         run in both, and head may run no fewer.
 
-        Tampering is any head file in the suite's directory, or a runner-config
-        file (`RUNNER_LIKE`) the worker wrote on the tests' import or config
-        path: in the suite's directory, any directory above it, or any
-        directory below the repo root that holds one. Both runs also start from
-        a checkout with every other `.vigil/` file removed (hotfix 5)."""
+        Black-box (hotfix 5, round 2): the test process runs in a base checkout
+        with the hidden files; the worker's in-scope changes are only in a
+        separate read-only subject checkout the tests run as a subprocess. Tampering
+        is any head file in the suite's directory, or an in-scope runner-config file
+        (`RUNNER_LIKE`) that isn't the flagged one. A hidden test that imports
+        in-scope code is refused before any run."""
         out: dict[str, Any] = {
             "test_cmd": hidden.test_cmd, "files": len(hidden.files), "expected": hidden.expected,
         }  # fmt: skip
-        pinned = [
-            p
-            for p in self._pinned(base_files, head_files, runner_config, hidden.test_cmd, overlap)
-            if p not in hidden.files
-        ]
         prefix = hidden.prefix.rstrip("/")
         planted = sorted(p for p in head_files if p.startswith(prefix + "/"))
         # second layer: an in-scope runner-config file that isn't the flagged runner
@@ -944,16 +921,14 @@ class Verifier:
         if tampered:
             out.update(ok=False, tampered=tampered[:20], failed_on_base=False, passed_on_head=False)
             return out
-        if missed := uncollected(hidden):
-            out.update(
-                ok=False, uncollected=missed[:20], failed_on_base=False, passed_on_head=False
-            )
+        if why := self.whitebox(repo, hidden, scope):
+            out.update(ok=False, whitebox=why[:10], failed_on_base=False, passed_on_head=False)
             return out
         b = self._hidden_run(
-            repo, image, f"{task_id}-hbase", task_id, base_sha, hidden, pinned, tagged=True
+            repo, image, f"{task_id}-hbase", task_id, base_sha, hidden, tagged=True
         )
         h = self._hidden_run(
-            repo, image, f"{task_id}-hhead", task_id, base_sha, hidden, pinned,
+            repo, image, f"{task_id}-hhead", task_id, base_sha, hidden,
             head=head, scope=scope, changed=changed,
         )  # fmt: skip
         h["sha"] = head  # the head run is the base plus the head's in-scope changes
@@ -1023,11 +998,18 @@ class Verifier:
         keep_output: bool = False,
         tag: str = "",
         env: Mapping[str, str] | None = None,
+        subject: Path | None = None,
     ) -> dict[str, Any]:
         src = self.ws.verify_checkout(repo, name, sha, take=take, put=put)
         try:
             r = self.runner.run(
-                image, src, command, timeout_s=self.timeout_s, max_output=MAX_OUTPUT, env=env
+                image,
+                src,
+                command,
+                timeout_s=self.timeout_s,
+                max_output=MAX_OUTPUT,
+                env=env,
+                subject=subject,
             )
         finally:
             shutil.rmtree(src.parent, ignore_errors=True)

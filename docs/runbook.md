@@ -259,6 +259,13 @@ the class is flagged and handled differently:
   on the base, pass on the head). They decide; the visible test is reported but
   is not enough. `tests.json` has `runner_files`, `runner_file_changed` and
   `hidden`.
+- **Hidden tests are black-box.** They never import the code under test; they run
+  it as a command (`run_subject`) or call a function through vigild's driver
+  (`call_subject`), on a read-only checkout, and compare exit codes, output and
+  JSON values. If the task's overlap is itself a test-runner config
+  (`conftest.py`, `pytest.ini`, `vitest.config.*`, ...) no author runs: the spec
+  item says "owner review only" and the task escalates. A hidden-test file that
+  imports in-scope code is rejected and regenerated once.
 - **The host key.** Hidden tests only count with a key only you create, once:
   `printf 'VIGIL_HOST_KEY=%s\n' "$(openssl rand -hex 32)" >> ~/.config/vigil/env`
   (mode 600 stays). Without it every flagged task is recorded "hidden tests

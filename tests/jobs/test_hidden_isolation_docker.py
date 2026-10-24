@@ -59,8 +59,10 @@ pytestmark = pytest.mark.docker
 MARKER = "HIDDEN-AUTHOR-OUTPUT-3f9c1d7a52"
 CONTROL = "SEARCH-CONTROL-8be40a6c"
 BODY = (
-    f"import os\n\n# {MARKER}\n\n\n"
-    "from vigil_hidden import check\n\n\ndef test_flag_env_is_set():\n    check(os.environ.get('FLAG_ON') == '1')\n"
+    f"# {MARKER}\nfrom vigil_hidden import check, run_subject\n\n\n"
+    "def test_flag_env_is_set():\n"
+    "    r = run_subject(['python3', 'tools/check.py'])\n"
+    "    check(r['returncode'] == 0 and r['stdout'].strip() == 'ok', repr(r))\n"
 )
 NAME = "flag env is set by the runner"
 
@@ -156,7 +158,7 @@ def dworld(
         dev_lockfiles=["README.md"],
         dev_suites={"smoke": "python -m pytest --version"},
         dev_image_tools=["git", "grep", "python", "pytest"],
-        runner_config=["conftest.py"],
+        runner_config=["tools/check.py"],
     )
     store = Store.open(":memory:")
     budget = Budget(store, cfg.budgets)

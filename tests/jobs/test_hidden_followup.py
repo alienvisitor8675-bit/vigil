@@ -16,6 +16,7 @@ import pytest
 from tests.jobs.test_coord_loop import (  # noqa: F401
     HIDDEN_NAME,
     REPO,
+    SPEC,
     World,
     _approve,
     _events,
@@ -29,6 +30,7 @@ from tests.jobs.test_coord_loop import (  # noqa: F401
     auth,
     failed_author,
     good_author,
+    plan,
     world,
 )
 from vigild.config import Config
@@ -74,8 +76,7 @@ def test_worker_planted_ini_above_the_task_dir_no_longer_makes_hidden_tests_pass
     def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
         _work(spec.clone, task["spec"]["files_in_scope"][0])
         if str(spec.task_id).endswith("w1"):
-            # the conftest.py the hidden test needs is NOT written: the hidden test fails
-            (spec.clone / "conftest.py").write_text("# unchanged behaviour\n")
+            # tools/check.py (what the hidden test runs) is NOT written: the hidden test fails
             d = spec.clone / ".vigil" / spec.job_id / "hidden"
             d.mkdir(parents=True, exist_ok=True)
             (d / "pytest.ini").write_text("[pytest]\npythonpath = .\naddopts = -p flipper\n")
@@ -151,14 +152,14 @@ def test_reconcile_reruns_only_the_author_step_after_a_crash_mid_author(world: W
 def test_a_retry_never_hands_a_human_written_spec_to_the_coord(world: World) -> None:
     w = world
     _runner_world(w)
-    w.runner.cfg.repos.repos["o/fixture"].runner_config = ["conftest.py"]
+    w.runner.cfg.repos.repos["o/fixture"].runner_config = ["tools/check.py"]
     r = w.client.post(
         "/api/tasks",
         headers=auth(w.tokens.admin),
         json={
             "repo": "o/fixture", "why": "w", "value": 3, "risk": 1,
             "spec": {"goal": "make the flag env visible", "test_cmd": "pytest -q tests/test_runbook.py",
-                     "done_when": "d", "files_in_scope": ["conftest.py", "tests/test_runbook.py"]},
+                     "done_when": "d", "files_in_scope": ["tools/check.py", "tests/test_runbook.py"]},
         },
     )  # fmt: skip
     assert r.status_code in (200, 202), r.text
@@ -198,7 +199,8 @@ def test_retry_still_runs_the_other_failed_tasks_when_one_is_escalated(world: Wo
     def edit(spec: SessionSpec, task: dict[str, Any]) -> None:
         flaky(spec, task)
         if str(spec.task_id).endswith("w1"):
-            (spec.clone / "conftest.py").write_text("import os\n")
+            (spec.clone / "tools").mkdir(exist_ok=True)
+            (spec.clone / "tools" / "check.py").write_text("print(1)\n")
 
     w.standin.worker_edit = edit
     job = _approve(w)
@@ -222,19 +224,17 @@ def test_retry_still_runs_the_other_failed_tasks_when_one_is_escalated(world: Wo
     assert [e["task"] for e in _events(w, "escalated")] == [f"{job}-w1"]
 
 
-def test_a_vitest_task_is_given_a_directory_its_include_collects(
+def test_a_vitest_task_is_given_a_directory_the_runner_collects_and_its_own_contract(
     world: World, fixture_repo: dict[str, Any]
 ) -> None:
-    """The base's vitest config is read through vigild's own path, the author's
-    packet names the directory, and the author's files are accepted only there."""
+    """The placement is asked of the runner (stubbed here); the author's packet names
+    it; and the author's own task.json lets it write exactly there, so the harness
+    commits the files (round 2, item 3)."""
     from tests.conftest import git
 
     seed = fixture_repo["seed"]
     (seed / "server").mkdir()
     (seed / "server" / "package.json").write_text('{"scripts": {"test": "vitest run"}}\n')
-    (seed / "server" / "vitest.config.ts").write_text(
-        "export default { test: { include: ['test/**/*.test.ts'] } }\n"
-    )
     git(seed, "add", "-A")
     git(seed, "commit", "-q", "-m", "a vitest project")
     git(seed, "push", "-q", "origin", "main")
@@ -242,16 +242,21 @@ def test_a_vitest_task_is_given_a_directory_its_include_collects(
     _runner_world(w)
     job_id = _request(w)
     job = w.store.get_job(job_id)
+    w.runner.verifier.collect_probe = lambda repo, image, base, cmd, files: {  # type: ignore[method-assign]
+        f for f in files if f.startswith("server/test/") and f.endswith(".test.ts")
+    }
     contract = {
         "task_id": f"{job_id}-w1", "job_id": job_id, "branch": f"vigil/{job_id}-w1",
-        "spec": {"test_cmd": "pnpm -C server test", "files_in_scope": ["conftest.py"]},
+        "spec": {"test_cmd": "pnpm -C server test", "files_in_scope": ["scripts/check.mjs"]},
     }  # fmt: skip
     folder = f"server/test/vigil-hidden/{job_id}/{job_id}-w1"
+    seen: dict[str, Any] = {}
 
     def author(spec: SessionSpec, task: dict[str, Any]) -> None:
+        seen["task"] = task
         d = spec.clone / folder
         d.mkdir(parents=True)
-        (d / "a.test.ts").write_text("import { test } from 'vitest'\ntest('x', () => {})\n")
+        (d / "a.test.ts").write_text("import { check } from './vigil_hidden.mjs'\ncheck(true)\n")
         m = {"test_cmd": f"pnpm -C server test {folder}", "tests": [{"name": "x", "category": "c"}]}
         (spec.clone / ".vigil" / job_id / "hidden").mkdir(parents=True, exist_ok=True)
         (spec.clone / ".vigil" / job_id / "hidden" / f"{job_id}-w1.json").write_text(json.dumps(m))
@@ -261,10 +266,67 @@ def test_a_vitest_task_is_given_a_directory_its_include_collects(
     entry = w.runner._author_one(job, spec_md, contract, [])
     packets = [p for r, p in w.standin.packets if r == "hidden_test_author"]
     assert f"Write your tests under `{folder}/`" in packets[-1]
-    assert "`test/**/*.test.ts`" in packets[-1]
-    # accepted where the include collects them; refused only by the (local, no pnpm) run
+    assert "`*.test.ts`" in packets[-1]
+    assert seen["task"]["spec"]["files_in_scope"] == [f"{folder}/**"]  # its own contract
+    # accepted at the placement (the only thing left to refuse it is the local run: no pnpm)
     assert entry["status"] == "missing" and "outside the hidden directory" not in entry["reason"]
-    assert "load" not in entry["reason"]
+    assert "black-box" not in entry["reason"]
+
+
+def test_a_vitest_task_whose_runner_cannot_be_asked_gets_no_author(
+    world: World, fixture_repo: dict[str, Any]
+) -> None:
+    from tests.conftest import git
+
+    seed = fixture_repo["seed"]
+    (seed / "server").mkdir()
+    (seed / "server" / "package.json").write_text('{"scripts": {"test": "vitest run"}}\n')
+    git(seed, "add", "-A")
+    git(seed, "commit", "-q", "-m", "a vitest project")
+    git(seed, "push", "-q", "origin", "main")
+    w = world
+    _runner_world(w)
+    job_id = _request(w)
+    w.runner.verifier.collect_probe = lambda *a, **k: None  # type: ignore[method-assign,assignment]
+    contract = {
+        "task_id": f"{job_id}-w1", "job_id": job_id, "branch": f"vigil/{job_id}-w1",
+        "spec": {"test_cmd": "pnpm -C server test", "files_in_scope": ["scripts/check.mjs"]},
+    }  # fmt: skip
+    spec_md = w.store.get_artifact(job_id, "spec.md").content
+    before = [c[0] for c in w.standin.calls].count("hidden_test_author")
+    entry = w.runner._author_one(w.store.get_job(job_id), spec_md, contract, [])
+    assert entry["status"] == "missing" and "could not be asked" in entry["reason"]
+    assert [c[0] for c in w.standin.calls].count("hidden_test_author") == before  # nothing spent
+
+
+def test_a_config_overlap_is_never_authored_and_can_only_escalate(world: World) -> None:
+    """The overlap includes the hidden runner's own config (conftest.py): no author
+    runs, the spec item says so, and the task escalates."""
+    w = world
+    _runner_world(w)
+    w.runner.cfg.repos.repos[REPO].runner_config = ["conftest.py"]
+    w.standin.coord_drafts = [
+        lambda j: (
+            SPEC.replace(
+                "- `tests/test_runbook.py`\n", "- `tests/test_runbook.py`\n- `conftest.py`\n"
+            ),
+            plan(j).replace(
+                '"tests/test_feature_map.py"\n   ]',
+                '"tests/test_feature_map.py",\n    "conftest.py"\n   ]',
+            ),
+        )
+    ]
+    job = _request(w)
+    assert [c[0] for c in w.standin.calls].count("hidden_test_author") == 0
+    (item,) = _specs(w, job)
+    hidden = {x["task_id"]: x for x in item["body"]["workers"]}[f"{job}-w1"]["hidden_tests"]
+    assert hidden["status"] == "missing"
+    entry = json.loads(w.store.get_artifact(job, "hidden_tests.json").content)["tasks"][f"{job}-w1"]
+    assert "own config" in entry["reason"] and "conftest.py" in entry["reason"]
+    w.standin.worker_edit = _flag_edit()
+    w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
+    assert w.store.get_task(f"{job}-w1").state == "escalated"
+    assert f"vigil/{job}-w1" not in [p["head"] for p in w.publisher.prs]
 
 
 def _book(w: World, tokens_out: int, roles: tuple[Role, ...]) -> Any:

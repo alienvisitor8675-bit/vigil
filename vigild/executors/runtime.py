@@ -187,7 +187,12 @@ def split_reports(text: str, marker: str) -> tuple[str, dict[str, bytes]]:
 
 
 def verifier_kwargs(
-    cfg: Config, image: str, source: Path, command: str, env: Mapping[str, str] | None = None
+    cfg: Config,
+    image: str,
+    source: Path,
+    command: str,
+    env: Mapping[str, str] | None = None,
+    subject: Path | None = None,
 ) -> dict[str, Any]:
     """The verifier's container (owner direction, round 2): the repo's dev
     image, vigild's checkout read-only at /src, no network at all, the agent
@@ -202,7 +207,11 @@ def verifier_kwargs(
         "command": [PREPARE, command],
         "user": f"{uid}:{uid}",
         "network_mode": "none",
-        "mounts": [_mount(str(source), "/src", read_only=True)],
+        "mounts": [
+            _mount(str(source), "/src", read_only=True),
+            # the code under test, for a hidden run: read-only, and run only as a subprocess
+            *([_mount(str(subject), "/subject", read_only=True)] if subject else []),
+        ],
         "tmpfs": {
             "/tmp": f"{tmp},size=2g,mode=1777",  # noqa: S108
             "/work": f"{tmp},size=4g,mode=0755",
@@ -216,6 +225,7 @@ def verifier_kwargs(
             "NO_COLOR": "1",
             "PYTEST_ADDOPTS": f"--junitxml={REPORT_DIR}/pytest.xml -p no:cacheprovider",
             "pnpm_config_verify_deps_before_run": "false",
+            **({"VIGIL_SUBJECT": "/subject"} if subject else {}),
             **(env or {}),
         },
         "stdin_open": True,  # the report marker, then closed
@@ -246,10 +256,17 @@ class DockerTestRunner:
         timeout_s: int,
         max_output: int,
         env: Mapping[str, str] | None = None,
+        subject: Path | None = None,
     ) -> RunResult:
         with self._slots:  # round 4, item 12: verifier containers one at a time
             return self._run(
-                image, source, command, timeout_s=timeout_s, max_output=max_output, env=env
+                image,
+                source,
+                command,
+                timeout_s=timeout_s,
+                max_output=max_output,
+                env=env,
+                subject=subject,
             )
 
     def _run(
@@ -261,11 +278,12 @@ class DockerTestRunner:
         timeout_s: int,
         max_output: int,
         env: Mapping[str, str] | None = None,
+        subject: Path | None = None,
     ) -> RunResult:
         import docker.errors
 
         marker = f"VIGIL-REPORT-{secrets.token_hex(16)}"
-        kw = verifier_kwargs(self.cfg, image, source, command, env)
+        kw = verifier_kwargs(self.cfg, image, source, command, env, subject)
         kw["mounts"] = _docker_mounts(kw["mounts"])
         c = self.client.containers.create(**kw)
         timed_out = threading.Event()

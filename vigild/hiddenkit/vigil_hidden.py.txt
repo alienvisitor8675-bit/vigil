@@ -1,0 +1,182 @@
+"""vigild's helper for hidden tests (pytest). vigild lays this file in the test
+directory for a hidden run; the author and the worker never write it.
+
+A hidden test is black-box: it never imports the code under test. It asserts
+through `check`, and reaches the subject (the worker's in-scope code, a
+read-only checkout at $VIGIL_SUBJECT) only through `run_subject` (a command)
+or `call_subject` (a function, called by a separate vigild-owned driver
+process). The subject never runs in this process."""
+
+import json
+import os
+import secrets
+import signal
+import subprocess
+import sys
+import tempfile
+
+_SUBJECT = os.environ.get("VIGIL_SUBJECT", "")
+_KEEP = ("PATH", "LANG", "LC_ALL", "TZ")
+_DRIVER = r"""
+import json, os, signal, subprocess, sys, threading
+nonce = sys.stdin.readline().strip()
+spec = json.loads(sys.stdin.read())
+CHILD = r'''
+import importlib, json, os, sys
+fd = int(sys.argv[1])
+spec = json.loads(sys.stdin.read())
+sys.path.insert(0, spec["cwd"])
+out = os.fdopen(fd, "w")
+for c in spec["calls"]:
+    try:
+        fn = importlib.import_module(c["module"])
+        for part in c["func"].split("."):
+            fn = getattr(fn, part)
+        val = fn(*c.get("args", []), **c.get("kwargs", {}))
+        json.dumps(val)
+        r = {"ok": True, "value": val}
+    except BaseException as e:
+        r = {"ok": False, "type": type(e).__name__, "message": str(e)[:2000]}
+    out.write(json.dumps(r) + "\n")
+    out.flush()
+'''
+rd, wr = os.pipe()
+env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "TZ") if k in os.environ}
+env["HOME"] = spec["home"]
+p = subprocess.Popen(
+    [sys.executable, "-I", "-c", CHILD, str(wr)], stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(wr,), cwd=spec["cwd"],
+    env=env, start_new_session=True,
+)
+os.close(wr)
+buf = bytearray()
+def drain():
+    while True:
+        b = os.read(rd, 65536)
+        if not b:
+            return
+        buf.extend(b)
+        if len(buf) > 8 << 20:
+            return
+t = threading.Thread(target=drain, daemon=True)
+t.start()
+timed_out = False
+try:
+    p.communicate(json.dumps({"cwd": spec["cwd"], "calls": spec["calls"]}).encode(), timeout=spec["timeout"])
+except subprocess.TimeoutExpired:
+    timed_out = True
+finally:
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        pass
+t.join(5)
+results, malformed = [], False
+for line in bytes(buf).decode(errors="replace").splitlines():
+    try:
+        r = json.loads(line)
+        if not isinstance(r, dict) or "ok" not in r:
+            raise ValueError
+        results.append(r)
+    except ValueError:
+        malformed = True
+if len(results) != len(spec["calls"]) and not timed_out:
+    malformed = True
+print(nonce + " " + json.dumps({"results": results, "malformed": malformed, "timed_out": timed_out, "exit": p.returncode}))
+"""
+
+
+def check(condition, message="assertion failed"):
+    """The only way a hidden test asserts. A failure carries vigild's per-task tag."""
+    if not condition:
+        raise AssertionError(f"[vigil-tag:{os.environ['VIGIL_HIDDEN_TAG']}] {message}")
+
+
+def _root():
+    if not _SUBJECT:
+        raise RuntimeError("VIGIL_SUBJECT is not set")
+    return os.path.realpath(_SUBJECT)
+
+
+def _cwd(cwd):
+    root = _root()
+    path = os.path.realpath(os.path.join(root, cwd))
+    if path != root and not path.startswith(root + os.sep):
+        check(False, "cwd leaves the subject checkout")
+    return path
+
+
+def _env(extra=None):
+    env = {k: os.environ[k] for k in _KEEP if k in os.environ}
+    env["HOME"] = tempfile.mkdtemp(prefix="vigil-subject-")
+    env["NO_COLOR"] = "1"
+    env.update(extra or {})
+    return env
+
+
+def _run(cmd, cwd, env, stdin, timeout):
+    p = subprocess.Popen(
+        cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, start_new_session=True,
+    )
+    try:
+        out, err = p.communicate(stdin, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        return None, "", "", True
+    finally:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return p.returncode, out, err, False
+
+
+def run_subject(cmd, *, cwd=".", env=None, input=None, timeout=60):
+    """Run a command in the read-only subject checkout, in its own process,
+    with a minimal environment. Returns a dict: returncode, stdout, stderr."""
+    code, out, err, timed_out = _run(cmd, _cwd(cwd), _env(env), input, timeout)
+    check(not timed_out, f"{cmd!r} timed out after {timeout}s")
+    return {"returncode": code, "stdout": out, "stderr": err}
+
+
+def call_subject_batch(calls, *, cwd=".", timeout=60):
+    """Call functions of the subject, named as {"module", "func", "args", "kwargs"},
+    in a separate driver process. Each result is {"ok": true, "value": ...} or
+    {"ok": false, "type": ..., "message": ...}. The driver's output is framed with a
+    per-run nonce that only this process and the driver's supervisor know."""
+    nonce = secrets.token_hex(16)
+    spec = {
+        "calls": [
+            {"module": c["module"], "func": c["func"], "args": list(c.get("args", [])),
+             "kwargs": dict(c.get("kwargs", {}))}
+            for c in calls
+        ],
+        "cwd": _cwd(cwd),
+        "home": tempfile.mkdtemp(prefix="vigil-subject-"),
+        "timeout": timeout,
+    }
+    payload = nonce + "\n" + json.dumps(spec)
+    code, out, err, timed_out = _run(
+        [sys.executable, "-I", "-c", _DRIVER], os.getcwd(), _env(), payload, timeout + 30
+    )
+    check(not timed_out, "the driver timed out")
+    frames = [ln for ln in out.splitlines() if ln.startswith(nonce + " ")]
+    check(len(frames) == 1, f"the driver gave {len(frames)} result frames, not 1")
+    try:
+        frame = json.loads(frames[0][len(nonce) + 1 :])
+    except ValueError:
+        check(False, "the driver's frame is not JSON")
+    check(not frame["malformed"], "the subject wrote a malformed result stream")
+    check(not frame["timed_out"], f"the subject timed out after {timeout}s")
+    check(len(frame["results"]) == len(calls), "the subject returned the wrong number of results")
+    return frame["results"]
+
+
+def call_subject(module, func, args=(), kwargs=None, *, cwd=".", timeout=60):
+    """One call: returns {"ok": true, "value": ...} or {"ok": false, "type", "message"}."""
+    return call_subject_batch(
+        [{"module": module, "func": func, "args": args, "kwargs": kwargs or {}}],
+        cwd=cwd, timeout=timeout,
+    )[0]

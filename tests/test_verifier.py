@@ -564,9 +564,13 @@ def test_a_case_belongs_to_its_file_class_based_or_not(classname: str) -> None: 
 # --- phase 1 run, finding #2: a task whose scope names a runner file -------------------------
 
 FLAG_TEST = "import os\n\n\ndef test_flag_env():\n    assert os.environ.get('FLAG_ON') == '1'\n"
+TOOL_OK = 'print("ok")\n'
+# black-box: the subject is a command, run in another process on a read-only checkout
 HIDDEN_FLAG = (
-    "import os\nfrom vigil_hidden import check\n\n\n"
-    "def test_flag_env():\n    check(os.environ.get('FLAG_ON') == '1')\n"
+    "from vigil_hidden import check, run_subject\n\n\n"
+    "def test_tool_says_ok():\n"
+    "    r = run_subject(['python3', 'tools/check.py'])\n"
+    "    check(r['returncode'] == 0 and r['stdout'].strip() == 'ok', repr(r))\n"
 )
 FLAG_CONFTEST = (
     "import os, sys\nsys.path.insert(0, os.path.dirname(__file__))\nos.environ['FLAG_ON'] = '1'\n"
@@ -579,6 +583,8 @@ def _runner_edit(c: Path) -> None:
     doesn't (package.json), with its own test."""
     (c / "tests" / "test_flag.py").write_text(FLAG_TEST)
     (c / "conftest.py").write_text(FLAG_CONFTEST)
+    (c / "tools").mkdir(exist_ok=True)
+    (c / "tools" / "check.py").write_text(TOOL_OK)
     (c / "package.json").write_text('{"scripts": {"test": "true"}}\n')
 
 
@@ -622,8 +628,8 @@ def _verify_flagged(
         head=head,
         test_cmd=CMD,
         must_fail_first=True,
-        runner_config=["conftest.py", "package.json"],
-        runner_overlap=["conftest.py"],
+        runner_config=["conftest.py", "package.json", "tools/check.py"],
+        runner_overlap=["conftest.py", "tools/check.py"],
         hidden=hidden,
         scope=scope,
     )
@@ -660,7 +666,7 @@ def test_a_flagged_task_runs_the_head_copy_of_only_the_overlapping_file(
     assert rec["before"]["outcome"] == "fail"  # base's conftest.py + the worker's test
     assert rec["runner_config"]["pinned_to_base"] == ["package.json"]  # every other one stays
     assert rec["runner_file_changed"] is True
-    assert rec["runner_files"] == ["conftest.py"]
+    assert rec["runner_files"] == ["conftest.py", "tools/check.py"]
     assert "hidden" not in rec  # none was given
 
 
@@ -669,7 +675,10 @@ def test_a_flagged_task_records_the_class_even_if_the_file_is_unchanged(
 ) -> None:
     base, head = _session(ws, tmp_path, _turn_on)
     rec = _verify_flagged(ws, base, head)
-    assert rec["runner_files"] == ["conftest.py"] and rec["runner_file_changed"] is False
+    assert (
+        rec["runner_files"] == ["conftest.py", "tools/check.py"]
+        and rec["runner_file_changed"] is False
+    )
     plain = _verify(ws, base, head)
     assert plain["runner_files"] == [] and plain["runner_file_changed"] is False
 
@@ -729,13 +738,15 @@ def test_hidden_tests_are_checked_on_base_alone_at_spec_time(ws: Workspace, tmp_
     v = Verifier(ws, LocalTestRunner(), host_key=KEY)
     got = v.check_hidden_on_base(
         repo=REPO, image="img", task_id="fx-0001-w1", base_sha=base, hidden=suite,
-        runner_config=["conftest.py"], overlap=["conftest.py"],
+        runner_config=["conftest.py", "tools/check.py"],
+        overlap=["conftest.py", "tools/check.py"],
     )  # fmt: skip
     assert got["ok"] and got["outcome"] == "fail" and got["failing"] >= 1
     green = _hidden_suite(ws, tmp_path, "def test_hidden():\n    assert True\n")
     got = v.check_hidden_on_base(
         repo=REPO, image="img", task_id="fx-0001-w1", base_sha=base, hidden=green,
-        runner_config=["conftest.py"], overlap=["conftest.py"],
+        runner_config=["conftest.py", "tools/check.py"],
+        overlap=["conftest.py", "tools/check.py"],
     )  # fmt: skip
     assert not got["ok"] and "pass" in got["why"]
 
@@ -750,7 +761,8 @@ def test_a_hidden_test_that_errors_instead_of_failing_an_assertion_is_the_wrong_
     base = ws.base_sha("fx-0001-ht1")
     got = Verifier(ws, LocalTestRunner(), host_key=KEY).check_hidden_on_base(
         repo=REPO, image="img", task_id="fx-0001-w1", base_sha=base, hidden=suite,
-        runner_config=["conftest.py"], overlap=["conftest.py"],
+        runner_config=["conftest.py", "tools/check.py"],
+        overlap=["conftest.py", "tools/check.py"],
     )  # fmt: skip
     assert not got["ok"] and "errored" in got["why"] and "assertion" in got["why"]
 

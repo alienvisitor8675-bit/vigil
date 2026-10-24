@@ -14,23 +14,16 @@ from __future__ import annotations
 import json
 import posixpath
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from vigild.blackbox import problems as blackbox_problems
 from vigild.intake.paths import scope_entry_error
 from vigild.packets.assemble import hidden_dir
-from vigild.verifier import (
-    HELPER_NAME,
-    HiddenSuite,
-    ReadFile,
-    collected,
-    glob_match,
-    plan_reports,
-    runner_like,
-    uncollected,
-)
+from vigild.verifier import HELPER_NAME, HiddenSuite, ReadFile, plan_reports, runner_like
 from vigild.workspace import Workspace
 
 ARTIFACT = "hidden_tests.json"
@@ -63,69 +56,51 @@ class Manifest(BaseModel):
 
 @dataclass(frozen=True)
 class Place:
-    """Where a task's hidden tests live in the checkout, and the include that
-    has to collect them (None: not a vitest project, so no include to check)."""
+    """Where a task's hidden tests live in the checkout. For a vitest project that
+    is a directory the project's own vitest collects (asked of the runner, not
+    read from its config), and the file suffix it collects."""
 
     folder: str
     project: str = ""
-    include: tuple[str, ...] | None = None
+    vitest: bool = False
+    suffix: str = ".test.ts"
 
 
-def _strings(body: str) -> list[str]:
-    return re.findall(r"""['"`]([^'"`]+)['"`]""", body)
+PROBE_DIRS = ("test", "tests", "__tests__", "src", "")
+PROBE_SUFFIXES = (".test.ts", ".spec.ts")
+Probe = Callable[[list[str]], "set[str] | None"]
 
 
-def _list_of(config: str, key: str) -> list[str] | None:
-    m = re.search(rf"\b{key}\s*:\s*\[(.*?)\]", config, re.S)
-    return _strings(m.group(1)) if m else None
-
-
-def place_for(job_id: str, task_id: str, test_cmd: str, read: ReadFile) -> Place:
-    """Where the author writes, and vigild injects, a task's hidden tests.
+def place_for(job_id: str, task_id: str, test_cmd: str, read: ReadFile, probe: Probe) -> Place:
+    """Where the author writes, and vigild runs, a task's hidden tests.
 
     A vitest task (the approved spec's `test_cmd` runs vitest, directly or
-    through a pnpm script) puts them under a directory the project's own
-    `include` already collects, read from the vitest config at the base (a
-    vault blob read): `<project>/<include's static prefix>/vigil-hidden/<job>/<task>`.
-    If the config can't be read, or no include would collect a test file
-    there, the task gets no hidden tests (hotfix 5). Everything else keeps
-    `.vigil/<job>/hidden/<task>`."""
-    plain = Place(hidden_dir(job_id, task_id))
+    through a pnpm script) gets `<project>/<dir>/vigil-hidden/<job>/<task>`, for
+    the first candidate dir in which the project's own `vitest list --json`, run
+    on the base in the no-network dev image, collects a probe file. Config text is
+    never parsed. If the runner can't be asked, or collects none of the
+    candidates, the task gets no hidden tests (it escalates). Everything else
+    keeps `.vigil/<job>/hidden/<task>` (pytest takes explicit paths)."""
     dirs = plan_reports(test_cmd, read).vitest_dirs
     if not dirs:
-        return plain
+        return Place(hidden_dir(job_id, task_id))
     if len(dirs) > 1:
         raise HiddenError(f"the spec's test_cmd runs vitest in {len(dirs)} projects: {list(dirs)}")
     project = dirs[0]
-    config = ""
-    for name in VITEST_CONFIGS:
-        got = read(f"{project}/{name}" if project else name)
-        if got is not None:
-            config = got
-            break
-    else:
-        raise HiddenError(f"no vitest config found in {project or '.'} at the base")
-    if re.search(r"\b(projects|workspace)\s*:", config):
-        raise HiddenError("the vitest config uses projects/workspace; its include can't be read")
-    include = _list_of(config, "include")
-    excluded = _list_of(config, "exclude") or []
-    for g in include or [""]:
-        static = []
-        for seg in g.removeprefix("./").split("/")[:-1]:
-            if set("*?{[(") & set(seg):
-                break
-            static.append(seg)
-        folder = "/".join(
-            [*([project] if project else []), *static, "vigil-hidden", job_id, task_id]
-        )
-        rel = folder[len(project) + 1 :] if project else folder
-        for name in ("x.test.ts", "x.spec.ts", "x.test.js", "x.spec.js", "x.test.mjs"):
-            probe = f"{rel}/{name}"
-            if collected(include, probe) and not glob_match(excluded, probe):
-                return Place(folder, project, tuple(include) if include else ())
+    cands = [
+        "/".join(x for x in (project, d, "vigil-hidden", job_id, task_id) if x) for d in PROBE_DIRS
+    ]
+    probes = [f"{c}/vigil-probe{sfx}" for c in cands for sfx in PROBE_SUFFIXES]
+    got = probe(probes)
+    if got is None:
+        raise HiddenError("vitest could not be asked what it collects here; no hidden tests")
+    for c in cands:
+        for sfx in PROBE_SUFFIXES:
+            if f"{c}/vigil-probe{sfx}" in got:
+                return Place(c, project, True, sfx)
     raise HiddenError(
-        f"the vitest include {include or '(default)'} in {project or '.'} would not collect "
-        "a hidden test file under any directory vigild can inject it into"
+        f"vitest in {project or '.'} collects none of the directories vigild can use "
+        f"({', '.join(PROBE_DIRS)})"
     )
 
 
@@ -138,6 +113,7 @@ def load_suite(
     task_id: str,
     test_cmd_problem: Any,
     place: Place | None = None,
+    scope: Sequence[str] = (),
 ) -> tuple[HiddenSuite, Manifest]:
     """The author's output at `sha` (a vault commit), checked. `test_cmd_problem`
     is the spec gate's resolver, given the base's file reader; `place` is where
@@ -172,13 +148,13 @@ def load_suite(
     why = test_cmd_problem(manifest.test_cmd, lambda p: ws.read_blob(repo, base_sha, p))
     if why:
         raise HiddenError(why)
+    texts = {f: ws.read_blob(repo, sha, f) or "" for f in files}
+    if why := blackbox_problems(texts, scope):
+        raise HiddenError("not black-box: " + "; ".join(why[:5]))
     suite = HiddenSuite(
         sha, folder, tuple(files), manifest.test_cmd, len(manifest.tests),
-        project=place.project, include=place.include,
+        project=place.project, vitest=place.vitest,
     )  # fmt: skip
-    if missed := uncollected(suite):
-        # refused before any run: the project's include would not collect these
-        raise HiddenError(f"the project's vitest include would not collect: {missed[:5]}")
     return suite, manifest
 
 
@@ -186,11 +162,9 @@ def entry_suite(entry: dict[str, Any] | None) -> HiddenSuite | None:
     """The stored suite of one task, or None when none was produced."""
     if not entry or entry.get("status") != "ok":
         return None
-    inc = entry.get("include")
     return HiddenSuite(
         str(entry["sha"]), str(entry["prefix"]), tuple(entry["files"]), str(entry["test_cmd"]),
-        len(entry.get("tests") or []), str(entry.get("project") or ""),
-        None if inc is None else tuple(inc),
+        len(entry.get("tests") or []), str(entry.get("project") or ""), bool(entry.get("vitest")),
     )  # fmt: skip
 
 

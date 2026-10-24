@@ -75,7 +75,7 @@ from vigild.redact import redact
 from vigild.repos import RepoPolicyError, check_backend, check_hidden_author
 from vigild.router.rules import RoutingError, route
 from vigild.telemetry.spans import Telemetry
-from vigild.verifier import Verifier, runner_overlap
+from vigild.verifier import Verifier, runner_like, runner_overlap
 from vigild.workspace import Workspace, WorkspaceError
 
 log = logging.getLogger("vigild.runner")
@@ -809,11 +809,27 @@ class JobRunner:
             check_hidden_author(self.cfg, job.repo, preset)
         except RepoPolicyError as e:
             return {"status": "missing", "reason": f"backend refused: {e}", "attempts": 0}
+        config = [f for f in overlap if runner_like(f)]
+        if config:
+            # the flagged files include the hidden runner's own config: no black-box
+            # test can stand apart from it, so no author runs and only the owner decides
+            return {
+                "status": "missing",
+                "reason": f"the overlap includes the hidden runner's own config {config}; "
+                "no hidden tests are written, owner review only",
+                "attempts": 0,
+            }
         try:
-            self.workspace.head_sha(job.repo, job.base)  # a fresh mirror to read the config from
+            base_now = self.workspace.head_sha(job.repo, job.base)  # a fresh mirror
+            test_cmd = str(contract["spec"].get("test_cmd") or "")
+
+            def probe(files: list[str]) -> set[str] | None:
+                image = self.dev_images.ensure_fresh(job.repo, base_now)
+                return self.verifier.collect_probe(job.repo, image, base_now, test_cmd, files)
+
             place = place_for(
-                job.id, str(contract["task_id"]), str(contract["spec"].get("test_cmd") or ""),
-                lambda p: self.workspace.mirror_file(job.repo, job.base, p),
+                job.id, str(contract["task_id"]), test_cmd,
+                lambda p: self.workspace.mirror_file(job.repo, job.base, p), probe,
             )  # fmt: skip
         except HiddenError as e:
             # refused before any session: no path the repo's runner would collect
@@ -914,14 +930,21 @@ class JobRunner:
             base_sha = self.workspace.base_sha(clone_id)
             image = self.dev_images.ensure_fresh(job.repo, base_sha)
             session_image = self._session_image(job.repo, base_sha)
-            self.workspace.write_task(clone, {**contract, "branch": branch, "base_sha": base_sha})
+            # the author's own contract: it may write exactly its placement path (the
+            # harness commits only what is in this scope or under .vigil/)
+            own = {
+                **contract,
+                "spec": {**contract["spec"], "files_in_scope": [f"{place.folder}/**"]},
+            }
+            self.workspace.write_task(clone, {**own, "branch": branch, "base_sha": base_sha})
             packet = assemble_hidden_test_author(
                 clone,
                 contract,
                 spec_md,
                 feedback=feedback,
                 folder=place.folder,
-                include=place.include,
+                vitest=place.vitest,
+                suffix=place.suffix,
             )
             self.store.add_event(
                 "packet",
@@ -955,7 +978,15 @@ class JobRunner:
                 head=str(out.result.get("head") or ""),
             )  # fmt: skip
             suite, manifest = load_suite(
-                self.workspace, job.repo, sha, base_sha, job_id, task_id, test_cmd_problem, place
+                self.workspace,
+                job.repo,
+                sha,
+                base_sha,
+                job_id,
+                task_id,
+                test_cmd_problem,
+                place,
+                scope=list(contract["spec"].get("files_in_scope") or []),
             )
         except (WorkspaceError, HiddenError) as e:
             self.store.update_session(s.id, status="failed")
@@ -963,6 +994,7 @@ class JobRunner:
         check = self.verifier.check_hidden_on_base(
             repo=job.repo, image=image, task_id=task_id, base_sha=base_sha, hidden=suite,
             runner_config=self.cfg.repo(job.repo).runner_config, overlap=overlap,
+            scope=list(contract["spec"].get("files_in_scope") or []),
         )  # fmt: skip
         if not check["ok"]:
             self.store.update_session(s.id, status="failed")
@@ -973,7 +1005,7 @@ class JobRunner:
             "sha": suite.sha,
             "prefix": suite.prefix,
             "project": suite.project,
-            "include": None if suite.include is None else list(suite.include),
+            "vitest": suite.vitest,
             "files": list(suite.files),
             "test_cmd": suite.test_cmd,
             "tests": [t.model_dump() for t in manifest.tests],
