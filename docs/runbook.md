@@ -265,7 +265,11 @@ the class is flagged and handled differently:
   JSON values. If the task's overlap is itself a test-runner config
   (`conftest.py`, `pytest.ini`, `vitest.config.*`, ...) no author runs: the spec
   item says "owner review only" and the task escalates. A hidden-test file that
-  imports in-scope code is rejected and regenerated once.
+  imports in-scope code is rejected and regenerated once. In the verifier the code
+  under test runs as a different uid (10002) through a small root-owned broker, in
+  its own process group that is killed when the call ends, so it can't touch the
+  JUnit report or the test process. The dev image needs `setpriv` (util-linux);
+  without it a hidden run is `unknown` and the task escalates.
 - **The host key.** Hidden tests only count with a key only you create, once:
   `printf 'VIGIL_HOST_KEY=%s\n' "$(openssl rand -hex 32)" >> ~/.config/vigil/env`
   (mode 600 stays; at least 64 hex characters). Without it every flagged task is recorded "hidden tests
