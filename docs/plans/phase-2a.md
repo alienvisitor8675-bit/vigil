@@ -223,9 +223,9 @@ unmetered, before #16.
 
 | # | Item | Owning module |
 |---|---|---|
-| 1.1 | **Kill switch.** A host-side flag outside any repo and outside `configs/`. `vigil stop` sets it and `vigil resume` clears it. The gateway checks it on every call; vigild checks it before every dispatch, push and PR. Test: a session can neither set nor clear it. | `vigild/killswitch.py` |
+| 1.1 | **Kill switch.** A host-side flag outside any repo and outside `configs/`. `vigil stop` sets it and `vigil resume` clears it. The gateway checks it on every call; vigild checks it before every dispatch, push and PR. Test: a session can neither set nor clear it. This PR also lists it in #14's host-policy section in design.md as "host state, never repo-editable, never session-reachable" (ruling 7). | `vigild/killswitch.py` |
 | 1.2 | **Exactly-once push and PR on resume.** Push, PR open and PR comments carry idempotency keys derived from job, task and attempt. Status is written before the action, and the result is re-read from GitHub afterwards. A resume never re-fires an irreversible action without re-checking its approval. Rehearsal test: crash mid-commit, resume, and assert the action happened exactly once. | `vigild/github/publish.py` |
-| 1.3 | **Coord model by change type.** Sonnet for docs, tests and refactors; Opus for money, auth and consent paths, and on escalation. The rule lives in `configs/routing.yaml`. | `vigild/router/` |
+| 1.3 | **Coord model by change type** (ruling 1). Opus for rung-0 shapes, cross-module design and escalations; Sonnet for docs, tests and refactors. The rule goes in `configs/routing.yaml`, and this PR updates design.md's routing text, which until now said the coord is always Opus. | `vigild/router/` |
 | 1.4 | **Stable prefix with the HMAC nonce.** Order: tools, then system, then the fixed packet, then volatile content, with a cache breakpoint after the fixed packet. Within the fixed packet: repo-wide, then job-wide, then task-specific, byte-identical across sessions of one model. The fence nonce is `HMAC(VIGIL_HOST_KEY, "fence:" + job_id)`, and the content-must-not-contain-nonce check stays. Test: an issue body can't predict the nonce. A coord redraft continues its warm session. Cached and uncached input are metered separately, with the cache-hit rate per session; a caching check runs in CI. | `vigild/packets/fence.py` |
 | 1.5 | **`.vigil/<job>/` kept in the vault.** It stays on the job branch while the job runs. Before the PR is marked ready, vigild commits its removal and links the vault copy with a `vigil:` reference. #14's playbook folder is unaffected. Test: a ready PR's diff has no `.vigil/<job>/` path. | `vigild/github/publish.py` |
 | 1.6 | **`depends_on`** (phase 1 run finding #3). A dependent task is dispatched after the task it depends on, from that task's head. | `vigild/scheduler/` |
@@ -237,9 +237,9 @@ unmetered, before #16.
 
 | # | Item | Owning module |
 |---|---|---|
-| 2.1 | **Packets v2**, one epic, covering: the repo map (paths plus one-line summaries in place of full documents; this is the packet map); per-role budgets enforced, worker 30k, coord 60k, reviewer = diff + spec + issue, with every section's size logged; per-file git context; lessons by glob (`.vigil/lessons/` in place of layer 5, per #14); rule-based tool-output trimming (truncate, deduplicate, keep head, tail and failure lines, capped, before any model summary, with tool-result sizes recorded first); compaction at 50% of the context window into `progress.md`, logged in the event log; packets citing invariant IDs (2.7). | `vigild/packets/` |
+| 2.1 | **Packets v2**, one epic, covering: the repo map (paths plus one-line summaries in place of full documents; this is the packet map); per-role budgets enforced, worker 30k, coord 60k, reviewer = diff + spec + issue, with design.md's per-layer budgets nested inside each role's total; when a packet is over, the lowest-priority layer is trimmed first, and which one is logged (ruling 4); every section's size is logged; per-file git context; lessons by glob (`.vigil/lessons/` in place of layer 5, per #14); rule-based tool-output trimming (truncate, deduplicate, keep head, tail and failure lines, capped, before any model summary, with tool-result sizes recorded first); compaction at 50% of the context window into `progress.md`, logged in the event log; packets citing invariant IDs (2.7). | `vigild/packets/` |
 | 2.2 | **#14 Stage A metrics and failure detectors.** The metrics are the list in #14. The detectors are pattern-based, with no LLM: `scope_creep`, `success_hallucination`, `tool_misuse`, `cascading_errors`, `context_loss`. Daily tag distribution, with a page above 5%. Every finding is tagged spec, coordination or verification; phase 1's run findings are #1 verification, #2 verification and #3 coordination. | `vigild/kpis.py` |
-| 2.3 | **Evidence footer with "what changed and why".** #14's Stage A footer, written by vigild and opening with a three-sentence summary drawn from the spec and the diff. The per-attempt event sequence goes in the footer's event-log range; until it exists, the range shows `pending`. | `vigild/github/publish.py` |
+| 2.3 | **Evidence footer with "what changed and why".** #14's Stage A footer, written by vigild. It opens with a **template, not a model** (ruling 5): spec intent, files changed with line counts, and the test delta. The per-attempt event sequence goes in the footer's event-log range; until it exists, the range shows `pending`. | `vigild/github/publish.py` |
 | 2.4 | **Merge-risk grade.** #14 Stage A. Advisory; it only ever raises review. | `vigild/review/risk.py` |
 | 2.5 | **Canary tokens.** Fake AWS, `.env` and GitHub credentials in every session container. Reading or exfiltrating one pages the owner and stops the session. The egress proxy and the gateway's body scan both match on them. Test it. | `vigild/executors/canary.py` |
 | 2.6 | **The original 2b scope**, unchanged: the CLI (`run`, `batch`, `ls --live`, `trace`, `kill`); `vigil mcp` (B8) with `vigil_approve` as the only state-changing tool; the session proxy (read, join, the `code` event); the bridge (`vigil_talk`, `vigil_listen`, `vigil-bridge`); doc layers 4, 5 and 7, with the search subagent and the staleness score; ADR-0002; verify level 1 (Hypothesis, Schemathesis). | `cli/vigil/`, `vigild/mcp/`, `vigild/proxy/`, `vigild/bridge/` (one per sub-item) |
@@ -254,8 +254,8 @@ unmetered, before #16.
 | # | Item | Trigger | Owning module |
 |---|---|---|---|
 | 3.1 | **Fault drill**: provider 429 and 500, the tower offline, vigild killed mid-job, disk full; each with its expected outcome. | before the first overnight run | `tests/drills/` |
-| 3.2 | **Benchmarks, scorers, harness ablations** (model fixed, one harness feature toggled, run locally) and the **Batch API** (seeded-defect runs, benchmark validation, scorers, nightly audits). | #14 Stage B | `vigild/bench/` |
-| 3.3 | **Owner audit plus explain-back, one inbox item.** A random 10% of passed PRs asks the owner to audit the PR and explain the change, stored as labelled data. **Review-independence data:** every review records its worker/reviewer model pair, with a different family preferred. | 30 merged jobs | `vigild/review/audit.py` |
+| 3.2 | **Benchmarks, scorers, harness ablations** (model fixed, one harness feature toggled, run locally) and the **Batch API** (seeded-defect runs, benchmark validation, scorers, nightly audits). The Batch API goes **through the gateway** (ruling 3): a batch path with a worst-case reservation at submit and settlement on result. | #14 Stage B | `vigild/bench/` |
+| 3.3 | **Owner audit plus explain-back, one inbox item.** A random 10% of passed PRs asks the owner to audit the PR and explain the change. The results are **labelled data only**, for scorer calibration and reviewer-prompt evals, and are **never ladder evidence**; the ladder stays on the seeded-defect SPRT (ruling 6). **Review-independence data:** every review records its worker/reviewer model pair, with a different family preferred. It is recorded, not enforced, until phase 5 (ruling 2). | 30 merged jobs | `vigild/review/audit.py` |
 | 3.4 | **Improvement proposals and evolution invariants.** Before writing Stage C's rules, read Bernstein's `invariants.py` and `circuit.py` (Apache-2.0) for ideas only; adapted text goes in `docs/sources.md` with the licence. | #14 Stage C | `vigild/proposals/` |
 | 3.5 | **Research sub-sessions.** A summary of at most 2k tokens for the coord, routed to the local model. | phase 5 | `vigild/research.py` |
 
@@ -264,15 +264,15 @@ unmetered, before #16.
 - **FTS5.**
 - **Structured docs beyond invariant IDs:** the machine-readable feature-map rows.
 
-### Overlaps and conflicts with design.md, flagged for the owner
-1. **Coord model (1.3).** design.md and `configs/routing.yaml` say `coord: claude-opus  # the coord is the one place to spend quality`. Tier 1.3 changes that rule, so design.md's routing section needs the change-type rule.
-2. **Review independence (3.3).** The rule is "Sonnet reviewer, Opus auditor", both Claude. A different model family is satisfiable only once phase 5 lands, so until then this item is recorded, not enforced.
-3. **Batch API (3.2).** CLAUDE.md says every hosted model call goes through vigild's gateway, and the gateway has no batch path. Batch calls need gateway metering and budget reservations before they're allowed.
-4. **Packet budgets (2.1).** design.md's packet assembler budgets per layer, but 2.1 sets per-role totals. Packets v2 must reconcile them: per-layer budgets inside each role's total.
-5. **The "what changed and why" summary (2.3).** #14's footer is built with no model calls. The summary needs a model, or a rule-based template. If it's a model, name the model and its cost line, and pass the text through `redact`.
-6. **Owner audit sample (3.3).** #12 ruling 12 says the ladder's statistics come from the random audit sample only. The owner audit is a third, also random, sample. Decide whether it feeds the ladder or stays labelled data only.
-7. **Kill switch (1.1).** #14 puts host policy in vigild's own config. The kill switch is state, not policy, so it lives outside `configs/` as ruled. Note it in #14's host-policy list.
-8. **2a's §7.** Items 1.5–1.8 used to sit there. They now live in this backlog; §7 keeps only the mechanics of 2a's rebase.
+### Owner rulings on the overlaps with design.md (2026-10-23)
+1. **Coord model:** Opus for rung-0 shapes, cross-module design and escalations; Sonnet for docs, tests and refactors. design.md and `routing.yaml` are updated in 1.3's PR.
+2. **Review independence:** recorded, not enforced, until phase 5.
+3. **Batch API:** goes through the gateway, with a worst-case reservation at submit and settlement on result. It's in Tier 3, at Stage B.
+4. **Packet budgets:** per-layer budgets nested inside each role's total. When a packet is over, the lowest-priority layer is trimmed first, and which one is logged.
+5. **"What changed and why":** a template made of spec intent, files changed with line counts, and the test delta. No model.
+6. **Owner audit:** labelled data only, for scorer calibration and reviewer-prompt evals. It is never ladder evidence; the ladder stays on the seeded-defect SPRT.
+7. **Kill switch:** host state outside `configs/`, listed in #14's host-policy section as "host state, never repo-editable, never session-reachable".
+8. **2a's §7:** fine as recorded.
 
 ### 2b done-when (carried over unchanged)
 - One task is dispatched from a Claude Code session through `vigil mcp`.
