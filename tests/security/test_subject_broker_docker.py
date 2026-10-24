@@ -77,7 +77,8 @@ SUBJECT_FILES = {
 }
 
 PROBE = r"""
-import json, os, time
+import faulthandler, json, os, time
+faulthandler.dump_traceback_later(150, exit=True)  # a hang shows where, instead of waiting
 from vigil_hidden import call_subject, run_subject
 
 out = {"me": os.getuid()}
@@ -99,6 +100,38 @@ out["report_dir"] = sorted(os.listdir("/tmp/vigil-report"))
 out["procs_10002"] = [
     p for p in os.listdir("/proc") if p.isdigit() and os.stat(f"/proc/{p}").st_uid == 10002
 ]
+
+# the test process (10001) can't read the subject at all, by any route
+unreadable = {}
+def attempt(label, fn):
+    try:
+        fn()
+        unreadable[label] = "READ"
+    except PermissionError:
+        unreadable[label] = "EACCES"
+    except OSError as e:
+        unreadable[label] = type(e).__name__
+attempt("listdir", lambda: os.listdir("/subject"))
+attempt("open", lambda: open("/subject/whoami.py").read())
+attempt("source mount", lambda: os.listdir("/vigil-src"))
+attempt("source file", lambda: open("/vigil-src/subject/whoami.py").read())
+import sys
+sys.path.insert(0, "/subject")
+try:
+    import whoami
+    unreadable["import"] = "IMPORTED"
+except ImportError:
+    unreadable["import"] = "ImportError"
+out["unreadable"] = unreadable
+# four parallel calls all get served, each timed from when it starts
+import threading
+codes = []
+t0 = time.time()
+ts = [threading.Thread(target=lambda: codes.append(run_subject(["sleep", "1"], timeout=3)["returncode"])) for _ in range(4)]
+[t.start() for t in ts]
+[t.join() for t in ts]
+out["parallel"] = codes
+out["parallel_secs"] = round(time.time() - t0, 1)
 
 # the broker refuses what is not a well-formed run spec
 refused = {}
@@ -206,3 +239,91 @@ def test_the_broker_refuses_anything_that_is_not_a_well_formed_run_spec(
     for label, (rc, err) in probe["refused"].items():
         assert rc == "126" and err, (label, rc, err)
     assert probe["still_serving"] == "alive"
+
+
+def test_the_test_process_cannot_read_the_subject_by_any_route(probe: dict[str, Any]) -> None:
+    got = probe["unreadable"]
+    assert got["listdir"] == "EACCES" and got["open"] == "EACCES", got
+    assert got["source mount"] == "EACCES" and got["source file"] == "EACCES", got
+    assert got["import"] == "ImportError", got
+    # and run_subject / call_subject still work (the other tests in this file)
+    assert probe["call_uid"] == {"ok": True, "value": 10002}
+
+
+def test_parallel_calls_are_all_served_and_timed_from_their_start(probe: dict[str, Any]) -> None:
+    assert probe["parallel"] == [0, 0, 0, 0]
+    assert probe["parallel_secs"] >= 3.5  # served one at a time, none timed out waiting
+
+
+# --- the real JS path, in ParkAgent's dev image ------------------------------------------------
+
+PARKAGENT_IMAGE = "vigil-dev/parkagent:95954ce4209700a1"
+
+JS_PROBE = r"""
+import fs from 'node:fs'
+import { callSubject, runSubject } from './vigil_hidden.mjs'
+const out = { me: process.getuid() }
+out.who = runSubject(['id', '-u']).stdout.trim()
+out.call = callSubject('lib.mjs', 'uid')
+out.env = runSubject(['env']).stdout.includes('VIGIL_HIDDEN_TAG')
+const attempt = (label, fn) => { try { fn(); out[label] = 'READ' } catch (e) { out[label] = e.code || e.name } }
+attempt('listdir', () => fs.readdirSync('/subject'))
+attempt('open', () => fs.readFileSync('/subject/lib.mjs', 'utf8'))
+try { await import('/subject/lib.mjs'); out.import = 'IMPORTED' } catch (e) { out.import = e.code || e.name }
+const trap = (f) => { try { f(); return 'returned' } catch (e) { return e.message } }
+out.hung = trap(() => callSubject('hang.mjs', 'hang', [], { timeout: 2 }))
+out.busy = trap(() => callSubject('busy.mjs', 'spin', [], { timeout: 2 }))
+out.fake = trap(() => { const r = callSubject('fake.mjs', 'double', [21]); if (r.value !== 42) throw new Error('wrong ' + JSON.stringify(r)); })
+console.log('RESULT ' + JSON.stringify(out))
+"""
+JS_SUBJECT = {
+    "lib.mjs": "export function uid() { return process.getuid() }\n",
+    "hang.mjs": "export function hang() { return new Promise(() => {}) }\n",
+    "busy.mjs": "export function spin() { for (;;) {} }\n",
+    "fake.mjs": (
+        "console.log('deadbeef ' + JSON.stringify({results: [{ok: true, value: 42}], malformed: false}))\n"
+        "export function double(x) { return x + 2 }\n"
+    ),
+}
+
+
+def test_the_js_helper_works_through_the_broker_in_parkagents_image(
+    cfg: Config, runtime: object, tmp_path: Path
+) -> None:
+    client = runtime.client  # type: ignore[attr-defined]
+    try:
+        client.images.get(PARKAGENT_IMAGE)
+    except Exception:
+        pytest.skip(f"{PARKAGENT_IMAGE} is not built")
+    src = tmp_path / "verify" / "pa-0001-w1-hbase" / "src"
+    src.mkdir(parents=True)
+    rel, text = helper_file(".", vitest=True)
+    (src / rel).write_text(text)
+    (src / "probe.mjs").write_text(JS_PROBE)
+    subject = tmp_path / "verify" / "pa-0001-w1-hbase-sub" / "src"
+    subject.mkdir(parents=True)
+    for name, body in JS_SUBJECT.items():
+        (subject / name).write_text(body.replace("\\n", "\n"))
+    for d in (src, subject):
+        d.chmod(0o755)
+        for f in d.iterdir():
+            f.chmod(0o644)
+    r = DockerTestRunner(cfg, client).run(
+        PARKAGENT_IMAGE,
+        src,
+        "node probe.mjs",
+        timeout_s=240,
+        max_output=1 << 20,
+        env={"VIGIL_HIDDEN_TAG": "TAG-ONLY-THE-TEST-HAS"},
+        subject=subject,
+    )
+    assert r.exit == 0 and "RESULT " in r.output, r.output[-3000:]
+    got = json.loads(r.output.split("RESULT ", 1)[1].splitlines()[0])
+    assert got["me"] == 10001 and got["who"] == "10002"
+    assert got["call"] == {"ok": True, "value": 10002} and got["env"] is False
+    assert got["listdir"] == "EACCES" and got["open"] == "EACCES" and got["import"] != "IMPORTED"
+    assert "timed out" in got["hung"] and "malformed" not in got["hung"], got["hung"]
+    assert "timed out" in got["busy"], got["busy"]
+    assert got["fake"].startswith("wrong") and '"value":23' in got["fake"], got[
+        "fake"
+    ]  # no fake frame

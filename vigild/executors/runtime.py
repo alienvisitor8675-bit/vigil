@@ -166,6 +166,11 @@ PREPARE_SUBJECT = (
     "--bounding-set=-all --no-new-privs --'; "
     f"mkdir -m 700 {REPORT_DIR} && chown {{uid}}:{{uid}} {REPORT_DIR} || exit 125; "
     "mkfifo -m 600 /vigil-ipc/queue && chown {uid}:{uid} /vigil-ipc/queue || exit 125; "
+    # the subject: a copy owned by 10002, mode 0500/0400, in a tmpfs; the mount it
+    # came from sits under a root-only directory. The test process (10001) can't read
+    # either, so no import of subject code, by any syntax, can succeed in it.
+    "cp -a /vigil-src/subject/. /subject/ && chown -R {subj}:{subj} /subject "
+    "&& chmod -R u=rX,go= /subject || exit 125; "
     "sh /vigil/broker.sh & "
     "if [ -x /usr/local/bin/vigil-prepare ]; then $A /usr/local/bin/vigil-prepare || exit 125; "
     "else $A cp -a /src/. /work/ || exit 125; fi; "
@@ -177,6 +182,7 @@ PREPARE_SUBJECT = (
     f'head -c {MAX_REPORT} "$f" | base64 -w0; printf "\\n"; done; '
     'printf "%s END %s\\n" "$m" "$rc"; exit $rc'
 )
+SUBJECT_UID = 10002  # the uid every subject runs as (hiddenkit/broker.sh)
 SUBJECT_CAPS = ("SETUID", "SETGID", "SETPCAP", "KILL", "CHOWN", "DAC_OVERRIDE", "FOWNER")
 REPORT_NAME = re.compile(r"^(pytest|vitest-[0-9]{1,3})\.xml$")
 
@@ -230,20 +236,27 @@ def verifier_kwargs(
     return {
         "image": image,
         "entrypoint": ["sh", "-c"],
-        "command": [PREPARE_SUBJECT.format(uid=uid) if subject else PREPARE, command],
+        "command": [
+            PREPARE_SUBJECT.format(uid=uid, subj=SUBJECT_UID) if subject else PREPARE,
+            command,
+        ],
         "user": "0:0" if subject else f"{uid}:{uid}",
         "network_mode": "none",
         "mounts": [
             _mount(str(source), "/src", read_only=True),
             # the code under test, for a hidden run: read-only, and run only as a subprocess
-            *([_mount(str(subject), "/subject", read_only=True)] if subject else []),
+            *([_mount(str(subject), "/vigil-src/subject", read_only=True)] if subject else []),
             *([_mount(str(kit), "/vigil", read_only=True)] if subject and kit else []),
         ],
         "tmpfs": {
             "/tmp": f"{tmp},size=2g,mode=1777",  # noqa: S108
             "/work": f"{tmp},size=4g,mode=0755",
             **(
-                {"/vigil-ipc": f"rw,uid={uid},gid={uid},mode=0700,size=64m"}  # the broker's queue
+                {
+                    "/vigil-ipc": f"rw,uid={uid},gid={uid},mode=0700,size=64m",  # the queue
+                    "/vigil-src": "rw,uid=0,gid=0,mode=0700,size=1m",  # root-only
+                    "/subject": f"rw,exec,uid={SUBJECT_UID},gid={SUBJECT_UID},mode=0700,size=2g",
+                }
                 if subject
                 else {}
             ),

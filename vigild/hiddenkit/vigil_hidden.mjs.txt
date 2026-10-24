@@ -62,7 +62,8 @@ if (broker) {
   openSync(rpath, 'w')
   p = spawnSync('sh', ['/vigil/run.sh', spec.cwd, String(spec.timeout), rpath, '--', process.execPath, ...BOOT], {
     input, env: { PATH: keep.PATH || '', VIGIL_BROKER: broker, VIGIL_SUBJ_ENV: senv },
-    timeout: (spec.timeout + 20) * 1000, killSignal: 'SIGKILL', maxBuffer: 16 << 20,
+    killSignal: 'SIGKILL', maxBuffer: 16 << 20, // the broker times the call
+
   })
 } else {
   const fd = openSync(rpath, 'w')
@@ -73,7 +74,7 @@ if (broker) {
   })
   closeSync(fd)
 }
-const timedOut = !!(p.error && p.error.code === 'ETIMEDOUT') || p.status === 124 || p.status === 137
+const timedOut = !!(p.error && p.error.code === 'ETIMEDOUT') || p.status === 124 || p.status === 137 || p.status === 13
 let malformed = false
 const results = []
 let out3 = ''
@@ -136,7 +137,6 @@ export function runSubject(cmd, { cwd = '.', env = {}, input, timeout = 60 } = {
         PATH: process.env.PATH || '', VIGIL_BROKER: BROKER,
         VIGIL_SUBJ_ENV: Object.entries(senv).map(([k, v]) => k + '=' + v).join('\n'),
       },
-      timeout: (timeout + 20) * 1000,
     }
   } else {
     senv.HOME = mkdtempSync(path.join(tmpdir(), 'vigil-subject-'))
@@ -166,7 +166,7 @@ export function callSubjectBatch(calls, { cwd = '.', timeout = 60 } = {}) {
   if (BROKER) denv.VIGIL_BROKER = BROKER
   const p = spawnSync(process.execPath, ['--input-type=module', '-e', driver], {
     input: nonce + '\n' + JSON.stringify(spec), env: denv, encoding: 'utf8',
-    timeout: (timeout + 60) * 1000, killSignal: 'SIGKILL', maxBuffer: 16 << 20,
+    timeout: BROKER ? undefined : (timeout + 60) * 1000, killSignal: 'SIGKILL', maxBuffer: 16 << 20,
   })
   check(!(p.error), 'the driver failed: ' + (p.error ? p.error.message : ''))
   const frames = (p.stdout || '').split('\n').filter((l) => l.startsWith(nonce + ' '))

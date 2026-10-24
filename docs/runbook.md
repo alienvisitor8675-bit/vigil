@@ -266,7 +266,7 @@ the class is flagged and handled differently:
   (`conftest.py`, `pytest.ini`, `vitest.config.*`, ...) no author runs: the spec
   item says "owner review only" and the task escalates. A hidden-test file that
   imports in-scope code is rejected and regenerated once. In the verifier the code
-  under test runs as a different uid (10002) through a small root-owned broker, in
+  under test lives in a copy only uid 10002 can read, and runs as that uid through a small root-owned broker, in
   its own process group that is killed when the call ends, so it can't touch the
   JUnit report or the test process. The dev image needs `setpriv` (util-linux);
   without it a hidden run is `unknown` and the task escalates.

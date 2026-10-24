@@ -11,9 +11,10 @@ by a separate vigild-owned driver process), both against a read-only checkout.
 refuses any import (Python `import`/`from`, JS `import`/`require`/`import()`)
 that resolves into the task's scope, and any construct that loads code by a name
 it can't see (`importlib`, `__import__`, `exec`, `eval`, `sys.path`, a computed
-`require`/`import()` argument). It is a check on what the author wrote, not a
-sandbox: the real boundary is that the subject only ever runs in another
-process."""
+`require`/`import()` argument, vitest's `vi.importActual`/`vi.mock`, an absolute
+specifier). The primary defence is structural, though: the test process cannot
+read the subject checkout at all (it is owned by another uid, mode 0700), so this
+is a check on what the author wrote, not the boundary."""
 
 from __future__ import annotations
 
@@ -126,10 +127,19 @@ def _js_problems(path: str, text: str, scope: Sequence[str]) -> list[str]:
             out.append(f"{path}: {m.group(1)}() with a computed argument loads code by value")
         else:
             specs.append(lit.group(2))
-    if re.search(r"\bcreateRequire\b|\bprocess\.binding\b|\bnew\s+Function\b|\beval\s*\(", text):
-        out.append(f"{path}: loads code by value (createRequire, Function or eval)")
+    if re.search(
+        r"\bcreateRequire\b|\bmodule\s*\.\s*require\b|\bprocess\.binding\b"
+        r"|\bnew\s+Function\b|\beval\s*\(|\bimport\.meta\.glob\b",
+        text,
+    ):
+        out.append(f"{path}: loads code by value (createRequire, module.require, Function, eval)")
+    if re.search(r"\bvi\s*\.\s*(importActual|importMock|mock|doMock|unmock|doUnmock)\b", text):
+        out.append(f"{path}: uses vitest's module loaders or mocks, which load code by name")
     for spec in specs:
         if posixpath.basename(spec).startswith("vigil_hidden"):
+            continue
+        if spec.startswith(("/", "file:", "data:", "http:", "https:")):
+            out.append(f"{path}: imports an absolute specifier ({spec})")
             continue
         for cand in _js_resolve(spec, base_dir):
             if in_scope(cand, scope):

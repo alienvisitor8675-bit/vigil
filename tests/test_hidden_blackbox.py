@@ -306,3 +306,41 @@ def test_the_helpers_are_the_files_vigild_ships() -> None:
     assert py_path.endswith(f"{HELPER_NAME}.py") and js_path.endswith(f"{HELPER_NAME}.mjs")
     assert "call_subject" in py and "callSubject" in js
     assert json.dumps(py) and "VIGIL_HIDDEN_TAG" in py + js
+
+
+def test_vitest_loaders_absolute_specifiers_and_require_helpers_are_rejected() -> None:
+    """The reviewer's repros: each of these loads head code into the test process."""
+    for body in (
+        "const m = await vi.importActual('../feature.ts')\n",
+        "vi.mock('../../src/feature')\n",
+        "await vi.importMock('../feature.ts')\n",
+        "vi.doMock('../x')\n",
+        "vi.unmock('../x')\n",
+        "import '/subject/src/feature.ts'\n",
+        "import { f } from '/subject/src/feature.ts'\n",
+        "await import('/subject/src/feature.ts')\n",
+        "const m = require('/subject/src/feature.ts')\n",
+        "await import('file:///subject/src/x.ts')\n",
+        "const r = createRequire(import.meta.url)\n",
+        "module.require('../x')\n",
+    ):
+        assert problems({"server/test/h/a.test.ts": body}, JS_SCOPE), body
+
+
+@needs_node
+def test_javascript_a_hung_call_is_reported_as_timed_out_not_malformed(tmp_path: Path) -> None:
+    for name, lib in (
+        ("never settles", "export function hang() { return new Promise(() => {}) }\n"),
+        ("busy loop", "export function hang() { for (;;) {} }\n"),
+    ):
+        script = (
+            "import { callSubject } from './vigil_hidden.mjs'\n"
+            "callSubject('lib.mjs', 'hang', [], { timeout: 2 })\nconsole.log('PASSED')\n"
+        )
+        got = _node(
+            tmp_path / name.replace(" ", "-"),
+            _subject(tmp_path / name.replace(" ", "-"), {"lib.mjs": lib}),
+            script,
+        )
+        assert got["code"] != 0 and "timed out" in got["err"], (name, got)
+        assert "malformed" not in got["err"], (name, got)

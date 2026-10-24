@@ -33,9 +33,12 @@ as_subject() {
 		--bounding-set=-all --no-new-privs -- "$@"
 }
 
+# Open the queue read-write once and keep it open: concurrent clients write their
+# one-line names into the pipe's buffer, and none is lost when a reader closes.
+exec 4<> "$IPC/queue"
 while :; do
 	id=
-	read -r id < "$IPC/queue"
+	read -r id <&4
 	[ -n "$id" ] || continue
 	case $id in
 		req-????????????????????????????????) ;;
@@ -80,11 +83,12 @@ while :; do
 	: > "$d/out"
 	: > "$d/err"
 	: > "$d/fd3"
+	: > "$d/started"
 	(
 		cd "$real" || exit 126
 		exec setsid timeout -s KILL "$t" setpriv --reuid=$SUBJ --regid=$SUBJ --clear-groups \
 			--inh-caps=-all --bounding-set=-all --no-new-privs -- "$@"
-	) < "$d/stdin" > "$d/out" 2> "$d/err" 3> "$d/fd3" &
+	) < "$d/stdin" > "$d/out" 2> "$d/err" 3> "$d/fd3" 4<&- &
 	pid=$!
 	wait $pid
 	rc=$?

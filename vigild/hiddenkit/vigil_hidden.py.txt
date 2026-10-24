@@ -65,7 +65,7 @@ else:
                          cwd=spec["cwd"], env=keep, start_new_session=True)
 timed_out = False
 try:
-    p.communicate(payload, timeout=spec["timeout"] + 20)
+    p.communicate(payload, timeout=None if broker else spec["timeout"])
 except subprocess.TimeoutExpired:
     timed_out = True
 finally:
@@ -141,7 +141,7 @@ def _run(argv, cwd, env, stdin, timeout):
         stderr=subprocess.PIPE, text=True, start_new_session=True,
     )
     try:
-        out, err = p.communicate(stdin, timeout=timeout + (20 if _BROKER else 0))
+        out, err = p.communicate(stdin, timeout=None if _BROKER else timeout)
     except subprocess.TimeoutExpired:
         p.kill()
         p.communicate()

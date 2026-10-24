@@ -29,13 +29,26 @@ done
 printf '%s\n' "${VIGIL_SUBJ_ENV:-}" > "$d/env"
 cat > "$d/stdin"
 printf '%s\n' "$id" > "$IPC/queue"
+# The broker serves one request at a time, so a call may wait its turn: the
+# queue wait is generous and separate, and the call's own timeout is counted from
+# the moment the broker starts it (it writes `started`), never from when we queued.
+waited=0
+queue_limit=$((${VIGIL_QUEUE_SECONDS:-1800} * 20))
+while [ ! -f "$d/started" ] && [ ! -f "$d/rc" ]; do
+	sleep 0.05
+	waited=$((waited + 1))
+	if [ "$waited" -gt "$queue_limit" ]; then
+		echo "the broker did not start the call" >&2
+		exit 124
+	fi
+done
 waited=0
 limit=$((to * 20 + 1200))
 while [ ! -f "$d/rc" ]; do
 	sleep 0.05
 	waited=$((waited + 1))
 	if [ "$waited" -gt "$limit" ]; then
-		echo "the broker did not answer" >&2
+		echo "the broker did not finish the call" >&2
 		exit 124
 	fi
 done
