@@ -13,7 +13,7 @@ import pytest
 
 from tests.conftest import git
 from tests.harness import finish_session
-from vigild.github.publish import PublishError, publish
+from vigild.github.publish import PublishError, artifact_paths, publish
 from vigild.workspace import Workspace
 
 REPO, TID, BRANCH = "o/fixture", "fx-0001-w1", "vigil/fx-0001-w1-doc"
@@ -113,13 +113,57 @@ def test_publish_refuses_files_outside_the_scope(
     assert pulls.prs == []
 
 
-def test_vigil_artifacts_are_always_in_scope(tmp_path: Path, fixture_repo: dict[str, Path]) -> None:
+def _artifact_pub(
+    tmp_path: Path, fixture_repo: dict[str, Path], files: list[str]
+) -> tuple[Workspace, str, str]:
     ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
     clone = ws.clone(REPO, TID, branch=BRANCH, base="main")
     base = ws.base_sha(TID)
-    (clone / ".vigil" / "fx-0001" / TID).mkdir(parents=True)
-    (clone / ".vigil" / "fx-0001" / TID / "worker_report.json").write_text("{}")
+    for f in files:
+        (clone / f).parent.mkdir(parents=True, exist_ok=True)
+        (clone / f).write_text("{}")
     (clone / "docs" / "feature-map.md").write_text("ok\n")
     r = finish_session(clone, tmp_path / "out", branch=BRANCH, base_sha=base)
     head = ws.import_result(REPO, TID, tmp_path / "out", BRANCH, base, head=r["head"])
-    assert _pub(ws, base, head, FakePulls(fixture_repo["bare"])).endswith("/pull/1")
+    return ws, base, head
+
+
+def _scoped(ws: Workspace, base: str, head: str, pulls: FakePulls) -> str:
+    return publish(
+        ws, repo=REPO, head=head, base_sha=base, branch=BRANCH, base="main", title="t", body="b",
+        pulls=pulls,
+        scope=["docs/feature-map.md", *artifact_paths("fx-0001", TID)],
+    )  # fmt: skip
+
+
+def test_a_worker_may_write_only_its_own_task_folder_and_task_json(
+    tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    ws, base, head = _artifact_pub(
+        tmp_path,
+        fixture_repo,
+        [".vigil/fx-0001/fx-0001-w1/worker_report.json", ".vigil/task.json"],
+    )
+    assert _scoped(ws, base, head, FakePulls(fixture_repo["bare"])).endswith("/pull/1")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".vigil/fx-0001/spec.md",  # its own job's other paths
+        ".vigil/fx-0001/fx-0001-w2/worker_report.json",  # another task's folder
+        ".vigil/fx-0002/fx-0002-w1/worker_report.json",  # another job
+        ".vigil/fx-0001/hidden/fx-0001-w1/test_x.py",  # where hidden tests live
+        ".vigil/fx-0001/hidden/pytest.ini",
+        ".vigil/playbook/rules.md",  # the playbook paths
+        ".vigil/other.json",
+    ],
+)
+def test_any_other_vigil_path_is_out_of_scope(
+    tmp_path: Path, fixture_repo: dict[str, Path], path: str
+) -> None:
+    ws, base, head = _artifact_pub(tmp_path, fixture_repo, [path])
+    pulls = FakePulls(fixture_repo["bare"])
+    with pytest.raises(PublishError, match="outside the contract's scope"):
+        _scoped(ws, base, head, pulls)
+    assert pulls.prs == []

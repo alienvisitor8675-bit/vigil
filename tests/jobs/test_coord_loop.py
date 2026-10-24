@@ -38,6 +38,7 @@ from vigild.telemetry.spans import Telemetry
 from vigild.verifier import Verifier
 from vigild.workspace import Workspace
 
+KEY = b"k" * 32
 REPO = "o/fixture"
 
 SPEC = """# Spec: document the rate limit
@@ -140,7 +141,8 @@ def _work(clone: Path, doc: str, *, honest: bool = True) -> None:
 
 
 HIDDEN_BODY = (
-    "import os\n\n\ndef test_flag_env_is_set():\n    assert os.environ.get('FLAG_ON') == '1'\n"
+    "import os\nfrom vigil_hidden import check\n\n\n"
+    "def test_flag_env_is_set():\n    check(os.environ.get('FLAG_ON') == '1')\n"
 )
 HIDDEN_NAME = "flag env is set by the runner"
 Author = Callable[[SessionSpec, dict[str, Any]], "ExecOutcome | None"]
@@ -358,7 +360,7 @@ def world(
         publisher,
         Telemetry(),
         images,
-        Verifier(ws, tests),
+        Verifier(ws, tests, host_key=KEY),
         background=False,
         session_images=SessionImages(images, lambda: tmp_path),
     )

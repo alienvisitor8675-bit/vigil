@@ -12,21 +12,36 @@ the verifier (`Verifier._hidden_pair`).
 from __future__ import annotations
 
 import json
+import posixpath
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from vigild.intake.paths import scope_entry_error
 from vigild.packets.assemble import hidden_dir
-from vigild.verifier import HiddenSuite
+from vigild.verifier import (
+    HELPER_NAME,
+    HiddenSuite,
+    ReadFile,
+    collected,
+    glob_match,
+    plan_reports,
+    runner_like,
+    uncollected,
+)
 from vigild.workspace import Workspace
 
 ARTIFACT = "hidden_tests.json"
 MAX_FILES = 40
 MAX_TESTS = 200
 CATEGORY = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
-CONFIG_NAMES = ("conftest.py", "pytest.ini", "package.json", "tox.ini", "setup.cfg")
+VITEST_CONFIGS = tuple(
+    f"{base}.config.{ext}"
+    for base in ("vitest", "vite")
+    for ext in ("ts", "mts", "cts", "js", "mjs", "cjs")
+)
 AUTHOR_ATTEMPTS = 2  # one try and one regeneration
 
 
@@ -46,6 +61,74 @@ class Manifest(BaseModel):
     tests: list[HiddenTest] = Field(min_length=1, max_length=MAX_TESTS)
 
 
+@dataclass(frozen=True)
+class Place:
+    """Where a task's hidden tests live in the checkout, and the include that
+    has to collect them (None: not a vitest project, so no include to check)."""
+
+    folder: str
+    project: str = ""
+    include: tuple[str, ...] | None = None
+
+
+def _strings(body: str) -> list[str]:
+    return re.findall(r"""['"`]([^'"`]+)['"`]""", body)
+
+
+def _list_of(config: str, key: str) -> list[str] | None:
+    m = re.search(rf"\b{key}\s*:\s*\[(.*?)\]", config, re.S)
+    return _strings(m.group(1)) if m else None
+
+
+def place_for(job_id: str, task_id: str, test_cmd: str, read: ReadFile) -> Place:
+    """Where the author writes, and vigild injects, a task's hidden tests.
+
+    A vitest task (the approved spec's `test_cmd` runs vitest, directly or
+    through a pnpm script) puts them under a directory the project's own
+    `include` already collects, read from the vitest config at the base (a
+    vault blob read): `<project>/<include's static prefix>/vigil-hidden/<job>/<task>`.
+    If the config can't be read, or no include would collect a test file
+    there, the task gets no hidden tests (hotfix 5). Everything else keeps
+    `.vigil/<job>/hidden/<task>`."""
+    plain = Place(hidden_dir(job_id, task_id))
+    dirs = plan_reports(test_cmd, read).vitest_dirs
+    if not dirs:
+        return plain
+    if len(dirs) > 1:
+        raise HiddenError(f"the spec's test_cmd runs vitest in {len(dirs)} projects: {list(dirs)}")
+    project = dirs[0]
+    config = ""
+    for name in VITEST_CONFIGS:
+        got = read(f"{project}/{name}" if project else name)
+        if got is not None:
+            config = got
+            break
+    else:
+        raise HiddenError(f"no vitest config found in {project or '.'} at the base")
+    if re.search(r"\b(projects|workspace)\s*:", config):
+        raise HiddenError("the vitest config uses projects/workspace; its include can't be read")
+    include = _list_of(config, "include")
+    excluded = _list_of(config, "exclude") or []
+    for g in include or [""]:
+        static = []
+        for seg in g.removeprefix("./").split("/")[:-1]:
+            if set("*?{[(") & set(seg):
+                break
+            static.append(seg)
+        folder = "/".join(
+            [*([project] if project else []), *static, "vigil-hidden", job_id, task_id]
+        )
+        rel = folder[len(project) + 1 :] if project else folder
+        for name in ("x.test.ts", "x.spec.ts", "x.test.js", "x.spec.js", "x.test.mjs"):
+            probe = f"{rel}/{name}"
+            if collected(include, probe) and not glob_match(excluded, probe):
+                return Place(folder, project, tuple(include) if include else ())
+    raise HiddenError(
+        f"the vitest include {include or '(default)'} in {project or '.'} would not collect "
+        "a hidden test file under any directory vigild can inject it into"
+    )
+
+
 def load_suite(
     ws: Workspace,
     repo: str,
@@ -54,23 +137,26 @@ def load_suite(
     job_id: str,
     task_id: str,
     test_cmd_problem: Any,
+    place: Place | None = None,
 ) -> tuple[HiddenSuite, Manifest]:
     """The author's output at `sha` (a vault commit), checked. `test_cmd_problem`
-    is the spec gate's resolver, given the base's file reader."""
-    folder = hidden_dir(job_id, task_id)
-    area = f".vigil/{job_id}/hidden/"
-    raw = ws.read_blob(repo, sha, f"{folder}.json", 64 << 10)
+    is the spec gate's resolver, given the base's file reader; `place` is where
+    the tests were to be written (`place_for`)."""
+    place = place or Place(hidden_dir(job_id, task_id))
+    folder = place.folder
+    manifest_path = f"{hidden_dir(job_id, task_id)}.json"
+    raw = ws.read_blob(repo, sha, manifest_path, 64 << 10)
     if raw is None:
-        raise HiddenError(f"no usable {folder}.json was written")
+        raise HiddenError(f"no usable {manifest_path} was written")
     try:
         manifest = Manifest.model_validate(json.loads(raw))
     except (json.JSONDecodeError, ValidationError) as e:
-        raise HiddenError(f"{folder}.json is not valid: {str(e)[:300]}") from e
+        raise HiddenError(f"{manifest_path} is not valid: {str(e)[:300]}") from e
     for t in manifest.tests:
         if not CATEGORY.match(t.category):
             raise HiddenError(f"category {t.category!r} must be one lowercase word")
     changed = ws.changed(repo, base_sha, sha)
-    outside = sorted(p for _, p in changed if not p.startswith(area))
+    outside = sorted(p for _, p in changed if p != manifest_path and not p.startswith(f"{folder}/"))
     if outside:
         raise HiddenError(f"the author changed files outside the hidden directory: {outside[:5]}")
     files = sorted(p for s, p in changed if p.startswith(f"{folder}/") and s[:1] in ("A", "M"))
@@ -79,23 +165,33 @@ def load_suite(
     if len(files) > MAX_FILES:
         raise HiddenError(f"{len(files)} files; at most {MAX_FILES}")
     for f in files:
-        if scope_entry_error(f) or f.rsplit("/", 1)[-1] in CONFIG_NAMES:
+        if scope_entry_error(f) or runner_like(f) or posixpath.basename(f).startswith(HELPER_NAME):
             raise HiddenError(f"{f} is not an allowed hidden test file")
         if ws.read_blob(repo, sha, f) is None:
             raise HiddenError(f"{f} is not a regular file of a usable size")
     why = test_cmd_problem(manifest.test_cmd, lambda p: ws.read_blob(repo, base_sha, p))
     if why:
         raise HiddenError(why)
-    return HiddenSuite(sha, folder, tuple(files), manifest.test_cmd), manifest
+    suite = HiddenSuite(
+        sha, folder, tuple(files), manifest.test_cmd, len(manifest.tests),
+        project=place.project, include=place.include,
+    )  # fmt: skip
+    if missed := uncollected(suite):
+        # refused before any run: the project's include would not collect these
+        raise HiddenError(f"the project's vitest include would not collect: {missed[:5]}")
+    return suite, manifest
 
 
 def entry_suite(entry: dict[str, Any] | None) -> HiddenSuite | None:
     """The stored suite of one task, or None when none was produced."""
     if not entry or entry.get("status") != "ok":
         return None
+    inc = entry.get("include")
     return HiddenSuite(
-        str(entry["sha"]), str(entry["prefix"]), tuple(entry["files"]), str(entry["test_cmd"])
-    )
+        str(entry["sha"]), str(entry["prefix"]), tuple(entry["files"]), str(entry["test_cmd"]),
+        len(entry.get("tests") or []), str(entry.get("project") or ""),
+        None if inc is None else tuple(inc),
+    )  # fmt: skip
 
 
 def public_view(entry: dict[str, Any]) -> dict[str, Any]:

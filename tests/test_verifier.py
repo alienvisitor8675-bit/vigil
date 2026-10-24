@@ -19,6 +19,7 @@ from tests.harness import LocalTestRunner, finish_session
 from vigild.verifier import Verifier, judge, outcome, with_reports
 from vigild.workspace import Workspace
 
+KEY = b"k" * 32
 REPO = "o/fixture"
 TID = "fx-0001-w1"
 BRANCH = f"vigil/{TID}"
@@ -66,7 +67,7 @@ def _verify(
     config: list[str] | None = None,
     runner: LocalTestRunner | None = None,
 ) -> dict[str, Any]:
-    return Verifier(ws, runner or LocalTestRunner()).verify(
+    return Verifier(ws, runner or LocalTestRunner(), host_key=KEY).verify(
         repo=REPO,
         image="img",
         task_id=TID,
@@ -563,6 +564,10 @@ def test_a_case_belongs_to_its_file_class_based_or_not(classname: str) -> None: 
 # --- phase 1 run, finding #2: a task whose scope names a runner file -------------------------
 
 FLAG_TEST = "import os\n\n\ndef test_flag_env():\n    assert os.environ.get('FLAG_ON') == '1'\n"
+HIDDEN_FLAG = (
+    "import os\nfrom vigil_hidden import check\n\n\n"
+    "def test_flag_env():\n    check(os.environ.get('FLAG_ON') == '1')\n"
+)
 FLAG_CONFTEST = (
     "import os, sys\nsys.path.insert(0, os.path.dirname(__file__))\nos.environ['FLAG_ON'] = '1'\n"
 )
@@ -577,7 +582,7 @@ def _runner_edit(c: Path) -> None:
     (c / "package.json").write_text('{"scripts": {"test": "true"}}\n')
 
 
-def _hidden_suite(ws: Workspace, tmp_path: Path, body: str = FLAG_TEST) -> Any:
+def _hidden_suite(ws: Workspace, tmp_path: Path, body: str = HIDDEN_FLAG, expected: int = 1) -> Any:
     """What the hidden-test session leaves in the vault: a commit on a branch
     that is never pushed."""
     from vigild.verifier import HiddenSuite
@@ -597,13 +602,19 @@ def _hidden_suite(ws: Workspace, tmp_path: Path, body: str = FLAG_TEST) -> Any:
         prefix=HIDDEN_DIR,
         files=(f"{HIDDEN_DIR}/test_hidden.py",),
         test_cmd=f"pytest -q {HIDDEN_DIR}/test_hidden.py",
+        expected=expected,
     )
 
 
 def _verify_flagged(
-    ws: Workspace, base: str, head: str, hidden: Any = None, runner: LocalTestRunner | None = None
+    ws: Workspace,
+    base: str,
+    head: str,
+    hidden: Any = None,
+    runner: LocalTestRunner | None = None,
+    scope: list[str] | None = None,
 ) -> dict[str, Any]:
-    return Verifier(ws, runner or LocalTestRunner()).verify(
+    return Verifier(ws, runner or LocalTestRunner(), host_key=KEY).verify(
         repo=REPO,
         image="img",
         task_id=TID,
@@ -614,6 +625,7 @@ def _verify_flagged(
         runner_config=["conftest.py", "package.json"],
         runner_overlap=["conftest.py"],
         hidden=hidden,
+        scope=scope,
     )
 
 
@@ -682,7 +694,9 @@ def test_hidden_tests_that_head_fails_decide_against_a_passing_visible_test(
     ws: Workspace, tmp_path: Path
 ) -> None:
     base, head = _session(ws, tmp_path, _runner_edit)
-    suite = _hidden_suite(ws, tmp_path, "def test_hidden():\n    assert False\n")
+    suite = _hidden_suite(
+        ws, tmp_path, "from vigil_hidden import check\n\n\ndef test_hidden():\n    check(False)\n"
+    )
     rec = _verify_flagged(ws, base, head, suite)
     assert rec["after"]["outcome"] == "pass"  # the visible test is fine
     assert rec["hidden"]["ok"] is False and rec["hidden"]["passed_on_head"] is False
@@ -712,7 +726,7 @@ def test_a_worker_cannot_plant_files_in_the_hidden_directory(ws: Workspace, tmp_
 def test_hidden_tests_are_checked_on_base_alone_at_spec_time(ws: Workspace, tmp_path: Path) -> None:
     suite = _hidden_suite(ws, tmp_path)
     base = ws.base_sha("fx-0001-ht1")
-    v = Verifier(ws, LocalTestRunner())
+    v = Verifier(ws, LocalTestRunner(), host_key=KEY)
     got = v.check_hidden_on_base(
         repo=REPO, image="img", task_id="fx-0001-w1", base_sha=base, hidden=suite,
         runner_config=["conftest.py"], overlap=["conftest.py"],
@@ -734,7 +748,7 @@ def test_a_hidden_test_that_errors_instead_of_failing_an_assertion_is_the_wrong_
         ws, tmp_path, "import no_such_module_anywhere\n\n\ndef test_h():\n    pass\n"
     )
     base = ws.base_sha("fx-0001-ht1")
-    got = Verifier(ws, LocalTestRunner()).check_hidden_on_base(
+    got = Verifier(ws, LocalTestRunner(), host_key=KEY).check_hidden_on_base(
         repo=REPO, image="img", task_id="fx-0001-w1", base_sha=base, hidden=suite,
         runner_config=["conftest.py"], overlap=["conftest.py"],
     )  # fmt: skip
@@ -744,11 +758,11 @@ def test_a_hidden_test_that_errors_instead_of_failing_an_assertion_is_the_wrong_
 def test_one_erroring_test_among_failing_ones_is_rejected(ws: Workspace, tmp_path: Path) -> None:
     body = (
         "import pytest\n\n\n@pytest.fixture\ndef boom():\n    raise RuntimeError('setup')\n\n\n"
-        "def test_a():\n    assert False\n\n\ndef test_b(boom):\n    assert False\n"
+        "from vigil_hidden import check\n\n\ndef test_a():\n    check(False)\n\n\ndef test_b(boom):\n    check(False)\n"
     )
-    suite = _hidden_suite(ws, tmp_path, body)
+    suite = _hidden_suite(ws, tmp_path, body, expected=2)
     base = ws.base_sha("fx-0001-ht1")
-    got = Verifier(ws, LocalTestRunner()).check_hidden_on_base(
+    got = Verifier(ws, LocalTestRunner(), host_key=KEY).check_hidden_on_base(
         repo=REPO, image="img", task_id="fx-0001-w1", base_sha=base, hidden=suite,
         runner_config=[], overlap=[],
     )  # fmt: skip

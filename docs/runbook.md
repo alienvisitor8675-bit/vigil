@@ -259,6 +259,26 @@ the class is flagged and handled differently:
   on the base, pass on the head). They decide; the visible test is reported but
   is not enough. `tests.json` has `runner_files`, `runner_file_changed` and
   `hidden`.
+- **The host key.** Hidden tests only count with a key only you create, once:
+  `printf 'VIGIL_HOST_KEY=%s\n' "$(openssl rand -hex 32)" >> ~/.config/vigil/env`
+  (mode 600 stays). Without it every flagged task is recorded "hidden tests
+  missing" and escalates; `vigil doctor` shows whether it is set, never the value.
+  Authors assert through vigild's `check` helper; a bare `assert` doesn't count.
+- **Where the hidden tests live.** For a vitest repo (ParkAgent) vigild picks a
+  directory the project's own `include` already collects, read from the vitest
+  config at the base, e.g. `server/test/vigil-hidden/<job>/<task>/`; the author
+  names its test files to match the include and runs them with the repo's own
+  script (`pnpm -C server test <that directory>`). If the config can't be read
+  (projects/workspace, no include that fits) the task shows "hidden tests
+  missing" and can only escalate.
+- **If vigild restarts while the author runs** the inbox shows "vigild restarted
+  while the hidden-test author was writing"; retry runs the author step only.
+  A hidden run that crashes while the author's tests are checked shows the task
+  as "hidden tests missing" too. `<data>/hidden-runs/*.txt` (mode 600) holds the
+  full output of each hidden run, for you to read on the Mac; `tests.json` has
+  counts only.
+- **A retry after an escalation** still re-runs the job's other failed tasks;
+  the escalated one stays held and the job is held again for it.
 - **The PR** is a draft that says "Owner review required: runner file changed:
   <files>". Read the runner-file diff yourself; this class is always your look.
   You merge as always.

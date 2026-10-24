@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -86,7 +87,14 @@ class LocalTestRunner:
     calls: list[dict[str, Any]] = field(default_factory=list)
 
     def run(
-        self, image: str, source: Path, command: str, *, timeout_s: int, max_output: int
+        self,
+        image: str,
+        source: Path,
+        command: str,
+        *,
+        timeout_s: int,
+        max_output: int,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         hooks = subprocess.run(
             ["git", "config", "--get", "core.hooksPath"], cwd=source, capture_output=True, text=True
@@ -107,6 +115,7 @@ class LocalTestRunner:
         env = {
             **os.environ,
             "PYTEST_ADDOPTS": f"--junitxml={reports}/pytest.xml -p no:cacheprovider",
+            **(env or {}),
         }
         try:
             p = subprocess.run(

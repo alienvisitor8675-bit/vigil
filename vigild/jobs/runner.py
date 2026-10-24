@@ -58,9 +58,9 @@ from vigild.db import SessionRoleError, Store, iso
 from vigild.devimage import DevImages, SessionImages, StaleDevImage, missing_tools
 from vigild.executors.base import ExecOutcome, Executor, SessionSpec
 from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
-from vigild.github.publish import PublishError
+from vigild.github.publish import PublishError, artifact_paths, vigild_paths
 from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
-from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, entry_suite, load_suite
+from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, Place, entry_suite, load_suite, place_for
 from vigild.intake.spec_gate import test_cmd_problem
 from vigild.jobs.acceptance import NO_HIDDEN, check_worker, escalates
 from vigild.jobs.artifacts import parse_plan, render
@@ -72,7 +72,7 @@ from vigild.packets.assemble import assemble_coord, assemble_hidden_test_author,
 from vigild.packets.fence import fence
 from vigild.provenance import Provenance
 from vigild.redact import redact
-from vigild.repos import RepoPolicyError, check_backend
+from vigild.repos import RepoPolicyError, check_backend, check_hidden_author
 from vigild.router.rules import RoutingError, route
 from vigild.telemetry.spans import Telemetry
 from vigild.verifier import Verifier, runner_overlap
@@ -110,6 +110,7 @@ class Pager(Protocol):
     def file_for_approval(self, job_id: str) -> list[str]: ...
     def flagged_tasks(self, job_id: str) -> dict[str, list[str]]: ...
     def file_item(self, job_id: str) -> None: ...
+    def open_spec_item(self, job_id: str) -> Any: ...
 
 
 class Refused(Exception):
@@ -259,10 +260,27 @@ class JobRunner:
     def on_approved(self, job_id: str) -> None:
         self._spawn(self.build, job_id)
 
-    def on_resume(self, job_id: str) -> None:
+    def _author_only(self, job_id: str) -> bool:
+        """A spec_pending job that has its spec and needs only the hidden-test
+        step: a human-written spec (a coord never rewrites it), or a coord's
+        whose latest session is an author's (the job was interrupted mid-author)."""
+        spec = self.store.get_artifact(job_id, "spec.md")
+        if spec is None or self.store.get_artifact(job_id, "plan.md") is None:
+            return False
+        if spec.provenance == Provenance.HUMAN.value:
+            return True
+        sessions = self.store.list_sessions(job_id)
+        return bool(sessions) and sessions[-1].role is Role.HIDDEN_TEST_AUTHOR
+
+    def on_resume(self, job_id: str, *, replan: bool = False) -> None:
         state = self.store.get_job(job_id).state
         if state is JobState.SPEC_PENDING:
-            self._spawn(self.run_coord, job_id)
+            # a retry never sends a finished draft back to the coord (hotfix 5);
+            # only a replan asks it for a new one
+            if not replan and self._author_only(job_id):
+                self._spawn(self._finish_spec, job_id)
+            else:
+                self._spawn(self.run_coord, job_id)
         elif state is JobState.APPROVED:
             self._spawn(self.build, job_id)
         elif state is JobState.PLANNING:
@@ -291,12 +309,15 @@ class JobRunner:
         if self.reaper is not None:
             out["containers"] = self.reaper()
         failed_coord: set[str] = set()
+        failed_author: set[str] = set()
         for s in self.store.list_sessions():
             if s.status in LIVE_SESSION:
                 self.store.update_session(s.id, status="failed", ended_at=iso())
                 out["sessions"] += 1
-                if s.role in (Role.COORD, Role.HIDDEN_TEST_AUTHOR) and s.job_id:
+                if s.role is Role.COORD and s.job_id:
                     failed_coord.add(s.job_id)
+                elif s.role is Role.HIDDEN_TEST_AUTHOR and s.job_id:
+                    failed_author.add(s.job_id)
         for rid in self.budget.open_reservation_ids():
             self.budget.settle(rid)
             out["reservations"] += 1
@@ -313,7 +334,22 @@ class JobRunner:
                     resumable=True,
                 )
                 out["held"] += 1
-            elif job.state is JobState.SPEC_PENDING and job.id in failed_coord:
+            elif (
+                job.state is JobState.SPEC_PENDING
+                and job.id in failed_author
+                and job.id not in failed_coord
+                and self._author_only(job.id)
+                and (self.jobs is None or self.jobs.open_spec_item(job.id) is None)
+            ):
+                # interrupted mid-author: retry runs only the author step, never the coord
+                self._page(
+                    job.id,
+                    f"{job.id}: vigild restarted while the hidden-test author was writing",
+                    {"state": job.state.value, "actions": ["retry", "abandon"]},
+                    resumable=True,
+                )
+                out["held"] += 1
+            elif job.state is JobState.SPEC_PENDING and job.id in (failed_coord | failed_author):
                 self._page(
                     job.id,
                     f"{job.id}: vigild restarted while the coord was drafting",
@@ -719,8 +755,8 @@ class JobRunner:
         fails twice leaves the task marked "hidden tests missing"."""
         assert self.jobs is not None
         flagged = self.jobs.flagged_tasks(job_id)
-        if not flagged:
-            return  # file_for_approval already filed an ordinary spec
+        if not flagged or self.jobs.open_spec_item(job_id) is not None:
+            return  # an ordinary spec is already filed, or this one is: one item per job
         self._author_hidden_tests(job_id, flagged)
         self.jobs.file_item(job_id)
 
@@ -765,20 +801,51 @@ class JobRunner:
         """Up to AUTHOR_ATTEMPTS sessions: the second is the one regeneration,
         after a session that failed or tests that failed the wrong way."""
         preset = self.cfg.routing.reviewer  # the reviewer tier (Sonnet)
+        if self.verifier.host_key is None:
+            # no key, no tag, no hidden test that can count: the task can only escalate
+            return {"status": "missing", "reason": "VIGIL_HOST_KEY is not set", "attempts": 0}
         try:
             check_backend(self.cfg, job.repo, preset)
+            check_hidden_author(self.cfg, job.repo, preset)
         except RepoPolicyError as e:
             return {"status": "missing", "reason": f"backend refused: {e}", "attempts": 0}
+        try:
+            self.workspace.head_sha(job.repo, job.base)  # a fresh mirror to read the config from
+            place = place_for(
+                job.id, str(contract["task_id"]), str(contract["spec"].get("test_cmd") or ""),
+                lambda p: self.workspace.mirror_file(job.repo, job.base, p),
+            )  # fmt: skip
+        except HiddenError as e:
+            # refused before any session: no path the repo's runner would collect
+            return {"status": "missing", "reason": str(e)[:300], "attempts": 0}
         feedback: str | None = None
         reason = "no session ran"
+        task_id = str(contract["task_id"])
+        cap = self.cfg.budgets.hidden_tests_session_usd
         for attempt in range(1, AUTHOR_ATTEMPTS + 1):
+            # one cap for the whole stage, regeneration included (owner, 2026-10-23)
+            left = cap - self._author_spent(job.id, task_id)
+            if left < MIN_RETRY_USD:
+                return {
+                    "status": "missing",
+                    "reason": f"the author cap (${cap:.2f} per task) is spent",
+                    "attempts": attempt - 1,
+                }
             got, reason = self._author_attempt(
-                job, spec_md, contract, overlap, preset, attempt, feedback
+                job, spec_md, contract, overlap, preset, attempt, feedback, place, left
             )
             if got is not None:
                 return {**got, "attempts": attempt}
             feedback = reason
         return {"status": "missing", "reason": reason, "attempts": AUTHOR_ATTEMPTS}
+
+    def _author_spent(self, job_id: str, task_id: str) -> float:
+        """What this task's author stage has spent so far, across its sessions."""
+        return sum(
+            session_cost(self.store, s.id)
+            for s in self.store.list_sessions(job_id)
+            if s.role is Role.HIDDEN_TEST_AUTHOR and (s.detail or {}).get("for_task") == task_id
+        )
 
     def _author_attempt(
         self,
@@ -789,6 +856,38 @@ class JobRunner:
         preset: str,
         attempt: int,
         feedback: str | None,
+        place: Place,
+        amount: float,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """One author session. Any exception, in the session or in vigild's
+        checks of its output (a verifier crash, say), settles its reservation and
+        fails its session before it propagates: `_author_hidden_tests` then files
+        the task as "hidden tests missing; this task can only escalate", and no
+        session is left `running` for a restart to mistake for a coord."""
+        held: dict[str, Any] = {}
+        try:
+            return self._author_attempt_inner(
+                job, spec_md, contract, overlap, preset, attempt, feedback, place, amount, held
+            )
+        except Exception:
+            if (rid := held.get("rid")) is not None:
+                self.budget.settle(rid)
+            if (sess := held.get("s")) is not None:
+                self.store.update_session(sess.id, status="failed", ended_at=iso())
+            raise
+
+    def _author_attempt_inner(
+        self,
+        job: Any,
+        spec_md: str,
+        contract: dict[str, Any],
+        overlap: list[str],
+        preset: str,
+        attempt: int,
+        feedback: str | None,
+        place: Place,
+        amount: float,
+        held: dict[str, Any],
     ) -> tuple[dict[str, Any] | None, str]:
         job_id, task_id = job.id, str(contract["task_id"])
         s = self.store.create_session(
@@ -797,16 +896,18 @@ class JobRunner:
             backend_preset=preset,
             branch=f"vigil/{task_id}-hidden{attempt}",
         )  # no parent: a fresh context, never the coord's or a worker's
+        held["s"] = s
         # the task has no row yet at spec time, so the session names it in its detail
         self.store.update_session(s.id, detail={"for_task": task_id, "attempt": attempt})
         try:
             rid = self._reserve_queued(
                 job_id, "hidden_test_author", session_id=s.id, task_id=None,
-                amount=self.cfg.budgets.hidden_tests_session_usd, purpose="hidden_tests",
+                amount=amount, purpose="hidden_tests",
             )  # fmt: skip
         except BudgetExceeded as e:
             self.store.update_session(s.id, status="refused")
             return None, f"{e.cap} cap reached"
+        held["rid"] = rid
         clone_id, branch = f"{task_id}-ht{attempt}", f"vigil/{task_id}-hidden{attempt}"
         try:
             clone = self.workspace.clone(job.repo, clone_id, branch=branch, base=job.base)
@@ -814,7 +915,14 @@ class JobRunner:
             image = self.dev_images.ensure_fresh(job.repo, base_sha)
             session_image = self._session_image(job.repo, base_sha)
             self.workspace.write_task(clone, {**contract, "branch": branch, "base_sha": base_sha})
-            packet = assemble_hidden_test_author(clone, contract, spec_md, feedback=feedback)
+            packet = assemble_hidden_test_author(
+                clone,
+                contract,
+                spec_md,
+                feedback=feedback,
+                folder=place.folder,
+                include=place.include,
+            )
             self.store.add_event(
                 "packet",
                 {"role": "hidden_test_author", "attempt": attempt, "dropped": packet.dropped},
@@ -825,7 +933,7 @@ class JobRunner:
                 repo=job.repo, preset=preset, model=self.cfg.preset(preset).model or "",
                 clone=clone, session_dir=self._session_dir(s.id), max_turns=40,
                 max_minutes=COORD_MINUTES,
-                max_budget_usd=self.cfg.budgets.hidden_tests_session_usd,
+                max_budget_usd=amount,
                 mounts=self.workspace.overlays(clone), packet=packet.text, image=session_image,
                 max_output_tokens=self.cfg.budgets.session_max_output_tokens,
             )  # fmt: skip
@@ -847,7 +955,7 @@ class JobRunner:
                 head=str(out.result.get("head") or ""),
             )  # fmt: skip
             suite, manifest = load_suite(
-                self.workspace, job.repo, sha, base_sha, job_id, task_id, test_cmd_problem
+                self.workspace, job.repo, sha, base_sha, job_id, task_id, test_cmd_problem, place
             )
         except (WorkspaceError, HiddenError) as e:
             self.store.update_session(s.id, status="failed")
@@ -864,6 +972,8 @@ class JobRunner:
             "status": "ok",
             "sha": suite.sha,
             "prefix": suite.prefix,
+            "project": suite.project,
+            "include": None if suite.include is None else list(suite.include),
             "files": list(suite.files),
             "test_cmd": suite.test_cmd,
             "tests": [t.model_dump() for t in manifest.tests],
@@ -954,9 +1064,16 @@ class JobRunner:
         wave with a failure, the job blocks and the owner chooses (N5)."""
         tasks = {t.id: t for t in self.store.list_tasks(job_id) if t.state not in DEAD_TASK}
         done = {t for t, row in tasks.items() if row.state == "pr_open"}
-        pending = [t for t in tasks if t not in done]
+        # an escalated task is held out of a retry: it would build the same thing
+        # (a new plan and new hidden tests are what help), but the job's other
+        # failed tasks still retry (hotfix 5)
+        escalated = [t for t, row in tasks.items() if row.state == "escalated"]
+        pending = [t for t in tasks if t not in done and t not in escalated]
         while pending:
             wave = [t for t in pending if set(tasks[t].contract.get("depends_on", [])) <= done]
+            if not wave and escalated:
+                self._hold_failed(job_id, escalated)  # what's left waits behind them
+                return
             if not wave:
                 # Nothing can start: a dependency is missing from the plan (item 17).
                 stuck = {t: self.store.get_task(t).state for t in pending}
@@ -983,8 +1100,11 @@ class JobRunner:
             done |= {t for t, ok in zip(wave, results, strict=True) if ok}
             failed = [t for t, ok in zip(wave, results, strict=True) if not ok]
             if failed:
-                self._hold_failed(job_id, failed)
+                self._hold_failed(job_id, failed + [t for t in escalated if t not in failed])
                 return
+        if escalated:
+            self._hold_failed(job_id, escalated)
+            return
         live = [t for t in self.store.list_tasks(job_id) if t.state not in DEAD_TASK]
         if all(t.state == "pr_open" for t in live):
             transition(self.store, job_id, JobState.IN_REVIEW, Actor.VIGILD)
@@ -1031,7 +1151,7 @@ class JobRunner:
         """Block the job with one item: retry (when every failed task has budget
         left), re-plan, or abandon."""
         tasks: dict[str, dict[str, Any]] = {}
-        can_retry = True
+        lefts: list[float] = []  # budget left of each task a retry would run
         for tid in task_ids:
             cap, spent, left = self.remaining(tid)
             with self._why_lock:
@@ -1043,7 +1163,10 @@ class JobRunner:
                 "remaining_usd": round(left, 4),
                 **why,
             }
-            can_retry = can_retry and left >= MIN_RETRY_USD
+            if self.store.get_task(tid).state != "escalated":
+                lefts.append(left)
+        # retry is offered while every task it would run has budget left
+        can_retry = bool(lefts) and all(x >= MIN_RETRY_USD for x in lefts)
         deps = any("needs_deps" in t for t in tasks.values())
         if deps:
             # retry once the deps PR has merged: the base moves, so the dev image
@@ -1069,10 +1192,7 @@ class JobRunner:
                 resumable=can_retry,
             )
             return
-        escalated = [t for t, v in tasks.items() if v.get("escalate")]
-        if escalated:
-            # a retry would build the same thing; only a new plan (and new hidden tests) helps
-            can_retry = False
+        escalated = [t for t in task_ids if self.store.get_task(t).state == "escalated"]
         actions = (["retry"] if can_retry else []) + ["replan", "abandon"]
         self._block(
             job_id,
@@ -1257,6 +1377,7 @@ class JobRunner:
                 state="waiting",
             )
         paths = []
+        session_base = base_sha  # worker changes are counted from vigild's own commit
         for name in ("spec.md", "plan.md", "approval.json"):
             art = self.store.get_artifact(job_id, name)
             if art is not None:
@@ -1265,7 +1386,9 @@ class JobRunner:
                 path.write_text(art.content)
                 paths.append(f".vigil/{job_id}/{name}")
         if paths:
-            self.workspace.commit_before_session(clone, paths, f"vigil: {job_id} spec and plan")
+            session_base = self.workspace.commit_before_session(
+                clone, paths, f"vigil: {job_id} spec and plan"
+            )
         self.workspace.write_task(clone, {**contract, "base_sha": base_sha})
         approval = self.store.get_artifact(job_id, "approval.json")
         edits = json.loads(approval.content).get("edits") if approval else None
@@ -1402,6 +1525,7 @@ class JobRunner:
                     runner_config=self.cfg.repo(job.repo).runner_config,
                     runner_overlap=overlap,
                     hidden=entry_suite(hidden_entry),
+                    scope=list(contract["spec"].get("files_in_scope") or []),
                 )
             except Exception as e:  # docker or git trouble: no verdict, nothing accepted
                 log.exception("verifier failed on %s", task_id)
@@ -1438,6 +1562,7 @@ class JobRunner:
             tests,
             cost=session_cost(self.store, s.id),
             runner_config=self.cfg.repo(job.repo).runner_config,
+            session_base=session_base,
         )
         if errors and escalates(tests) and all(e.startswith(NO_HIDDEN) for e in errors):
             # built and verified, but with no hidden tests it can never pass
@@ -1477,7 +1602,11 @@ class JobRunner:
                 base=job.base,
                 title=f"[vigil {job_id}] {contract['spec']['goal']}",
                 body=body,
-                scope=list(contract["spec"]["files_in_scope"]),
+                scope=[
+                    *contract["spec"]["files_in_scope"],
+                    *artifact_paths(job_id, task_id),
+                    *vigild_paths(job_id),
+                ],
             )
         except PublishError as e:
             return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})

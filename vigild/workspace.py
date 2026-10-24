@@ -152,10 +152,12 @@ class Workspace:
             raise WorkspaceError(f"bad base record for {task_id}")
         return sha
 
-    def commit_before_session(self, clone: Path, paths: list[str], message: str) -> None:
-        """vigild's own commit in a clone, before any session has touched it."""
+    def commit_before_session(self, clone: Path, paths: list[str], message: str) -> str:
+        """vigild's own commit in a clone, before any session has touched it;
+        returns its sha, the point a worker's own changes are counted from."""
         self._git(clone, "add", "--", *paths)
         self._git(clone, "commit", "-q", "--no-verify", "-m", message)
+        return self._git(clone, "rev-parse", "HEAD")
 
     def write_task(self, clone: Path, contract: dict[str, Any]) -> Path:
         path = clone / ".vigil" / "task.json"
@@ -244,12 +246,14 @@ class Workspace:
         sha: str,
         *,
         take: list[tuple[str, list[str]]] | None = None,
+        put: list[tuple[str, str]] | None = None,
         source: str = "vault",
     ) -> Path:
         """A fresh checkout of `sha` for the verifier, under
         <data>/verify/<name>/src: a new .git with hooks off, nothing from the
         worker's clone. `take` lays files over it: for each (commit, paths),
         each path as it is at that commit, or removed if it isn't there.
+        `put` writes vigild's own files (path, text) last.
         `source` is the vault (a worker's result) or the mirror (a base commit,
         for validating a dev image)."""
         take = take or []
@@ -286,7 +290,24 @@ class Workspace:
                 self._git(src, "checkout", "--quiet", commit, "--", *present)
             if absent:
                 self._git(src, "rm", "-q", "-f", "--ignore-unmatch", "--", *absent)
+        for rel, text in put or []:
+            dest = src / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(text)
         return src
+
+    def keep_hidden_output(self, name: str, text: str) -> Path:
+        """The full output of a hidden-test run, kept on the host (mode 600) in
+        <data>/hidden-runs/: it can carry the tests' names and source lines, so
+        it never goes into the DB, an artifact, the API or a PR."""
+        if not ID.match(name):
+            raise WorkspaceError(f"bad hidden run name {name!r}")
+        d = self.data_dir / "hidden-runs"
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{name}.txt"
+        path.write_text(text)
+        path.chmod(0o600)
+        return path
 
     def export_tree(self, repo: str, sha: str, dest: Path) -> Path:
         """The tree at `sha`, from a freshly fetched mirror, unpacked at `dest`

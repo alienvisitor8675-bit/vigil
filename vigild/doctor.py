@@ -176,6 +176,15 @@ def run_checks(
     else:
         out.append(Check("PHOENIX_ADMIN_SECRET", False, "missing: tracing off"))
 
+    have_key = bool(secrets.get("VIGIL_HOST_KEY"))
+    out.append(
+        Check(
+            "VIGIL_HOST_KEY",
+            have_key,
+            "" if have_key else "missing: every hidden-test task escalates",
+        )
+    )
+
     token = secrets.get("VIGIL_API_TOKEN")
     if token:
         api = cfg.vigild.api
