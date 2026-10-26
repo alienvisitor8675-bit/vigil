@@ -66,7 +66,7 @@ from vigild.intake.spec_gate import test_cmd_problem
 from vigild.jobs.acceptance import NO_HIDDEN, check_worker, escalates
 from vigild.jobs.artifacts import parse_plan, render
 from vigild.jobs.deps import infer_deps, is_lockfile
-from vigild.jobs.fsm import Actor, TransitionError, transition
+from vigild.jobs.fsm import Actor, TransitionError, plan_gaps, transition
 from vigild.jobs.model import JobState, Role, SessionRow
 from vigild.jobs.ownernote import author_contract, spec_body, spec_diff
 from vigild.metering.calls import last_call_truncated, session_cost
@@ -362,6 +362,10 @@ class JobRunner:
                     {"state": job.state.value, "actions": ["retry", "abandon"]},
                     resumable=True,
                 )
+                out["held"] += 1
+            elif job.state is JobState.IN_REVIEW and (gaps := plan_gaps(self.store, job.id)):
+                # stuck in review with a plan task that has no PR (finding #4): page it
+                self._hold_without_pr(job.id, gaps, "found at start")
                 out["held"] += 1
             elif job.state is JobState.APPROVED:
                 self.deferred.append(job.id)
@@ -703,6 +707,8 @@ class JobRunner:
             "value": meta.get("value"),
             "risk": meta.get("risk"),
             **({"amending": True} if amend else {}),
+            # a re-plan names every worker with a new id (phase 1 run finding #4)
+            "existing_task_ids": [t.id for t in self.store.list_tasks(job_id)],
             **{f"previous_{k}": v for k, v in previous.items()},
         }
         untrusted: dict[str, str] = {}
@@ -1234,7 +1240,32 @@ class JobRunner:
             return
         live = [t for t in self.store.list_tasks(job_id) if t.state not in DEAD_TASK]
         if all(t.state == "pr_open" for t in live):
+            self._enter_review(job_id)
+
+    def _enter_review(self, job_id: str) -> None:
+        """The one way vigild moves a job to `in_review`. The FSM's guard refuses it
+        unless every task in the current plan has an open PR for that plan's work; the
+        job then blocks with a page naming the tasks that have none (finding #4)."""
+        try:
             transition(self.store, job_id, JobState.IN_REVIEW, Actor.VIGILD)
+        except TransitionError as e:
+            gaps = plan_gaps(self.store, job_id)
+            if not gaps:
+                raise
+            self._hold_without_pr(job_id, gaps, str(e))
+
+    def _hold_without_pr(self, job_id: str, gaps: dict[str, str], why: str) -> None:
+        self._block(job_id, f"no open PR for plan task(s) {sorted(gaps)}")
+        self._page(
+            job_id,
+            f"{job_id}: no open PR for {', '.join(sorted(gaps))}; replan or abandon",
+            {
+                "kind": "plan_without_pr",
+                "tasks": {t: {"state": w} for t, w in gaps.items()},
+                "error": why,
+                "actions": ["replan", "abandon"],
+            },
+        )
 
     def remaining(self, task_id: str) -> tuple[float, float, float]:
         """(cap, spent, left) for a task: a retry gets what's left, never a fresh cap."""

@@ -149,6 +149,7 @@ edits this table (or, from phase 2 on, an ADR).
 | B39 | Dependency changes | **Owner direction, round 3.** A task can't change dependencies: its runner files are the base's in every verification run, and its sessions and verifier run images built from the base's lockfiles. A worker that needs a dependency says so (`needs_deps: [{ecosystem, package, version, why}]` in `worker_report.json`), or vigild reads it from a manifest or lockfile it changed. The task isn't verified: it goes to `needs_deps`, and the job blocks (reason `needs_deps`) with one inbox item showing the requested deps and the worker's manifest and lockfile diff, fenced as untrusted. **The path for a dependency change** is its own **deps job**, a child of the blocked task's job (the task's `blocked_on`; shape `deps`): **no model** — vigild runs the package manager's lockfile-only update (`pnpm add <pkg>@<ver> --lockfile-only`, `uv add …`) in a build container with registry egress and nothing else (no repo secrets, no gateway token); the diff must touch only manifests and lockfiles, or the job fails; the requested version and every other package the lockfile pulls in must be at least 14 days old by the registry's publish time, or the job fails with the list; the dev image is rebuilt from the new lockfile and the full suite runs offline on base plus the new lockfile; vigild opens the PR; `deps` starts at rung 1 and always needs the owner's review, like money paths. After it merges the dev image key changes, and the parent resumes on the new image; the FSM refuses that resume until the deps job has merged. Dependabot-style bumps arrive the same way, as deps jobs. **Phase 1 builds** the structured block, the inbox item, the `shape`/`parent_task`/`blocked_on` fields and the FSM transition (the owner resumes from the inbox); **phase 2** the deps job executor, the child-job spawn and auto-resume on merge; **phase 6** the Dependabot intake | A dependency is a supply-chain change, so it gets its own deterministic job and the owner's review, never a worker's say-so. |
 | B32 | Scope globs | Two semantics, each where its error is the safe one. **Detection** (money/auth/consent) keeps guard's and route's loose rules (basename anywhere, tail match, case-insensitive): over-matching flags more. **Scope** (what a worker may change, nesting, disjointness) is strict: anchored, case-sensitive, `*` inside a segment, `**` across segments, no `..` or absolute entries; two globs count as overlapping unless their literal prefixes differ | Review r1, items 14 and 15. This departs from the design's "one glob means the same thing everywhere" for scope only. |
 | B40 | Hidden tests for runner-file tasks | **Hidden tests are disabled until ADR-0003's work merges: `hidden_tests.enabled` is off for every repo.** **Threat model, the known open findings and the planned separate subject container: `docs/decisions/ADR-0003-hidden-tests-threat-model.md` (Proposed). Until its series is merged, nothing here is a proof of isolation.** The switch is host policy (`RepoPolicy.hidden_tests` in vigild's `configs/repos.yaml`; nothing in a target repo can set it), and `vigil doctor` reports it per repo. **Off (the default):** no hidden-test author runs, so there is no hidden-test session, no reservation for one, no hidden run in the verifier, no injection into the checkout and no tag, and `VIGIL_HOST_KEY` is not needed. A task whose scope names a runner file (`runner_overlap`, flagged by `JobService.flagged_tasks`; the task keeps its `runner_file_change` marker and stays at rung 0, which nothing counts toward graduation) is built and verified on its **visible** tests only (the verifier runs the head's copy of only the overlapping runner file and the base's copy of every other, as B33 says), then opens a draft PR titled `Owner review required: runner file changed; hidden tests disabled`, whose body lists the runner files. The owner is the oracle; the spec item says hidden tests are disabled for such a task. No job is left escalated for want of hidden tests. The switch is read once, when the spec is gated, and frozen in the job's `spec_gate.json` (`hidden_tests_enabled`); build and verify follow that value, so flipping it later changes nothing for a job already specced. **On:** the earlier behaviour, unchanged and not relied on: after the spec gate a fresh `hidden_test_author` session writes black-box tests for each flagged task, vigild checks them against the base, and they decide the task in their own verifier run; without them the task escalates. That code (`vigild/hidden.py`, `vigild/blackbox.py`, `vigild/hiddenkit/`, the verifier's hidden run) stays in the tree but its sandbox is under review in ADR-0003, so no guarantee about it is stated here. **Also here (owner spec, 2026-10-25):** the helpers' `make_fixture`/`makeFixture`; and *replan with an owner note*: `POST /api/inbox/{id}/replan` takes `{"note": "..."}` (text, 8 KB at most: 413 over it, 422 if empty or not text), stored verbatim as `owner_note.md` (provenance human, an event carries its size and hash). It is the owner's text, so it is an owner section of the coord's packet, never `fence()`d, with a snapshot of the baseline spec (`spec_previous.md`: the spec as of the last approval, else the current draft, labelled so). The coord **amends** it rather than redrafting, and returns `spec_changelog.md`; the spec gate runs on the amended spec; vigild stores a unified diff (`spec_diff.md`) and the spec item shows the changelog and the diff. Notes accumulate until an approval closes them. It works from a failed build's page and from the spec item ("replan with note": the job is already `spec_pending`, so no state changes; no approval is made; a note is required; 409 while the runner holds the job). With the switch on the author also gets the amended spec and the note's author-contract lines (`vigild/jobs/ownernote.py`, no model). A refusal by the subject broker is a `SubjectRefused` exception in the helpers, never a subject exit code. | Hidden tests are off for every repo; a runner-file task is verified on its visible tests and the owner reviews its draft PR (`tests/jobs/test_hidden_switch.py`, `tests/jobs/test_replan_note.py`, `tests/test_hidden_fixtures.py`). |
+| B41 | The `in_review` invariant and task ids | **Phase 1 run, finding #4 (owner ruling 2026-10-26).** In pa-0002 a re-plan's single task was renumbered to `pa-0002-w1`, the id of a merged task: `_plan_and_dispatch` kept the existing `pr_open` task and created nothing, nothing ran, and the job still went `planning` → `building` → `in_review` with no PR for the new work and no inbox item. Two fixes. **The plan gate** (`check_job_spec`, `existing_task_ids`) refuses a worker id that already exists in the job (any state, superseded included) or repeats within the plan, so the coord's revise loop fixes it; the coord's packet lists `existing_task_ids`; `canonicalize_plan` numbers a re-plan's workers from the job's highest task number + 1. **The invariant**, in `vigild/jobs/fsm.py`: a job enters `in_review` only if every task of its current plan has an open PR for that plan's work (`plan_gaps`: the task exists, is `pr_open`, and its stored goal, test command and scope are the plan's). It is a guard on `building -> in_review` and on a held job's resume into `in_review`. A refusal blocks the job (an event) with a page, `kind: plan_without_pr`, naming the tasks and offering re-plan and abandon (`Runner._enter_review`). At startup `reconcile` runs the same check on every `in_review` job and pages a violator the same way; this is how an already-stuck job gets its page. | A job in `in_review` has a PR for every task its plan names, or it is blocked and the owner is paged (`tests/jobs/test_in_review_invariant.py`, `tests/intake/test_spec_gate.py`). |
 
 ## Backends
 
@@ -196,13 +197,13 @@ stateDiagram-v2
   spec_pending --> approved: owner, inbox only (spec gate passed)
   approved --> planning
   planning --> building: worker tasks routed
-  building --> in_review: every worker has a draft PR + worker_report.json
+  building --> in_review: every task of the current plan has an open draft PR + worker_report.json
   in_review --> building: review findings (phase 2)
   in_review --> ready: reviews clean (phase 2)
   ready --> merged: merge commits (phase 2)
   merged --> verifying
   verifying --> done: clean verify record (phase 6)
-  building --> blocked: budget cap · routing refusal
+  building --> blocked: budget cap · routing refusal · a plan task with no PR
   blocked --> building: owner, inbox only (resume)
 ```
 
@@ -214,12 +215,30 @@ stateDiagram-v2
   acceptance in code, and writes a `state` event with its actor, channel
   and evidence. The owner's override (`force`) is logged and never skips
   approval.
+- **`in_review` invariant (phase 1 run, finding #4).** A job enters
+  `in_review` only if every task in its **current plan** (the latest
+  `plan.md`) has an open PR for that plan's work: the task exists, is
+  `pr_open`, and its stored contract (goal, test command, scope) is the
+  plan's. The guard on `building -> in_review` and the one on resuming a held
+  job into `in_review` both check it (`plan_gaps` in `fsm.py`), so every path
+  is covered: dispatch finishing, a resume, a retry, a deps job merging, a
+  restart's reconcile and a re-plan. A refusal blocks the job with one page
+  (`kind: plan_without_pr`, naming each such task) offering **re-plan** and
+  **abandon**. At start, reconcile checks every `in_review` job against the
+  invariant and pages one that fails it; a valid one is left alone.
+  Tasks of earlier plans are outside it: they stand with their PRs, or were
+  superseded. The owner's override is unchanged.
 - **Inside spec_pending.** A request (or a task with no `test_cmd` /
   `done_when`) starts a coord that writes `.vigil/<job>/spec.md` and
   `plan.md`: one session and one fresh clone per draft. vigild runs the spec
   gate; on a refusal the coord gets the errors and its previous draft and
-  drafts again, up to three drafts, then you are paged (resumable). vigild
-  renames the plan's workers to `{job}-w1`, `{job}-w2`, …. A
+  drafts again, up to three drafts, then you are paged (resumable). The
+  spec gate **refuses a worker id that already exists in the job**
+  (merged, failed or superseded) and one repeated in the plan; a new worker
+  may list an existing id in `depends_on`. After the gate vigild renames the
+  plan's workers to `{job}-w<n>`, **starting after the job's highest task
+  number** (`{job}-w1`, `{job}-w2`, … for a first plan, so a re-plan's tasks
+  are always new ones). A
   complete task skips the coord: vigild writes a one-worker spec and plan
   from the contract (provenance `human`). Either way the job waits in
   *Specs to approve*.

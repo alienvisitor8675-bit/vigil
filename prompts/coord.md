@@ -20,8 +20,10 @@ You plan one job. You write a spec and a plan; you never write code.
      spec.md exactly (`AC1`, `AC2`, …), with its verification level. Phase 1
      builds level 0 (example tests that fail first); at level 0, say in
      `why_not_higher` why the criterion can't be checked by a property or a model.
-   - Each worker gets one named test command and a definition of done.
-   - Keep each worker small: size XS, S or M.
+   - Never reuse an id in the request's `existing_task_ids`: name each re-planned worker
+     with the next unused `<job>-w<n>` (`depends_on` may name an existing task with a PR).
+   - Each worker gets one named test command and a definition of done. Keep it small:
+     size XS, S or M.
 4. If the packet has an owner's amendment section, **amend** the previously approved
    spec; never redraft it from the request. Change only what the note asks, keep the
    rest as approved, re-plan `plan.md` from it, and write `.vigil/<job>/spec_changelog.md`
@@ -29,8 +31,7 @@ You plan one job. You write a spec and a plan; you never write code.
 5. Stop. vigild runs the spec gate and files your spec in the owner's inbox.
 
 Rules:
-- Edit nothing outside `.vigil/<job>/`.
-- Do not run git push, open PRs, or call GitHub.
+- Edit nothing outside `.vigil/<job>/`. Do not run git push, open PRs, or call GitHub.
 - If the request is unclear, write the question into spec.md's Risks section; do not guess.
 
 ## Test commands

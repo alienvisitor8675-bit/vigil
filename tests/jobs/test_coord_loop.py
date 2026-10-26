@@ -172,6 +172,22 @@ def failed_author(spec: SessionSpec, task: dict[str, Any]) -> ExecOutcome | None
     return ExecOutcome("failed", 1, {}, "the author crashed")
 
 
+def _fresh_ids(text: str, job: str, existing: list[str]) -> str:
+    """What a coord does on a re-plan: a draft that names an id the job already has gets
+    the next unused ones (the gate refuses a reused id; finding #4)."""
+    if not existing or not any(f'"{e}"' in text for e in existing):
+        return text
+    head, rest = text.split("```json\n", 1)
+    body, tail = rest.split("\n```", 1)
+    doc = json.loads(body)
+    top = max(int(e.rsplit("-w", 1)[1]) for e in existing)
+    mapping = {w["task_id"]: f"{job}-w{top + i}" for i, w in enumerate(doc["workers"], 1)}
+    for w in doc["workers"]:
+        w["task_id"] = mapping[w["task_id"]]
+        w["depends_on"] = [mapping.get(d, d) for d in w.get("depends_on", [])]
+    return head + "```json\n" + json.dumps(doc) + "\n```" + tail
+
+
 @dataclass
 class StandIn:
     """Does what the container's harness does: run the agent's work, write the
@@ -189,6 +205,7 @@ class StandIn:
     max_running: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
     barrier: threading.Barrier | None = None
+    renumber: bool = True  # a re-plan's draft avoids the ids the job has (finding #4)
 
     def run(self, spec: SessionSpec, gateway_token: str, on_event: EventSink) -> ExecOutcome:
         assert gateway_token.startswith("vgw_")
@@ -222,6 +239,8 @@ class StandIn:
                     self.coord_drafts.pop(0) if self.coord_drafts else (lambda j: (SPEC, plan(j)))
                 )
                 sp, pl = draft(spec.job_id)
+                if self.renumber:
+                    pl = _fresh_ids(pl, spec.job_id, task.get("existing_task_ids") or [])
                 d = spec.clone / ".vigil" / spec.job_id
                 d.mkdir(parents=True, exist_ok=True)
                 (d / "spec.md").write_text(sp)
@@ -974,7 +993,9 @@ def test_replan_sends_the_job_back_to_the_coord_with_the_failure(world: World) -
     assert r.status_code == 200, r.text
     qs = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
     assert w.store.get_job(job).state.value == "in_review", [(q["title"], q["body"]) for q in qs]
-    assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
+    # the re-plan's tasks are new ones (w3, w4); w1 is superseded and w2's PR stands
+    assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w{n}" for n in (2, 3, 4)]
+    assert w.store.get_task(f"{job}-w1").state == "superseded"
 
 
 def test_abandon_ends_the_job(world: World) -> None:

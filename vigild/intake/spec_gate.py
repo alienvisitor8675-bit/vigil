@@ -15,7 +15,7 @@ the ones the path rules find.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 
 from vigild.contract.models import BUILT_VERIFY_LEVELS, Task, WorkerContract
@@ -184,6 +184,7 @@ def check_job_spec(
     *,
     missing_tools: Callable[[str], list[str]] | None = None,
     read: ReadFile | None = None,
+    existing_task_ids: Collection[str] = (),
 ) -> list[str]:
     errors: list[str] = []
     for entry in spec.files_in_scope:
@@ -206,11 +207,20 @@ def check_job_spec(
     ids = [w.task_id for w in plan.workers]
     for dup in sorted({i for i in ids if ids.count(i) > 1}):
         errors.append(f"plan.md repeats worker {dup}")
+    # phase 1 run finding #4: a task id belongs to one task for the life of the job,
+    # whatever its state; a re-plan names its workers anew (and may depend on a PR
+    # that already stands).
+    taken = set(existing_task_ids)
+    for reused in sorted({i for i in ids if i in taken}):
+        errors.append(
+            f"worker {reused} already exists in this job (merged, failed or superseded); "
+            "name every worker in a re-plan with a new task id, never an old one"
+        )
     for w in plan.workers:
         if why := test_cmd_problem(w.test_cmd, read):
             errors.append(f"worker {w.task_id}: {why}")
         for dep in w.depends_on:
-            if dep not in ids:
+            if dep not in ids and dep not in taken:
                 errors.append(f"worker {w.task_id} depends on unknown worker {dep}")
         for f in w.files_in_scope + w.out_of_scope:
             if err := scope_entry_error(f):

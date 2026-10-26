@@ -224,16 +224,20 @@ def parse_plan(text: str) -> PlanDoc:
     return doc
 
 
-def canonicalize_plan(job_id: str, text: str) -> str:
-    """Give plan.md's workers vigild's own ids, `{job}-w1`, `{job}-w2`, … in
-    order, remapping depends_on. A coord can't name a task id that collides
-    with another job's task, clone or branch (review round 1, item 16)."""
+def canonicalize_plan(job_id: str, text: str, start: int = 1) -> str:
+    """Give plan.md's workers vigild's own ids, `{job}-w<start>`, `{job}-w<start+1>`, …
+    in order, remapping depends_on. A coord can't name a task id that collides
+    with another job's task, clone or branch (review round 1, item 16). A re-plan
+    starts after the job's highest task number, so it never reuses an id (phase 1
+    run finding #4: renumbering from w1 gave a re-planned task a merged task's id)."""
     blocks = list(re.finditer(r"```json\s*\n(.*?)```", text, flags=re.S))
     for m in blocks:
         if '"workers"' not in m.group(1):
             continue
         raw = json.loads(m.group(1))
-        mapping = {w["task_id"]: f"{job_id}-w{i}" for i, w in enumerate(raw["workers"], start=1)}
+        mapping = {
+            w["task_id"]: f"{job_id}-w{i}" for i, w in enumerate(raw["workers"], start=start)
+        }
         for w in raw["workers"]:
             w["task_id"] = mapping[w["task_id"]]
             w["depends_on"] = [mapping.get(d, d) for d in w.get("depends_on", [])]

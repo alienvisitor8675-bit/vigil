@@ -368,7 +368,8 @@ uv run python -m vigild
     itself on restart;
   - reconciles anything a previous run left behind: tokens revoked, session
     containers removed, reservations settled, mid-flight jobs blocked with a
-    page in the inbox (retry, re-plan or abandon), a draft whose coord died
+    page in the inbox (retry, re-plan or abandon), an `in_review` job whose plan has a
+    task with no open PR paged (re-plan or abandon), a draft whose coord died
     paged (retry or cancel);
   - starts approved builds that never began, once the gateway is listening.
 - **When a worker fails**, its job is blocked after its wave with one inbox
@@ -376,6 +377,13 @@ uv run python -m vigild
   cap (offered only when there is at least $0.05 left), **Re-plan** sends
   the job back to its coord with the failures, **Abandon** ends it (any open
   PRs stay for you to close).
+- **"no open PR for <task>; replan or abandon"** (phase 1 run, finding #4): a job
+  reached the point of review but a task in its current plan has no open PR for that
+  plan's work (the page lists the tasks). Nothing is running. **Re-plan** (with a note
+  if you like) sends it back to the coord; **Abandon** ends it. The spec gate now
+  refuses a re-plan that names a worker id the job already has, and vigild numbers a
+  re-plan's tasks after the job's highest. After an upgrade, a job already stuck in
+  `in_review` (pa-0002) gets this page at vigild's start.
 - The API is at 127.0.0.1:8787, bearer tokens only (the CLI and MCP).
 - The web UI's login exists only on the Mac's Tailscale address
   (`api.tailscale_host`; unset means no UI login). Behind `tailscale serve`

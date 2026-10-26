@@ -15,6 +15,7 @@ from enum import StrEnum
 from typing import Any
 
 from vigild.db import Store
+from vigild.jobs.artifacts import parse_plan
 from vigild.jobs.model import Job, JobState, Role
 from vigild.provenance import Provenance
 
@@ -81,7 +82,7 @@ def _workers_routed(c: Ctx) -> list[str]:
 
 
 def _workers_done(c: Ctx) -> list[str]:
-    errs: list[str] = []
+    errs: list[str] = _plan_has_prs(c)
     workers = [s for s in c.store.list_sessions(c.job.id) if s.role is Role.WORKER]
     tasks = [t for t in c.store.list_tasks(c.job.id) if t.state not in ("superseded", "abandoned")]
     if not tasks:
@@ -93,6 +94,41 @@ def _workers_done(c: Ctx) -> list[str]:
         if c.store.get_artifact(c.job.id, "worker_report.json", t.id) is None:
             errs.append(f"worker {t.id} has no worker_report.json")
     return errs
+
+
+def plan_gaps(store: Store, job_id: str) -> dict[str, str]:
+    """Tasks of the job's current plan that have no open PR for that plan's work, as
+    {task id: why} (phase 1 run finding #4). A task has one only if it exists, is
+    `pr_open`, and its stored contract is the plan's (an id that names other work, as
+    a re-plan's reused id did in pa-0002, has no PR for this plan). Tasks of earlier
+    plans are not listed: they stand or are superseded."""
+    art = store.get_artifact(job_id, "plan.md")
+    if art is None:
+        return {}
+    gaps: dict[str, str] = {}
+    for w in parse_plan(art.content).workers:
+        try:
+            task = store.get_task(w.task_id)
+        except KeyError:
+            gaps[w.task_id] = "no task was created for it"
+            continue
+        if task.state != "pr_open":
+            gaps[w.task_id] = f"the task is {task.state}, not pr_open"
+            continue
+        spec = task.contract.get("spec")
+        if isinstance(spec, dict) and (
+            spec.get("goal") != w.goal
+            or spec.get("test_cmd") != w.test_cmd
+            or sorted(spec.get("files_in_scope") or []) != sorted(w.files_in_scope)
+        ):
+            gaps[w.task_id] = "its open PR is for different work than the plan names"
+    return gaps
+
+
+def _plan_has_prs(c: Ctx) -> list[str]:
+    return [
+        f"plan task {t} has no open PR: {why}" for t, why in plan_gaps(c.store, c.job.id).items()
+    ]
 
 
 def _findings(c: Ctx) -> list[str]:
@@ -193,6 +229,10 @@ def transition(
                 )
             if not owner_inbox:
                 raise TransitionError("only the owner, from the inbox, moves a held job")
+            # the same invariant on the way back in: a held job resumes into review
+            # only if its plan still has a PR for every task
+            if to is S.IN_REVIEW and (gaps := _plan_has_prs(ctx)):
+                raise TransitionError(f"{frm.value} -> {to.value} refused: " + "; ".join(gaps))
             if to == job.blocked_from and job.blocked_on:
                 # round 3: back to work only once the deps job it waits for has merged
                 dep = store.get_job(job.blocked_on)

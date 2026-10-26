@@ -457,3 +457,49 @@ def test_a_reporting_runner_is_accepted(cmd: str) -> None:
 )
 def test_control_flow_that_hides_an_exit_is_refused(cmd: str) -> None:  # round 4, item 1
     assert bad_test_cmd(cmd), cmd
+
+
+# --- phase 1 run finding #4: a plan never reuses a task id ---------------------------------
+
+
+def test_a_plan_that_reuses_an_existing_task_id_is_refused() -> None:
+    errors = check_job_spec(
+        parse_spec(SPEC), parse_plan(PLAN), MONEY, existing_task_ids={"pa-0001-w1"}
+    )
+    assert any("pa-0001-w1" in e and "already exists" in e for e in errors)
+    assert not any("pa-0001-w2" in e and "already exists" in e for e in errors)
+
+
+def test_a_superseded_or_failed_tasks_id_is_reused_no_more_than_a_merged_ones() -> None:
+    # the gate sees ids only: every existing task, whatever its state, blocks its id
+    errors = check_job_spec(
+        parse_spec(SPEC),
+        parse_plan(PLAN),
+        MONEY,
+        existing_task_ids=["pa-0001-w1", "pa-0001-w2"],
+    )
+    assert sum("already exists" in e for e in errors) == 2
+
+
+def test_a_plan_that_repeats_a_worker_id_is_refused() -> None:
+    plan = PLAN.replace('"task_id": "pa-0001-w2"', '"task_id": "pa-0001-w1"')
+    errors = check_job_spec(parse_spec(SPEC), parse_plan(plan), MONEY)
+    assert any("repeats worker pa-0001-w1" in e for e in errors)
+
+
+def test_fresh_ids_pass_beside_existing_ones() -> None:
+    plan = PLAN.replace("pa-0001-w", "pa-0001-w1")  # w11, w12
+    errors = check_job_spec(
+        parse_spec(SPEC), parse_plan(plan), MONEY, existing_task_ids={"pa-0001-w1", "pa-0001-w2"}
+    )
+    assert errors == []
+
+
+def test_a_new_worker_may_depend_on_an_existing_task() -> None:
+    plan = PLAN.replace("pa-0001-w2", "pa-0001-w3").replace(
+        '"task_id": "pa-0001-w1"', '"task_id": "pa-0001-w4", "depends_on": ["pa-0001-w2"]'
+    )
+    errors = check_job_spec(
+        parse_spec(SPEC), parse_plan(plan), MONEY, existing_task_ids={"pa-0001-w1", "pa-0001-w2"}
+    )
+    assert errors == []

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -187,7 +188,9 @@ class JobService:
             raise SubmitError(r.reasons)
         return r.reasons if r.outcome is IntakeOutcome.PROPOSE else []
 
-    def _gate(self, repo: str, spec_text: str, plan_text: str, base: str) -> list[str]:
+    def _gate(
+        self, repo: str, spec_text: str, plan_text: str, base: str, job_id: str | None = None
+    ) -> list[str]:
         return check_job_spec(
             parse_spec(spec_text),
             parse_plan(plan_text),
@@ -196,6 +199,8 @@ class JobService:
             # the base's files, so the gate resolves package scripts as the
             # verifier will (round 4, item 6)
             read=self.files(repo, base) if self.files is not None else None,
+            # a worker id is never reused in a job (phase 1 run finding #4)
+            existing_task_ids=self._used_task_ids(job_id) if job_id else (),
         )
 
     def _first_call_fits(self, repo: str) -> None:
@@ -354,6 +359,22 @@ class JobService:
         self.file_item(job_id)
         return []
 
+    def _used_task_ids(self, job_id: str) -> list[str]:
+        """The job's tasks that a plan has already been built from. A task still
+        `submitted` or `awaiting_approval` is the job's own, made at submit from the
+        plan vigild wrote for it; that plan owns the id."""
+        waiting = ("submitted", "awaiting_approval")
+        return [t.id for t in self.store.list_tasks(job_id) if t.state not in waiting]
+
+    def _next_task_number(self, job_id: str) -> int:
+        """One past the job's highest task number: a re-plan's tasks are new ones."""
+        used = [
+            int(m.group(1))
+            for tid in self._used_task_ids(job_id)
+            if (m := re.fullmatch(re.escape(job_id) + r"-w(\d+)", tid))
+        ]
+        return max(used, default=0) + 1
+
     def gate_spec(self, job_id: str) -> list[str]:
         spec = self.store.get_artifact(job_id, "spec.md")
         plan = self.store.get_artifact(job_id, "plan.md")
@@ -361,7 +382,7 @@ class JobService:
             errors = ["spec.md and plan.md are both required"]
         else:
             job0 = self.store.get_job(job_id)
-            errors = self._gate(job0.repo, spec.content, plan.content, job0.base)
+            errors = self._gate(job0.repo, spec.content, plan.content, job0.base, job_id)
         self.store.add_artifact(
             job_id,
             "spec_gate.json",
@@ -371,7 +392,11 @@ class JobService:
         if errors:
             return errors
         # vigild assigns task ids: {job}-w1, {job}-w2, ... (review r1, item 16)
-        canonical = canonicalize_plan(job_id, plan.content)  # type: ignore[union-attr]
+        canonical = canonicalize_plan(
+            job_id,
+            plan.content,  # type: ignore[union-attr]
+            self._next_task_number(job_id),
+        )
         if canonical != plan.content:  # type: ignore[union-attr]
             self.store.add_artifact(job_id, "plan.md", canonical, plan.provenance)  # type: ignore[union-attr]
         flagged = self.flagged_tasks(job_id)
