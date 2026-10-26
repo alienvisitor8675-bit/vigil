@@ -581,6 +581,25 @@ class Store:
         )
         return ArtifactRow(**dict(rows[0])) if rows else None
 
+    def spec_before(self, job_id: str, artifact_id: int) -> ArtifactRow | None:
+        """The job's spec.md as it was when artifact `artifact_id` was written."""
+        rows = self.q(
+            "SELECT * FROM artifacts WHERE job_id=? AND name='spec.md' AND task_id IS NULL"
+            " AND id < ? ORDER BY id DESC LIMIT 1",
+            (job_id, artifact_id),
+        )
+        return ArtifactRow(**dict(rows[0])) if rows else None
+
+    def notes_since_approval(self, job_id: str) -> list[str]:
+        """The owner's replan notes written since the job's last approval, oldest first."""
+        approval = self.get_artifact(job_id, "approval.json")
+        rows = self.q(
+            "SELECT content FROM artifacts WHERE job_id=? AND name='owner_note.md'"
+            " AND task_id IS NULL AND id > ? ORDER BY id",
+            (job_id, approval.id if approval else 0),
+        )
+        return [r["content"] for r in rows]
+
     def list_artifacts(self, job_id: str) -> list[ArtifactRow]:
         """The newest version of each (name, task) for a job."""
         rows = self.q(

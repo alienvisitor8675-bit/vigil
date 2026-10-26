@@ -23,13 +23,20 @@ Rules:
    - a command: `run_subject(cmd, cwd=".", env=None, input=None)` returns
      `{"returncode", "stdout", "stderr"}`; for a script, e.g.
      `run_subject(["node", "scripts/check-feature-map.mjs"])` or
-     `run_subject(["python3", "-m", "pkg.cli", "--flag"])`, against fixtures you
-     create in a temp dir of your own;
+     `run_subject(["python3", "-m", "pkg.cli", "--flag"])`, against fixtures made
+     with `make_fixture` (below);
    - a function: `call_subject(module, func, args, kwargs, cwd=".")` returns
      `{"ok": true, "value": ...}` or `{"ok": false, "type", "message"}`; inputs
      and outputs must be JSON; a separate vigild-owned process imports the module
      (pytest: a dotted module name; vitest: `callSubject("src/lib.ts", "func", [args])`
      from `./vigil_hidden.mjs`, which also has `runSubject`).
+   **Use `make_fixture` for every fixture** (pytest `from vigil_hidden import make_fixture`;
+   vitest `makeFixture` from `./vigil_hidden.mjs`): `make_fixture({"dir/a.txt": "text"})`
+   returns the path of a fresh directory holding those files. The subject runs as another
+   uid that cannot read a temp dir (`mkdtemp`, `tmp_path`, `os.tmpdir`) you make yourself;
+   a `make_fixture` directory it can read at every level and never write. Paths are
+   relative, with no `..` and no symlinks. Pass the returned path to the subject
+   (`--root`, an argument).
    Assert only through the helper's `check(cond, message)` (pytest
    `from vigil_hidden import check`; vitest `import { check } from './vigil_hidden.mjs'`),
    never a bare `assert` or `expect`: a failure counts as "failed an assertion"

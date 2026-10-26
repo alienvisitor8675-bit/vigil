@@ -51,6 +51,9 @@ class RecordingRunner:
     def on_rebuild(self, repo: str, base_sha: str) -> None:
         self.rebuilt.append((repo, base_sha))
 
+    def busy(self, job_id: str) -> bool:
+        return False
+
 
 @pytest.fixture
 def tokens() -> Tokens:

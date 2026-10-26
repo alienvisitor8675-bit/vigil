@@ -21,10 +21,12 @@
 
 IPC=/vigil-ipc
 SUBJ=10002
+TESTUID=${VIGIL_TEST_UID:-10001}
 PATH_SAFE=/usr/local/bin:/usr/bin:/bin
 
 refuse() {
 	printf '%s\n' "$1" > "$d/err"
+	: > "$d/refused"
 	echo 126 > "$d/rc"
 }
 
@@ -57,6 +59,8 @@ while :; do
 		/subject | /subject/*) ;;
 		*) refuse "cwd is not inside /subject"; continue ;;
 	esac
+	# nothing the test uid started may accept requests from the subject (guard.sh)
+	msg=$(sh /vigil/guard.sh "$TESTUID" 2>&1) || { refuse "$msg"; continue; }
 	tmp=$(mktemp -d /tmp/vigil-subj.XXXXXX) || { refuse "no tmp dir"; continue; }
 	chown $SUBJ:$SUBJ "$tmp"
 	set -- env -i PATH=$PATH_SAFE HOME="$tmp" TMPDIR="$tmp"

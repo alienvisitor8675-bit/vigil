@@ -178,12 +178,25 @@ def run_checks(
 
     raw_key = secrets.get("VIGIL_HOST_KEY")
     have_key = bool(raw_key) and len(raw_key or "") >= 64
+    # the host policy: hidden tests are off for a repo unless configs/repos.yaml says so
+    for name, policy in cfg.repos.repos.items():
+        on = policy.hidden_tests.enabled
+        out.append(
+            Check(
+                f"hidden tests: {name}",
+                True if on else None,
+                "on (host policy)" if on else "off (host policy)",
+            )
+        )
+    any_on = any(p.hidden_tests.enabled for p in cfg.repos.repos.values())
     out.append(
         Check(
             "VIGIL_HOST_KEY",
-            have_key,
+            have_key or not any_on,
             ""
             if have_key
+            else "not needed: hidden tests are off for every repo"
+            if not any_on
             else "too short: needs 64 hex characters; every hidden-test task escalates"
             if raw_key
             else "missing: every hidden-test task escalates",

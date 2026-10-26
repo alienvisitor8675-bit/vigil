@@ -3,6 +3,7 @@ Images: `uv run python scripts/build-images.py`."""
 
 from __future__ import annotations
 
+import contextlib
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -78,10 +79,12 @@ def make_spec(
     # Docker Desktop shares /private; keep paths short for socket limits.
     ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
     n = [0]
+    made: list[str] = []
 
     def make(role: Role = Role.WORKER) -> SessionSpec:
         n[0] += 1
         sid = f"s-sec{tmp_path.name[-6:].lower().replace('_', '')}{n[0]}"
+        made.append(sid)
         clone = ws.clone(
             "o/fixture", f"fx-0001-w{n[0]}", branch=f"vigil/fx-0001-w{n[0]}", base="main"
         )
@@ -113,5 +116,25 @@ def make_spec(
             image=executor_image,
         )
 
-    yield make
-    shutil.rmtree(tmp_path / "data", ignore_errors=True)
+    try:
+        yield make
+    finally:
+        # a session id repeats from run to run, so a network a test left behind makes the
+        # next run's create fail with 409: remove each one this test made, containers too
+        _remove_session_networks(made)
+        shutil.rmtree(tmp_path / "data", ignore_errors=True)
+
+
+def _remove_session_networks(session_ids: list[str]) -> None:
+    client = _docker()
+    for sid in session_ids:
+        # `names` filters by substring: keep only the exact name
+        for net in client.networks.list(names=[f"vigil-{sid}"]):  # type: ignore[attr-defined]
+            if net.name != f"vigil-{sid}":
+                continue
+            net.reload()
+            for c in net.containers:
+                with contextlib.suppress(Exception):  # already gone
+                    c.remove(force=True)
+            with contextlib.suppress(Exception):
+                net.remove()

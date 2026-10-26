@@ -1116,6 +1116,7 @@ TOOL_OK = 'print("ok")\n'
 
 def _runner_world(w: World) -> None:
     w.runner.cfg.repos.repos[REPO].runner_config = ["tools/check.py"]
+    w.runner.cfg.repos.repos[REPO].hidden_tests.enabled = True  # the switch is off by default
     w.standin.coord_drafts = [_named]
 
 
@@ -1403,6 +1404,7 @@ def test_an_api_submit_of_a_runner_file_task_starts_no_session_and_files_no_item
 ) -> None:
     """The author never blocks a submit: the runner does it afterwards."""
     services.cfg.repos.repos["thomasbardhi01/vigil"].runner_config = ["conftest.py"]
+    services.cfg.repos.repos["thomasbardhi01/vigil"].hidden_tests.enabled = True
     r = client.post(
         "/api/tasks",
         headers=auth(tokens.admin),

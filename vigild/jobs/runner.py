@@ -68,6 +68,7 @@ from vigild.jobs.artifacts import parse_plan, render
 from vigild.jobs.deps import infer_deps, is_lockfile
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import JobState, Role, SessionRow
+from vigild.jobs.ownernote import author_contract, spec_body, spec_diff
 from vigild.metering.calls import last_call_truncated, session_cost
 from vigild.packets.assemble import assemble_coord, assemble_hidden_test_author, assemble_worker
 from vigild.packets.fence import fence
@@ -80,6 +81,8 @@ from vigild.verifier import Verifier, runner_like, runner_overlap
 from vigild.workspace import Workspace, WorkspaceError
 
 log = logging.getLogger("vigild.runner")
+# the draft PR title of a runner-file task while hidden tests are off (host policy)
+OWNER_REVIEW_TITLE = "Owner review required: runner file changed; hidden tests disabled"
 COORD_DRAFTS = 3
 COORD_MINUTES = 30
 WORKER_MINUTES = 40
@@ -110,6 +113,8 @@ class Pager(Protocol):
     ) -> Any: ...
     def file_for_approval(self, job_id: str) -> list[str]: ...
     def flagged_tasks(self, job_id: str) -> dict[str, list[str]]: ...
+    def needs_hidden(self, job_id: str) -> dict[str, list[str]]: ...
+    def hidden_enabled(self, job_id: str) -> bool: ...
     def file_item(self, job_id: str) -> None: ...
     def open_spec_item(self, job_id: str) -> Any: ...
 
@@ -253,7 +258,7 @@ class JobRunner:
     def on_job_created(self, job_id: str, needs_spec: bool) -> None:
         if needs_spec:
             self._spawn(self.run_coord, job_id)
-        elif self.jobs is not None and self.jobs.flagged_tasks(job_id):
+        elif self.jobs is not None and self.jobs.needs_hidden(job_id):
             # a submitted task that names a runner file: its hidden tests are
             # written in the background, and then the spec is filed
             self._spawn(self._finish_spec, job_id)
@@ -555,6 +560,37 @@ class JobRunner:
         tasks = json.loads(rows[0]["data"]).get("tasks")
         return tasks if isinstance(tasks, dict) else {}
 
+    def busy(self, job_id: str) -> bool:
+        """Whether a run already holds the job (a second start would be dropped)."""
+        with self._running_lock:
+            return job_id in self._running
+
+    def _replan_notes(self, job_id: str) -> list[str]:
+        """The owner's notes, verbatim, oldest first: every note since the last
+        approval, if the latest re-plan carried one (a plain re-plan has none, and an
+        approval closes the notes before it)."""
+        rows = self.store.q(
+            "SELECT data FROM events WHERE job_id=? AND type='replan' ORDER BY id DESC LIMIT 1",
+            (job_id,),
+        )
+        if not rows or not json.loads(rows[0]["data"]).get("note_sha256"):
+            return []
+        return self.store.notes_since_approval(job_id)
+
+    def _amend_context(self, job_id: str) -> tuple[str, str, list[str]] | None:
+        """(the spec to amend, its baseline kind, the owner's notes) when the latest
+        re-plan has a note. The kind is "approved", "approved-pre-versioning" or "draft"."""
+        notes = self._replan_notes(job_id)
+        previous = self.store.get_artifact(job_id, "spec_previous.md")
+        if not notes or previous is None:
+            return None
+        rows = self.store.q(
+            "SELECT data FROM events WHERE job_id=? AND type='replan' ORDER BY id DESC LIMIT 1",
+            (job_id,),
+        )
+        baseline = str(json.loads(rows[0]["data"]).get("baseline") or "draft")
+        return spec_body(previous.content), baseline, notes
+
     def _session_dir(self, session_id: str) -> Path:
         return self.cfg.vigild.data_path / "sessions" / session_id
 
@@ -653,6 +689,7 @@ class JobRunner:
         clone = self.workspace.clone(job.repo, clone_id, branch=branch, base=job.base)
         base_sha = self.workspace.base_sha(clone_id)
         replan = self._replan_context(job_id)
+        amend = self._amend_context(job_id)
         request = {
             "job_id": job_id,
             "repo": job.repo,
@@ -665,6 +702,7 @@ class JobRunner:
             "why": meta.get("why"),
             "value": meta.get("value"),
             "risk": meta.get("risk"),
+            **({"amending": True} if amend else {}),
             **{f"previous_{k}": v for k, v in previous.items()},
         }
         untrusted: dict[str, str] = {}
@@ -676,7 +714,9 @@ class JobRunner:
             }
             untrusted["previous build failures"] = json.dumps(replan, indent=1)[:12000]
         self.workspace.write_task(clone, request)
-        packet = assemble_coord(clone, request, untrusted=untrusted, gate_errors=gate_errors)
+        packet = assemble_coord(
+            clone, request, untrusted=untrusted, gate_errors=gate_errors, amend=amend
+        )
         self.store.add_event(
             "packet",
             {"role": "coord", "attempt": attempt, "dropped": packet.dropped},
@@ -741,8 +781,9 @@ class JobRunner:
         kept = self.store.get_artifact(job_id, "spec.md")
         human = kept is not None and kept.provenance == Provenance.HUMAN.value
         for name in ("spec.md", "plan.md"):
-            if name == "spec.md" and human:
+            if name == "spec.md" and human and amend is None:
                 # a coord never rewrites a human-written spec: a replan re-plans only
+                # (unless the owner's note asks it to amend)
                 assert kept is not None
                 drafts["spec"] = kept.content
                 continue
@@ -752,7 +793,36 @@ class JobRunner:
                 job_id, name, render(name, text, Provenance.CLAUDE), Provenance.CLAUDE
             )
         assert self.jobs is not None
+        if amend is not None:
+            missing = self._store_amendment(job, head, drafts["spec"], amend[1])
+            if missing:
+                return [missing], drafts
         return self.jobs.file_for_approval(job_id), drafts
+
+    def _store_amendment(
+        self, job: Any, head: str, amended: str, baseline: str = "approved"
+    ) -> str | None:
+        """An amendment's record: vigild's diff of the previously approved spec against
+        the amended one, and the coord's changelog, which it must have written (the
+        error to feed back when it did not)."""
+        previous = self.store.get_artifact(job.id, "spec_previous.md")
+        assert previous is not None
+        label = {
+            "approved": "previously approved",
+            "approved-pre-versioning": "approved, pre-versioning",
+        }.get(baseline, "current draft, never approved")
+        diff = redact(spec_diff(previous.content, amended, label))
+        self.store.add_artifact(job.id, "spec_diff.md", diff, Provenance.CLAUDE)
+        log = self.workspace.read_blob(job.repo, head, f".vigil/{job.id}/spec_changelog.md") or ""
+        if not log.strip():
+            return (
+                f"spec_changelog.md is missing or empty: write .vigil/{job.id}/spec_changelog.md "
+                "listing each change you made to the approved spec"
+            )
+        self.store.add_artifact(
+            job.id, "spec_changelog.md", redact(log.strip()[:20_000]) + "\n", Provenance.CLAUDE
+        )
+        return None
 
     # --- stage 1b: hidden tests for a task whose scope names a runner file --------------------
 
@@ -762,8 +832,12 @@ class JobRunner:
         inbox item exists meanwhile); then the spec is filed. An author that
         fails twice leaves the task marked "hidden tests missing"."""
         assert self.jobs is not None
-        flagged = self.jobs.flagged_tasks(job_id)
-        if not flagged or self.jobs.open_spec_item(job_id) is not None:
+        flagged = self.jobs.needs_hidden(job_id)
+        if not flagged:
+            if self.jobs.flagged_tasks(job_id):  # hidden tests off: no author, just file it
+                self.jobs.file_item(job_id)
+            return
+        if self.jobs.open_spec_item(job_id) is not None:
             return  # an ordinary spec is already filed, or this one is: one item per job
         self._author_hidden_tests(job_id, flagged)
         self.jobs.file_item(job_id)
@@ -964,6 +1038,8 @@ class JobRunner:
                 folder=place.folder,
                 vitest=place.vitest,
                 suffix=place.suffix,
+                owner_contract="\n\n".join(author_contract(n) for n in self._replan_notes(job_id))
+                or None,
             )
             self.store.add_event(
                 "packet",
@@ -1353,7 +1429,13 @@ class JobRunner:
         return entry if isinstance(entry, dict) else None
 
     def _runner_note(
-        self, repo: str, base_sha: str, head: str, overlap: list[str], tests: dict[str, Any] | None
+        self,
+        repo: str,
+        base_sha: str,
+        head: str,
+        overlap: list[str],
+        tests: dict[str, Any] | None,
+        hidden_on: bool = True,
     ) -> str:
         """The PR body's plain statement for a runner-file task: the class is
         durable (`runner_file_change`), the owner looks, hidden tests decided."""
@@ -1363,6 +1445,13 @@ class JobRunner:
         moved = [p for p in overlap if p in changed]
         files = ", ".join(f"`{p}`" for p in moved or overlap)
         what = "runner file changed" if moved else "runner file in scope, unchanged"
+        if not hidden_on:
+            return (
+                f"**Owner review required: {what}: {files}.** Hidden tests are disabled "
+                "(host policy), so the verifier's visible-test result is not enough on its "
+                "own: read the runner-file diff yourself. The verifier ran the head's copy "
+                "of only that file and the base's copy of every other runner file.\n\n"
+            )
         hidden = (tests or {}).get("hidden") or {}
         count = (hidden.get("head") or {}).get("tests")
         return (
@@ -1562,8 +1651,15 @@ class JobRunner:
             self.cfg.repo(job.repo).runner_config,
             test_cmd,
         )
-        hidden_entry = self._hidden_entry(job_id, task_id) if overlap else None
-        if overlap and self.verifier.host_key is None:
+        # host policy: off (the default), nothing hidden is looked up, run or tagged, and
+        # the task is verified on its visible tests and goes to the owner as a draft PR
+        hidden_on = (
+            self.jobs.hidden_enabled(job_id)
+            if self.jobs is not None
+            else self.cfg.repo(job.repo).hidden_tests.enabled
+        )
+        hidden_entry = self._hidden_entry(job_id, task_id) if overlap and hidden_on else None
+        if overlap and hidden_on and self.verifier.host_key is None:
             # without the key nothing hidden can count: escalate, never retry forever
             hidden_entry = {"status": "missing", "reason": "VIGIL_HOST_KEY is not set"}
         if test_cmd.strip():
@@ -1586,7 +1682,9 @@ class JobRunner:
                 return self._fail(
                     job_id, s, task_id, f"{task_id}: verifier error", {"error": str(e)[:1000]}
                 )
-            if overlap and "hidden" not in tests:
+            if overlap and not hidden_on:
+                tests["hidden_disabled"] = True
+            elif overlap and "hidden" not in tests:
                 reason = (hidden_entry or {}).get("reason") or "none were written"
                 tests["hidden"] = {"present": False, "reason": reason}
             self.store.add_artifact(
@@ -1639,7 +1737,7 @@ class JobRunner:
             return self._fail(
                 job_id, s, task_id, f"{task_id}: stage 3 acceptance failed", {"errors": errors}
             )
-        runner_note = self._runner_note(job.repo, base_sha, head, overlap, tests)
+        runner_note = self._runner_note(job.repo, base_sha, head, overlap, tests, hidden_on)
         body = (
             f"{report.summary}\n\n{runner_note}Job `{job_id}`, task `{task_id}` (tier `{t.tier}`: "
             f"{t.tier_reason}).\n\nTest: `{contract['spec']['test_cmd']}` "
@@ -1654,7 +1752,11 @@ class JobRunner:
                 base_sha=base_sha,
                 branch=branch,
                 base=job.base,
-                title=f"[vigil {job_id}] {contract['spec']['goal']}",
+                title=(
+                    OWNER_REVIEW_TITLE
+                    if overlap and not hidden_on
+                    else f"[vigil {job_id}] {contract['spec']['goal']}"
+                ),
                 body=body,
                 scope=[
                     *contract["spec"]["files_in_scope"],

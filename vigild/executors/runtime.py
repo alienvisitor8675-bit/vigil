@@ -166,14 +166,25 @@ PREPARE_SUBJECT = (
     "--bounding-set=-all --no-new-privs --'; "
     f"mkdir -m 700 {REPORT_DIR} && chown {{uid}}:{{uid}} {REPORT_DIR} || exit 125; "
     "mkfifo -m 600 /vigil-ipc/queue && chown {uid}:{uid} /vigil-ipc/queue || exit 125; "
+    # every cache, home and temp path the test process uses is made here, as 10001 and
+    # mode 0700: /tmp is world-writable, so a path left for the test to create is one
+    # the subject (10002) could create first and plant code in
+    "for d in /tmp/pycache /tmp/home /tmp/cache /tmp/t-{uid}; do "
+    "mkdir -m 700 $d && chown {uid}:{uid} $d || exit 125; done; "
     # the subject: a copy owned by 10002, mode 0500/0400, in a tmpfs; the mount it
     # came from sits under a root-only directory. The test process (10001) can't read
     # either, so no import of subject code, by any syntax, can succeed in it.
     "cp -a /vigil-src/subject/. /subject/ && chown -R {subj}:{subj} /subject "
     "&& chmod -R u=rX,go= /subject || exit 125; "
-    "sh /vigil/broker.sh & "
+    "VIGIL_TEST_UID={uid} sh /vigil/broker.sh & "
     "if [ -x /usr/local/bin/vigil-prepare ]; then $A /usr/local/bin/vigil-prepare || exit 125; "
     "else $A cp -a /src/. /work/ || exit 125; fi; "
+    # what the prepare step started as the test uid (a database, say) must not outlive it:
+    # the subject shares the loopback. Stop every process of that uid, then check.
+    "$A sh -c 'kill -KILL -1' >/dev/null 2>&1; "
+    "sh /vigil/guard.sh {uid} wait || exit 125; "
+    # `cp -a` gave /work the checkout's mode: it holds the hidden tests, so 10001's only
+    "$A chmod 700 /work || exit 125; "
     "cd /work; "
     '$A bash -o pipefail -o errexit -c "$0"; rc=$?; '
     'printf "\\n%s BEGIN\\n" "$m"; '
@@ -250,10 +261,13 @@ def verifier_kwargs(
         ],
         "tmpfs": {
             "/tmp": f"{tmp},size=2g,mode=1777",  # noqa: S108
-            "/work": f"{tmp},size=4g,mode=0755",
+            # a hidden run's /work holds the hidden tests: the subject has no use for it
+            "/work": f"{tmp},size=4g,mode={'0700' if subject else '0755'}",
             **(
                 {
                     "/vigil-ipc": f"rw,uid={uid},gid={uid},mode=0700,size=64m",  # the queue
+                    # make_fixture's base: the test's, 0711 (10002 traverses, never lists or writes)
+                    "/vigil-fx": f"rw,uid={uid},gid={uid},mode=0711,size=64m",
                     "/vigil-src": "rw,uid=0,gid=0,mode=0700,size=1m",  # root-only
                     "/subject": f"rw,exec,uid={SUBJECT_UID},gid={SUBJECT_UID},mode=0700,size=2g",
                 }
@@ -270,7 +284,16 @@ def verifier_kwargs(
             "NO_COLOR": "1",
             "PYTEST_ADDOPTS": f"--junitxml={REPORT_DIR}/pytest.xml -p no:cacheprovider",
             "pnpm_config_verify_deps_before_run": "false",
-            **({"VIGIL_SUBJECT": "/subject", "VIGIL_BROKER": "/vigil-ipc"} if subject else {}),
+            **(
+                {
+                    "VIGIL_SUBJECT": "/subject",
+                    "VIGIL_BROKER": "/vigil-ipc",
+                    "VIGIL_FIXTURES": "/vigil-fx",
+                    "TMPDIR": f"/tmp/t-{uid}",  # noqa: S108  (made by PID 1, 10001's, 0700)
+                }
+                if subject
+                else {}
+            ),
             **(env or {}),
         },
         "stdin_open": True,  # the report marker, then closed
@@ -287,7 +310,7 @@ def write_kit(dest: Path) -> Path:
     from the repo itself) for the container to mount read-only at /vigil."""
     src = Path(__file__).resolve().parents[1] / "hiddenkit"
     dest.mkdir(parents=True, exist_ok=True)
-    for name in ("broker.sh", "run.sh"):
+    for name in ("broker.sh", "run.sh", "guard.sh"):
         target = dest / name
         target.write_text((src / name).read_text())
         target.chmod(0o644)

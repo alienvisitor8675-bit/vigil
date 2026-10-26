@@ -245,7 +245,35 @@ not changed.
 A runner file is one that decides how tests run (`runner_config` in
 `configs/repos.yaml`, or a script the `test_cmd` runs). When a spec's scope
 names one (ParkAgent's `scripts/check-feature-map.mjs`, vigil's `conftest.py`),
-the class is flagged and handled differently:
+the class is flagged and handled differently.
+
+**Hidden tests are disabled until ADR-0003's work merges** (`docs/decisions/ADR-0003-hidden-tests-threat-model.md`). `hidden_tests.enabled` is
+off for every repo (`RepoPolicy.hidden_tests` in vigild's `configs/repos.yaml`; a target
+repo cannot set it; `vigil doctor` shows it per repo). Today, then:
+
+- No hidden-test author runs, nothing is reserved for one, no hidden run happens, and
+  `VIGIL_HOST_KEY` is not needed.
+- A flagged task is built and verified on its visible tests, then opens a draft PR titled
+  "Owner review required: runner file changed; hidden tests disabled" whose body lists
+  the runner files. Read the runner-file diff yourself: you are the oracle. You merge as
+  always. The spec item says hidden tests are disabled for the task.
+- Nothing escalates for want of hidden tests.
+- **Replan with a note** works whatever the switch says. When the spec is not right but
+  not wrong enough to throw away, send it back from the spec item (or from a failed
+  build's page) with a note, 8 KB at most. The coord amends the approved spec and lists
+  what it changed; the new item shows that list and a diff. It is never an approval.
+  ```sh
+  curl -sS -X POST -H "Authorization: Bearer $VIGIL_API_TOKEN" -H 'Content-Type: application/json' \
+    -d "$(jq -n --rawfile note note.md '{note: $note}')" \
+    http://127.0.0.1:8787/api/inbox/<item id>/replan
+  ```
+  Over 8 KB is refused (413); an empty note is refused (422); the spec item's replan
+  needs a note. (With the switch on, the hidden-test author also gets the amended spec
+  and the lines of your note under an item or heading with the word "author" in its
+  title, or the whole note if none has it.)
+
+The rest of this section describes what the code does **if the switch is turned on**; it
+is not in use, and its sandbox is under review in ADR-0003, so it states no guarantee.
 
 - **At spec time** vigild runs a fresh Sonnet session (the hidden-test author,
   up to $1, twice at most) before the spec reaches your inbox. The job stays
@@ -266,9 +294,8 @@ the class is flagged and handled differently:
   (`conftest.py`, `pytest.ini`, `vitest.config.*`, ...) no author runs: the spec
   item says "owner review only" and the task escalates. A hidden-test file that
   imports in-scope code is rejected and regenerated once. In the verifier the code
-  under test lives in a copy only uid 10002 can read, and runs as that uid through a small root-owned broker, in
-  its own process group that is killed when the call ends, so it can't touch the
-  JUnit report or the test process. The dev image needs `setpriv` (util-linux);
+  under test runs as another uid through a small root-owned broker (see ADR-0003 for
+  the open work on this). The dev image needs `setpriv` (util-linux);
   without it a hidden run is `unknown` and the task escalates.
 - **The host key.** Hidden tests only count with a key only you create, once:
   `printf 'VIGIL_HOST_KEY=%s\n' "$(openssl rand -hex 32)" >> ~/.config/vigil/env`
@@ -282,6 +309,10 @@ the class is flagged and handled differently:
   script (`pnpm -C server test <that directory>`). If the config can't be read
   (projects/workspace, no include that fits) the task shows "hidden tests
   missing" and can only escalate.
+- **Fixtures.** The hidden-test helpers' `make_fixture({"dir/a.txt": "text"})`
+  (`makeFixture` in vitest) returns a fresh directory under `/vigil-fx`, a tmpfs owned by
+  the test's uid, with directories at 0755 and files at 0644, for the code under test to
+  read. The helpers are the way a hidden test makes a fixture.
 - **If vigild restarts while the author runs** the inbox shows "vigild restarted
   while the hidden-test author was writing"; retry runs the author step only.
   A hidden run that crashes while the author's tests are checked shows the task

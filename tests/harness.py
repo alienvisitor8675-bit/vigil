@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -116,6 +117,8 @@ class LocalTestRunner:
         reports = Path(tempfile.mkdtemp(prefix="vigil-report-"))
         env = {
             **os.environ,
+            # the interpreter running the tests brings its own pytest: no PATH needed
+            "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}",
             "PYTEST_ADDOPTS": f"--junitxml={reports}/pytest.xml -p no:cacheprovider",
             **({"VIGIL_SUBJECT": str(subject)} if subject else {}),
             **(env or {}),

@@ -10,6 +10,7 @@ Every piece of work runs inside a job, and every job waits in
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Callable
@@ -31,6 +32,7 @@ from vigild.intake.spec_gate import check_job_spec, check_task, runner_files_nam
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import InboxItem, Job, JobState
+from vigild.jobs.ownernote import NOTE_MAX_BYTES
 from vigild.metering.calls import session_cost
 from vigild.provenance import Provenance
 from vigild.router.rules import RoutingError, route
@@ -42,6 +44,7 @@ class Runner(Protocol):
     def on_approved(self, job_id: str) -> None: ...
     def on_resume(self, job_id: str, *, replan: bool = False) -> None: ...
     def on_rebuild(self, repo: str, base_sha: str) -> None: ...
+    def busy(self, job_id: str) -> bool: ...
 
 
 class SubmitError(ValueError):
@@ -56,6 +59,14 @@ class NotFound(KeyError):
 
 class Conflict(ValueError):
     pass
+
+
+class BadNote(ValueError):
+    """A replan note that is empty, not text, or missing where one is required."""
+
+
+class NoteTooLarge(ValueError):
+    """A replan note over NOTE_MAX_BYTES."""
 
 
 @dataclass
@@ -310,13 +321,35 @@ class JobService:
                 out[w.task_id] = hit
         return out
 
+    def _hidden_frozen(self, job_id: str) -> dict[str, bool]:
+        """The host switch as it is when the spec is gated: recorded in `spec_gate.json`,
+        so what is built and verified follows the spec the owner approved."""
+        return {"hidden_tests_enabled": self._hidden_live(job_id)}
+
+    def _hidden_live(self, job_id: str) -> bool:
+        return self.cfg.repo(self.store.get_job(job_id).repo).hidden_tests.enabled
+
+    def hidden_enabled(self, job_id: str) -> bool:
+        """Whether hidden tests apply to this job: the value frozen at its spec gate,
+        or, for a job gated before the freeze existed, the live host policy."""
+        art = self.store.get_artifact(job_id, "spec_gate.json")
+        frozen = json.loads(art.content).get("hidden_tests_enabled") if art else None
+        return frozen if isinstance(frozen, bool) else self._hidden_live(job_id)
+
+    def needs_hidden(self, job_id: str) -> dict[str, list[str]]:
+        """`flagged_tasks`, but only when the host policy turns hidden tests on for
+        the job's repo: off, nothing waits for an author."""
+        if not self.hidden_enabled(job_id):
+            return {}
+        return self.flagged_tasks(job_id)
+
     def file_for_approval(self, job_id: str) -> list[str]:
         """Run the job spec gate on the stored spec and plan, and file the inbox
         item. A job with a runner-file task is not filed here: the runner's
         author writes its hidden tests first (it never blocks a submit), then
         calls `file_item`."""
         errors = self.gate_spec(job_id)
-        if errors or self.flagged_tasks(job_id):
+        if errors or self.needs_hidden(job_id):
             return errors
         self.file_item(job_id)
         return []
@@ -332,7 +365,7 @@ class JobService:
         self.store.add_artifact(
             job_id,
             "spec_gate.json",
-            json.dumps({"ok": not errors, "errors": errors}),
+            json.dumps({"ok": not errors, "errors": errors, **self._hidden_frozen(job_id)}),
             Provenance.HUMAN,
         )
         if errors:
@@ -346,7 +379,14 @@ class JobService:
             self.store.add_artifact(
                 job_id,
                 "spec_gate.json",
-                json.dumps({"ok": True, "errors": [], "runner_file_change": flagged}),
+                json.dumps(
+                    {
+                        "ok": True,
+                        "errors": [],
+                        "runner_file_change": flagged,
+                        **self._hidden_frozen(job_id),
+                    }
+                ),
                 Provenance.HUMAN,
             )
         return []
@@ -377,6 +417,34 @@ class JobService:
                 return it
         return None
 
+    def _hidden_view(self, job_id: str, entry: dict[str, Any] | None) -> dict[str, Any]:
+        """What the spec item says of a flagged task's hidden tests."""
+        if not self.hidden_enabled(job_id):
+            return {
+                "status": "disabled",
+                "note": "hidden tests are disabled (host policy); the task is built on its "
+                "visible tests and opens a draft PR for your review",
+            }
+        return public_view(entry or {})
+
+    def _amendment(self, job_id: str) -> dict[str, Any]:
+        """What the coord changed in the previously approved spec, for the spec item:
+        the coord's changelog and vigild's diff, only while they belong to the spec
+        on file (a later redraft has a newer spec than the diff)."""
+        spec = self.store.get_artifact(job_id, "spec.md")
+        diff = self.store.get_artifact(job_id, "spec_diff.md")
+        log = self.store.get_artifact(job_id, "spec_changelog.md")
+        note = self.store.get_artifact(job_id, "owner_note.md")
+        if spec is None or diff is None or log is None or note is None or diff.id < spec.id:
+            return {}
+        return {
+            "amendment": {
+                "changelog": log.content,
+                "diff": diff.content,
+                "note_bytes": len(note.content.encode()),
+            }
+        }
+
     def _file_item(self, job_id: str) -> None:
         plan = self.store.get_artifact(job_id, "plan.md")
         spec = self.store.get_artifact(job_id, "spec.md")
@@ -396,6 +464,9 @@ class JobService:
             f"Approve spec: {job.title}",
             {
                 "repo": job.repo,
+                # approve, or send it back with a note (never an approval)
+                "actions": ["approve", "replan"],
+                **self._amendment(job_id),
                 "spend": self._stage_spend(job_id),
                 "why": intake.get("why"),
                 "value": intake.get("value"),
@@ -416,7 +487,7 @@ class JobService:
                         # categories only) and an owner look
                         "runner_file_change": flagged.get(w.task_id, []),
                         **(
-                            {"hidden_tests": public_view(hidden.get(w.task_id) or {})}
+                            {"hidden_tests": self._hidden_view(job_id, hidden.get(w.task_id))}
                             if w.task_id in flagged
                             else {}
                         ),
@@ -530,27 +601,89 @@ class JobService:
         self._offered(item_id, "retry")
         return self.resume(item_id)
 
-    def replan(self, item_id: int) -> Job:
-        """Send a held job back to the coord, with the failures in its packet."""
-        with self.store.tx():
-            item = self._offered(item_id, "replan")
-            assert item.job_id is not None
+    def replan(self, item_id: int, note: str | None = None) -> Job:
+        """Send a job back to the coord. A held job (a failed build) goes back with
+        the failures in the packet; a job waiting on its spec item goes back only
+        with a note (the spec item's "replan with note": never an approval, the job
+        stays `spec_pending`). With a note the coord amends the previously approved
+        spec instead of redrafting it: the note is the owner's, stored verbatim."""
+        if note is not None:
+            if not isinstance(note, str) or not note.strip():
+                raise BadNote("the note must be non-empty text")
             try:
-                job = transition(
-                    self.store, item.job_id, JobState.SPEC_PENDING, Actor.OWNER,
-                    channel="inbox", evidence={"inbox_item_id": item_id, "action": "replan"},
-                )  # fmt: skip
-            except TransitionError as e:
-                raise Conflict(str(e)) from e
-            self.store.add_event(
-                "replan",
-                {"inbox_item_id": item_id, "tasks": item.body.get("tasks") or {}},
-                Provenance.HUMAN,
-                job_id=job.id,
-            )
-            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+                size = len(note.encode())
+            except UnicodeEncodeError as e:  # a lone surrogate is not text
+                raise BadNote("the note is not valid text") from e
+            if size > NOTE_MAX_BYTES:
+                raise NoteTooLarge(f"the note is over {NOTE_MAX_BYTES} bytes")
+        with self.store.tx():
+            try:
+                peek = self.store.get_inbox_item(item_id)
+            except KeyError as e:
+                raise NotFound(item_id) from e
+            if peek.job_id is not None and self.runner.busy(peek.job_id):
+                raise Conflict(f"{peek.job_id} is being worked on; try again in a moment")
+            if peek.queue == "specs":
+                job = self._replan_spec(peek, note)
+            else:
+                item = self._offered(item_id, "replan")
+                assert item.job_id is not None
+                try:
+                    job = transition(
+                        self.store, item.job_id, JobState.SPEC_PENDING, Actor.OWNER,
+                        channel="inbox", evidence={"inbox_item_id": item_id, "action": "replan"},
+                    )  # fmt: skip
+                except TransitionError as e:
+                    raise Conflict(str(e)) from e
+                self._record_replan(job.id, item_id, note, item.body.get("tasks") or {})
+                self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
         self.runner.on_resume(job.id, replan=True)
         return job
+
+    def _replan_spec(self, item: InboxItem, note: str | None) -> Job:
+        """The spec item's "replan with note": the job is already `spec_pending`, where
+        the coord drafts, so no state changes; it is not the owner's approval."""
+        if item.status != "open" or item.kind != "spec" or item.job_id is None:
+            raise Conflict(f"inbox item {item.id} is not an open spec to replan")
+        if note is None:
+            raise BadNote("replanning a spec needs a note")
+        job = self.store.get_job(item.job_id)
+        if job.state is not JobState.SPEC_PENDING:
+            raise Conflict(f"{job.id} is {job.state.value}, not spec_pending")
+        self._record_replan(job.id, item.id, note, {})
+        self.store.resolve_inbox_item(item.id, Actor.OWNER.value)
+        return job
+
+    def _record_replan(
+        self, job_id: str, item_id: int, note: str | None, tasks: dict[str, Any]
+    ) -> None:
+        """The replan event and, with a note, its artifacts: the note itself (human),
+        and the spec it amends: the spec as of the last approval, or, if the job was
+        never approved, the current draft (labelled so). Notes accumulate until an
+        approval closes them."""
+        data: dict[str, Any] = {"inbox_item_id": item_id, "tasks": tasks}
+        if note is not None:
+            self.store.add_artifact(job_id, "owner_note.md", note, Provenance.HUMAN)
+            data |= {
+                "note_bytes": len(note.encode()),
+                "note_sha256": hashlib.sha256(note.encode()).hexdigest(),
+            }
+            approval = self.store.get_artifact(job_id, "approval.json")
+            spec = (
+                self.store.get_artifact(job_id, "spec.md")
+                if approval is None
+                else self.store.spec_before(job_id, approval.id)
+            )
+            data["baseline"] = "draft" if approval is None else "approved"
+            if spec is None and approval is not None:
+                # approved before specs were versioned: the one on file, said so
+                spec = self.store.get_artifact(job_id, "spec.md")
+                data["baseline"] = "approved-pre-versioning"
+            if spec is not None:
+                self.store.add_artifact(
+                    job_id, "spec_previous.md", spec.content, Provenance(spec.provenance)
+                )
+        self.store.add_event("replan", data, Provenance.HUMAN, job_id=job_id)
 
     def abandon(self, item_id: int) -> Job:
         """Give the job up: nothing more runs; open PRs stay for you to close."""

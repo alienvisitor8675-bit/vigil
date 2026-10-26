@@ -29,6 +29,12 @@ JOB_ARTIFACTS = {
     "approval.json",
     "verify.json",
     "close.md",
+    # a replan with an owner note: the note (human), the spec it amends, the coord's
+    # changelog, and vigild's diff of the two
+    "owner_note.md",
+    "spec_previous.md",
+    "spec_changelog.md",
+    "spec_diff.md",
 }
 TASK_ARTIFACTS = {
     "worker_report.json",

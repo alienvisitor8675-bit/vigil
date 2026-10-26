@@ -59,6 +59,9 @@ class NullRunner:
     def on_rebuild(self, repo: str, base_sha: str) -> None:
         log.info("dev image rebuild for %s asked; no runner attached", repo)
 
+    def busy(self, job_id: str) -> bool:
+        return False
+
 
 @dataclass
 class Vigild:

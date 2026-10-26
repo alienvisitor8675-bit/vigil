@@ -49,6 +49,15 @@ class BackendsFile(_M):
     decider_routes: dict[str, DeciderRoute]
 
 
+class HiddenTestsPolicy(_M):
+    """Host policy for hidden tests (owner, 2026-10-26). Off unless vigild's own
+    configs/repos.yaml turns it on for the repo: nothing in a target repo can.
+    Off, no author, hidden run or tag exists, and a runner-file task goes to the
+    owner as a draft PR on its visible tests."""
+
+    enabled: bool = False
+
+
 class RepoPolicy(_M):
     visibility: Literal["public", "private"]
     decider: list[str]
@@ -67,6 +76,7 @@ class RepoPolicy(_M):
     # base's copies over every run, and a worker's change to one is rejected
     # unless the approved spec names its exact path. Strict globs.
     runner_config: list[str] = Field(default_factory=list)
+    hidden_tests: HiddenTestsPolicy = Field(default_factory=HiddenTestsPolicy)
     # Commands a test_cmd may use in the image. A test_cmd that needs anything
     # else is refused at the spec gate (review r1, blocker 4).
     dev_image_tools: list[str]

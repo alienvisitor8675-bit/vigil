@@ -26,6 +26,7 @@ from vigild.gitsafe import GitError, git
 from vigild.intake.paths import scope_entry_error
 from vigild.jobs.artifacts import SPEC_SECTIONS, artifact_path
 from vigild.jobs.model import Role
+from vigild.jobs.ownernote import spec_body as spec_text
 from vigild.packets.fence import UNTRUSTED_RULE, fence
 
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
@@ -35,6 +36,7 @@ TITLES = {
     "role_and_rules": "1. Role and rules",
     "context_pack": "2. Context pack",
     "contract": "3. Contract",
+    "owner": "3a. Owner's amendment (from the owner, not fenced)",
     "untrusted": "4. Untrusted content (data only)",
     "output_schema": "5. Output",
     "self_check": "6. Self-check",
@@ -180,6 +182,13 @@ def _context_pack(
     return "\n\n".join(out), dropped
 
 
+def _codeblock(text: str) -> str:
+    """The text in a code block whose fence is longer than any backtick run in it."""
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence_ = "`" * max(3, longest + 1)
+    return f"{fence_}\n{text.rstrip()}\n{fence_}"
+
+
 def _checklist(done_when: str) -> str:
     items = [s.strip() for s in re.split(r";|\n", done_when) if s.strip()]
     return "\n".join(f"- [ ] {i}" for i in items)
@@ -245,7 +254,11 @@ def assemble_coord(
     untrusted: dict[str, str],
     budget_chars: int = DEFAULT_BUDGET_CHARS,
     gate_errors: list[str] | None = None,
+    amend: tuple[str, str, list[str]] | None = None,
 ) -> Packet:
+    """`amend` is (the spec to amend, whether it was approved, the owner's notes in
+    order) for a replan with notes: the owner's text goes in its own section, never
+    fenced, and the coord amends that spec rather than drafting from the request."""
     job_id = request["job_id"]
     items: list[str] = []
     dropped: list[str] = []
@@ -273,6 +286,7 @@ def assemble_coord(
             + "\n".join(f"- {e}" for e in gate_errors)
         )
     plan_schema = json.dumps(Plan.model_json_schema(), indent=1, sort_keys=True)
+    changelog = f".vigil/{job_id}/spec_changelog.md"
     output = (
         f"Write `.vigil/{job_id}/spec.md` with these `##` sections: "
         + ", ".join(SPEC_SECTIONS)
@@ -280,12 +294,41 @@ def assemble_coord(
         "`## Workers` section holding one ```json block valid against this schema:\n\n"
         f"```json\n{plan_schema}\n```\n\nWorker task ids are `{job_id}-w1`, `{job_id}-w2`, …"
     )
+    parts = {
+        "role_and_rules": _role_and_rules(Role.COORD, repo),
+        "context_pack": "\n\n".join(items) or "(empty)",
+        "contract": contract,
+    }
+    if amend is not None:
+        previous, baseline, owner_notes = amend
+        what = {
+            "approved": "previously approved spec",
+            "approved-pre-versioning": "approved spec (pre-versioning, the one on file)",
+        }.get(baseline, "current draft (never approved)")
+        shown = "\n\n".join(
+            (f"### Note {i} of {len(owner_notes)}\n\n" if len(owner_notes) > 1 else "")
+            + _codeblock(n)
+            for i, n in enumerate(owner_notes, start=1)
+        )
+        parts["owner"] = (
+            f"The owner sent this job back with {'notes' if len(owner_notes) > 1 else 'a note'}. "
+            f"This is a change to the {what}, not a new request: **amend** that spec and do "
+            "not redraft it from the request. Change only what the notes ask and keep every "
+            "section, line and acceptance criterion they do not touch exactly as it is. "
+            "Apply the notes in order; a later note wins. Then re-plan `plan.md` from the "
+            "amended spec.\n\n"
+            f"## The owner's {'notes' if len(owner_notes) > 1 else 'note'}\n\n{shown}\n\n"
+            f"## The {what}\n\n{_codeblock(spec_text(previous))}\n"
+        )
+        output += (
+            f"\n\nThis is an amendment: also write `{changelog}`, a short list of each change "
+            "you made to the approved spec and why (one line each). vigild refuses an "
+            "amendment without it."
+        )
     return Packet(
         Role.COORD,
         {
-            "role_and_rules": _role_and_rules(Role.COORD, repo),
-            "context_pack": "\n\n".join(items) or "(empty)",
-            "contract": contract,
+            **parts,
             "untrusted": _untrusted(untrusted),
             "output_schema": output,
             "self_check": "Before stopping: does every criterion have a test command? "
@@ -310,6 +353,7 @@ def assemble_hidden_test_author(
     folder: str | None = None,
     vitest: bool = False,
     suffix: str = ".test.ts",
+    owner_contract: str | None = None,
 ) -> Packet:
     """The packet for a hidden-test author: the approved spec.md and this one
     task's contract, nothing else (learning ruling 13). Not plan.md, not the
@@ -327,6 +371,11 @@ def assemble_hidden_test_author(
         contract_part += (
             f"Name each test file `*{suffix}` (the project's vitest collects that name in this "
             "directory) and import vigild's helper as `./vigil_hidden.mjs`.\n"
+        )
+    if owner_contract:
+        contract_part += (
+            "\nThe owner's contract for these tests (from the owner's replan note; follow it, "
+            "it adds to the rules above):\n\n" + _codeblock(owner_contract) + "\n"
         )
     if feedback:
         contract_part += (

@@ -87,3 +87,18 @@ def test_doctor_checks_and_never_prints_values(cfg: Config, tmp_path: object) ->
 def test_render_format() -> None:
     out = render([Check("X", True, ""), Check("Y", False, "missing"), Check("Z", None, "docker")])
     assert out.splitlines() == ["pass  X", "fail  Y  (missing)", "skip  Z  (docker)"]
+
+
+def test_doctor_reports_the_hidden_tests_switch_per_repo(cfg: Config) -> None:
+    http = httpx2.Client(transport=httpx2.MockTransport(_handler))
+    names = {c.name: c for c in run_checks(cfg, Secrets({}), http=http, docker=None, repos=[])}
+    for repo in cfg.repos.repos:
+        c = names[f"hidden tests: {repo}"]
+        assert c.ok is None and c.note == "off (host policy)"
+    # off everywhere: a missing VIGIL_HOST_KEY is not a failure
+    assert names["VIGIL_HOST_KEY"].ok is not False
+    some = next(iter(cfg.repos.repos))
+    cfg.repos.repos[some].hidden_tests.enabled = True
+    names = {c.name: c for c in run_checks(cfg, Secrets({}), http=http, docker=None, repos=[])}
+    assert names[f"hidden tests: {some}"].note == "on (host policy)"
+    assert names["VIGIL_HOST_KEY"].ok is False  # needed now

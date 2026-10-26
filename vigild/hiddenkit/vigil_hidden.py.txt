@@ -8,7 +8,10 @@ or `call_subject` (a function, called by a separate vigild-owned driver
 process). The subject never runs in this process, and in the verifier it never
 runs as this process's uid either: $VIGIL_BROKER names vigild's root-owned
 broker, which runs every subject as uid 10002 in its own process group and
-kills the group when the call ends (vigild/hiddenkit/broker.sh)."""
+kills the group when the call ends (vigild/hiddenkit/broker.sh).
+
+A fixture a test builds for the subject to read comes only from `make_fixture`:
+the subject (uid 10002) can read it at every level and can never write it."""
 
 import json
 import os
@@ -21,6 +24,13 @@ import tempfile
 _SUBJECT = os.environ.get("VIGIL_SUBJECT", "")
 _BROKER = os.environ.get("VIGIL_BROKER", "")
 _KEEP = ("PATH", "LANG", "LC_ALL", "TZ")
+_FIXTURES = os.environ.get("VIGIL_FIXTURES", "")
+_RUN_SH = os.environ.get("VIGIL_RUN_SH", "/vigil/run.sh")
+
+
+class SubjectRefused(RuntimeError):
+    """The broker refused to run the subject (it never ran). This is not a subject
+    exit and not an assertion failure: a test that gets it has no result."""
 _DRIVER = r"""
 import json, os, signal, subprocess, sys, tempfile
 nonce = sys.stdin.readline().strip()
@@ -49,12 +59,14 @@ import base64
 boot = 'import sys,base64;exec(base64.b64decode(sys.argv[1]))'
 b64 = base64.b64encode(CHILD.encode()).decode()
 rfd, rpath = tempfile.mkstemp(prefix="vigil-res-")
+qfd, qpath = tempfile.mkstemp(prefix="vigil-refused-")
+run_sh = os.environ.get("VIGIL_RUN_SH", "/vigil/run.sh")
 keep = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "TZ") if k in os.environ}
 payload = json.dumps({"cwd": spec["cwd"], "calls": spec["calls"]}).encode()
 if broker:
-    cmd = ["sh", "/vigil/run.sh", spec["cwd"], str(spec["timeout"]), rpath, "--",
+    cmd = ["sh", run_sh, spec["cwd"], str(spec["timeout"]), rpath, "--",
            sys.executable, "-I", "-c", boot, b64, "3"]
-    env = {"PATH": keep.get("PATH", ""), "VIGIL_BROKER": broker,
+    env = {"PATH": keep.get("PATH", ""), "VIGIL_BROKER": broker, "VIGIL_REFUSED": qpath,
            "VIGIL_SUBJ_ENV": "\n".join(f"{k}={v}" for k, v in keep.items())}
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, env=env, start_new_session=True)
@@ -76,6 +88,9 @@ finally:
 os.close(rfd)
 data = open(rpath, "rb").read(8 << 20)
 os.unlink(rpath)
+refused = open(qpath, errors="replace").read(2000).strip()
+os.close(qfd)
+os.unlink(qpath)
 results, malformed = [], False
 for line in data.decode(errors="replace").splitlines():
     try:
@@ -89,7 +104,7 @@ if p.returncode in (124, 137) and len(results) != len(spec["calls"]):
     timed_out = True
 if len(results) != len(spec["calls"]) and not timed_out:
     malformed = True
-print(nonce + " " + json.dumps({"results": results, "malformed": malformed, "timed_out": timed_out, "exit": p.returncode}))
+print(nonce + " " + json.dumps({"results": results, "malformed": malformed, "timed_out": timed_out, "exit": p.returncode, "refused": refused}))
 """
 
 
@@ -97,6 +112,57 @@ def check(condition, message="assertion failed"):
     """The only way a hidden test asserts. A failure carries vigild's per-task tag."""
     if not condition:
         raise AssertionError(f"[vigil-tag:{os.environ['VIGIL_HIDDEN_TAG']}] {message}")
+
+
+def _fixture_base():
+    """The directory every fixture is made under. In the verifier it is vigild's
+    /vigil-fx (made by root, owned by this process's uid, mode 0755, so the subject
+    can traverse it and nothing in it is the subject's to write). Elsewhere, a
+    fresh 0755 directory of its own."""
+    if not _FIXTURES:
+        base = tempfile.mkdtemp(prefix="vigil-fx-")
+        os.chmod(base, 0o755)
+        return base
+    if os.path.islink(_FIXTURES) or not os.path.isdir(_FIXTURES):
+        raise ValueError(f"the fixture base {_FIXTURES!r} is not a real directory")
+    return _FIXTURES
+
+
+def make_fixture(files):
+    """Make a fresh directory holding `files` ({relative path: text}) and return its
+    path. Directories are 0755 and files 0644 whatever the umask, so the subject
+    (uid 10002 in the verifier) can read every level and cannot write any of it.
+    Absolute paths, `..`, empty or `.` parts, and a path that is both a file and a
+    directory are refused (ValueError) before anything is made."""
+    names = set()
+    dirs = set()
+    for rel in files:
+        if not isinstance(rel, str) or not rel or "\0" in rel or rel.startswith("/"):
+            raise ValueError(f"unsafe fixture path {rel!r}")
+        parts = rel.split("/")
+        if any(p in ("", ".", "..") for p in parts):
+            raise ValueError(f"unsafe fixture path {rel!r}")
+        names.add(rel)
+        dirs.update("/".join(parts[:i]) for i in range(1, len(parts)))
+    if names & dirs:
+        raise ValueError(f"a fixture path is both a file and a directory: {sorted(names & dirs)}")
+    root = tempfile.mkdtemp(prefix="fx-", dir=_fixture_base())
+    os.chmod(root, 0o755)
+    for d in sorted(dirs, key=lambda x: x.count("/")):
+        path = os.path.join(root, d)
+        os.mkdir(path, 0o755)
+        os.chmod(path, 0o755)
+    for rel, text in files.items():
+        data = text if isinstance(text, bytes) else str(text).encode()
+        fd = os.open(
+            os.path.join(root, rel), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644
+        )
+        try:
+            os.write(fd, data)
+            os.fchmod(fd, 0o644)
+        finally:
+            os.close(fd)
+    return root
 
 
 def _root():
@@ -122,17 +188,36 @@ def _subject_env(extra=None):
 
 def _start(cmd, cwd, extra_env, timeout):
     """Popen arguments for a subject: through the broker (uid 10002) when there is
-    one, else directly (outside the verifier)."""
+    one, else directly (outside the verifier). The last item is the file the broker's
+    client writes a refusal's reason to ('' when there is no broker)."""
     env = _subject_env(extra_env)
     if _BROKER:
+        fd, refused = tempfile.mkstemp(prefix="vigil-refused-")
+        os.close(fd)
         wrapper_env = {
             "PATH": os.environ.get("PATH", ""),
             "VIGIL_BROKER": _BROKER,
+            "VIGIL_REFUSED": refused,
             "VIGIL_SUBJ_ENV": "\n".join(f"{k}={v}" for k, v in env.items()),
         }
-        return ["sh", "/vigil/run.sh", cwd, str(timeout), "-", "--", *cmd], os.getcwd(), wrapper_env
+        argv = ["sh", _RUN_SH, cwd, str(timeout), "-", "--", *cmd]
+        return argv, os.getcwd(), wrapper_env, refused
     env["HOME"] = tempfile.mkdtemp(prefix="vigil-subject-")
-    return list(cmd), cwd, env
+    return list(cmd), cwd, env, ""
+
+
+def _refusal(path):
+    """The broker's reason for refusing a call, if it refused ('' otherwise)."""
+    if not path:
+        return ""
+    try:
+        with open(path, errors="replace") as f:
+            return f.read(2000).strip()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _run(argv, cwd, env, stdin, timeout):
@@ -158,8 +243,11 @@ def run_subject(cmd, *, cwd=".", env=None, input=None, timeout=60):
     """Run a command in the read-only subject checkout, in its own process (as
     uid 10002, in the verifier), with a minimal environment. Returns a dict:
     returncode, stdout, stderr."""
-    argv, wcwd, wenv = _start(cmd, _cwd(cwd), env, timeout)
+    argv, wcwd, wenv, refused = _start(cmd, _cwd(cwd), env, timeout)
     code, out, err, timed_out = _run(argv, wcwd, wenv, input or "", timeout)
+    reason = _refusal(refused)
+    if reason:
+        raise SubjectRefused(reason)
     check(not timed_out and code != 124, f"{cmd!r} timed out after {timeout}s")
     return {"returncode": code, "stdout": out, "stderr": err}
 
@@ -185,6 +273,7 @@ def call_subject_batch(calls, *, cwd=".", timeout=60):
     drv_env["HOME"] = spec["home"]
     if _BROKER:
         drv_env["VIGIL_BROKER"] = _BROKER
+        drv_env["VIGIL_RUN_SH"] = _RUN_SH
     code, out, err, timed_out = _run(
         [sys.executable, "-I", "-c", _DRIVER], os.getcwd(), drv_env, payload, timeout + 60
     )
@@ -195,6 +284,8 @@ def call_subject_batch(calls, *, cwd=".", timeout=60):
         frame = json.loads(frames[0][len(nonce) + 1 :])
     except ValueError:
         check(False, "the driver's frame is not JSON")
+    if frame.get("refused"):
+        raise SubjectRefused(frame["refused"])
     check(not frame["malformed"], "the subject wrote a malformed result stream")
     check(not frame["timed_out"], f"the subject timed out after {timeout}s")
     check(len(frame["results"]) == len(calls), "the subject returned the wrong number of results")

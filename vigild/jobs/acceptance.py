@@ -45,7 +45,7 @@ NO_HIDDEN = "runner file task: no hidden tests, so it cannot pass"
 def escalates(tests: dict[str, Any] | None) -> bool:
     """A runner-file task whose hidden tests don't exist: it is built and
     reported, never accepted; the owner decides (owner ruling, 2026-10-23)."""
-    if not tests or not tests.get("runner_files"):
+    if not tests or not tests.get("runner_files") or tests.get("hidden_disabled"):
         return False
     return not (tests.get("hidden") or {}).get("files")
 
@@ -55,7 +55,7 @@ def hidden_errors(tests: dict[str, Any]) -> list[str]:
     they failed on the base, pass on the head, head ran no fewer. The messages
     carry counts and reasons, never a test's name or output: they reach the
     owner's page and a re-plan's context."""
-    if not tests.get("runner_files"):
+    if not tests.get("runner_files") or tests.get("hidden_disabled"):
         return []
     hidden = tests.get("hidden") or {}
     if escalates(tests):

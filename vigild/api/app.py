@@ -22,7 +22,7 @@ from vigild.api.auth import (
     require,
 )
 from vigild.db import Store
-from vigild.jobs.service import Conflict, JobRequest, NotFound, SubmitError
+from vigild.jobs.service import BadNote, Conflict, JobRequest, NoteTooLarge, NotFound, SubmitError
 from vigild.jobs.tree import job_tree
 from vigild.services import Services
 
@@ -203,7 +203,7 @@ def resume(request: Request, item_id: int) -> dict[str, Any]:
 def _act(request: Request, item_id: int, action: str) -> dict[str, Any]:
     jobs = _svc(request).jobs
     try:
-        job = {"retry": jobs.retry, "replan": jobs.replan, "abandon": jobs.abandon}[action](item_id)
+        job = {"retry": jobs.retry, "abandon": jobs.abandon}[action](item_id)
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
@@ -218,9 +218,27 @@ def retry(request: Request, item_id: int) -> dict[str, Any]:
 
 
 @router.post("/api/inbox/{item_id}/replan", dependencies=[ADMIN])
-def replan(request: Request, item_id: int) -> dict[str, Any]:
-    """A blocked job goes back to its coord, with the failures in the packet."""
-    return _act(request, item_id, "replan")
+def replan(
+    request: Request, item_id: int, body: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
+    """A blocked job goes back to its coord, with the failures in the packet. With
+    {"note": "..."} (8 KB at most, kept verbatim as the owner's text) the coord
+    amends the previously approved spec instead of redrafting it. A spec item's
+    "replan with note" is the same call, and requires the note."""
+    note = (body or {}).get("note")
+    if note is not None and not isinstance(note, str):
+        raise HTTPException(422, "note must be text")
+    try:
+        job = _svc(request).jobs.replan(item_id, note)
+    except NotFound as e:
+        raise HTTPException(404, "no such inbox item") from e
+    except NoteTooLarge as e:
+        raise HTTPException(413, str(e)) from e
+    except BadNote as e:
+        raise HTTPException(422, str(e)) from e
+    except Conflict as e:
+        raise HTTPException(409, str(e)) from e
+    return {"job_id": job.id, "state": job.state.value}
 
 
 @router.post("/api/inbox/{item_id}/abandon", dependencies=[ADMIN])

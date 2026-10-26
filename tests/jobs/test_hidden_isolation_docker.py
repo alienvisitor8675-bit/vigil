@@ -159,6 +159,7 @@ def dworld(
         dev_suites={"smoke": "python -m pytest --version"},
         dev_image_tools=["git", "grep", "python", "pytest"],
         runner_config=["tools/check.py"],
+        hidden_tests={"enabled": True},  # the switch is off by default
     )
     store = Store.open(":memory:")
     budget = Budget(store, cfg.budgets)

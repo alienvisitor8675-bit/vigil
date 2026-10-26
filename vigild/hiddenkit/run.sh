@@ -52,6 +52,10 @@ while [ ! -f "$d/rc" ]; do
 		exit 124
 	fi
 done
+# a refusal is not the subject's exit: say so out of band (the caller reads this file)
+if [ -f "$d/refused" ] && [ -n "${VIGIL_REFUSED:-}" ]; then
+	cat "$d/err" > "$VIGIL_REFUSED"
+fi
 cat "$d/out"
 cat "$d/err" >&2
 if [ "$fd3" != "-" ] && [ -f "$d/fd3" ]; then

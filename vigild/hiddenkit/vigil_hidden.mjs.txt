@@ -7,14 +7,31 @@
 // `callSubject` (a function, called by a separate vigild-owned driver process).
 // In the verifier every subject runs as uid 10002 through vigild's root-owned
 // broker ($VIGIL_BROKER), in its own process group, killed when the call ends.
+//
+// A fixture a test builds for the subject to read comes only from `makeFixture`:
+// the subject (uid 10002) can read it at every level and can never write it.
 import { spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { mkdtempSync, realpathSync } from 'node:fs'
+import {
+  chmodSync, closeSync, constants, fchmodSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync,
+  realpathSync, rmSync, writeFileSync, writeSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 const SUBJECT = process.env.VIGIL_SUBJECT || ''
 const BROKER = process.env.VIGIL_BROKER || ''
+const FIXTURES = process.env.VIGIL_FIXTURES || ''
+const RUN_SH = process.env.VIGIL_RUN_SH || '/vigil/run.sh'
+
+/** The broker refused to run the subject (it never ran). Not a subject exit and not
+ *  an assertion failure: a test that gets it has no result. */
+export class SubjectRefused extends Error {
+  constructor(reason) {
+    super(reason)
+    this.name = 'SubjectRefused'
+  }
+}
 const KEEP = ['PATH', 'LANG', 'LC_ALL', 'TZ']
 
 const CHILD = String.raw`
@@ -42,7 +59,7 @@ for (const c of spec.calls) {
 
 const DRIVER = String.raw`
 import { spawnSync } from 'node:child_process'
-import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs'
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 const lines = readFileSync(0, 'utf8').split('\n')
@@ -55,13 +72,16 @@ const broker = process.env.VIGIL_BROKER || ''
 const BOOT = ['--input-type=module', '-e', "await import('data:text/javascript;base64,' + process.argv[1])", Buffer.from(CHILD_SRC).toString('base64')]
 const dir = mkdtempSync(path.join(tmpdir(), 'vigil-res-'))
 const rpath = path.join(dir, 'results')
+const qpath = path.join(dir, 'refused')
+writeFileSync(qpath, '')
+const RUN_SH = process.env.VIGIL_RUN_SH || '/vigil/run.sh'
 const input = JSON.stringify({ cwd: spec.cwd, calls: spec.calls })
 let p
 if (broker) {
   const senv = Object.entries(keep).map(([k, v]) => k + '=' + v).join('\n')
   openSync(rpath, 'w')
-  p = spawnSync('sh', ['/vigil/run.sh', spec.cwd, String(spec.timeout), rpath, '--', process.execPath, ...BOOT], {
-    input, env: { PATH: keep.PATH || '', VIGIL_BROKER: broker, VIGIL_SUBJ_ENV: senv },
+  p = spawnSync('sh', [RUN_SH, spec.cwd, String(spec.timeout), rpath, '--', process.execPath, ...BOOT], {
+    input, env: { PATH: keep.PATH || '', VIGIL_BROKER: broker, VIGIL_REFUSED: qpath, VIGIL_SUBJ_ENV: senv },
     killSignal: 'SIGKILL', maxBuffer: 16 << 20, // the broker times the call
 
   })
@@ -79,6 +99,8 @@ let malformed = false
 const results = []
 let out3 = ''
 try { out3 = readFileSync(rpath, 'utf8') } catch (e) {}
+let refused = ''
+try { refused = readFileSync(qpath, 'utf8').slice(0, 2000).trim() } catch (e) {}
 rmSync(dir, { recursive: true, force: true })
 for (const line of out3.split('\n')) {
   if (!line) continue
@@ -91,7 +113,7 @@ for (const line of out3.split('\n')) {
   }
 }
 if (results.length !== spec.calls.length && !timedOut) malformed = true
-console.log(nonce + ' ' + JSON.stringify({ results, malformed, timed_out: timedOut, exit: p.status }))
+console.log(nonce + ' ' + JSON.stringify({ results, malformed, timed_out: timedOut, exit: p.status, refused }))
 `
 
 export function check(condition, message = 'assertion failed') {
@@ -100,6 +122,55 @@ export function check(condition, message = 'assertion failed') {
     e.name = 'AssertionError'
     throw e
   }
+}
+
+function fixtureBase() {
+  // In the verifier: vigild's /vigil-fx (made by root, owned by this process's uid,
+  // mode 0755). Elsewhere: a fresh 0755 directory of its own.
+  if (!FIXTURES) {
+    const base = mkdtempSync(path.join(tmpdir(), 'vigil-fx-'))
+    chmodSync(base, 0o755)
+    return base
+  }
+  let st = null
+  try { st = lstatSync(FIXTURES) } catch (e) { st = null }
+  if (!st || st.isSymbolicLink() || !st.isDirectory()) throw new Error('the fixture base is not a real directory')
+  return FIXTURES
+}
+
+/** Make a fresh directory holding `files` ({ 'relative/path': text }) and return its
+ *  path. Directories are 0755 and files 0644 whatever the umask, so the subject
+ *  (uid 10002 in the verifier) can read every level and cannot write any of it.
+ *  Absolute paths, `..`, empty or `.` parts, and a path that is both a file and a
+ *  directory throw, before anything is made. */
+export function makeFixture(files) {
+  const names = new Set()
+  const dirs = new Set()
+  for (const rel of Object.keys(files)) {
+    if (!rel || rel.includes('\0') || rel.startsWith('/')) throw new Error('unsafe fixture path ' + JSON.stringify(rel))
+    const parts = rel.split('/')
+    if (parts.some((p) => p === '' || p === '.' || p === '..')) throw new Error('unsafe fixture path ' + JSON.stringify(rel))
+    names.add(rel)
+    for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join('/'))
+  }
+  for (const n of names) if (dirs.has(n)) throw new Error('a fixture path is both a file and a directory: ' + n)
+  const root = mkdtempSync(path.join(fixtureBase(), 'fx-'))
+  chmodSync(root, 0o755)
+  for (const d of [...dirs].sort((a, b) => a.split('/').length - b.split('/').length)) {
+    mkdirSync(path.join(root, d), { mode: 0o755 })
+    chmodSync(path.join(root, d), 0o755)
+  }
+  for (const [rel, text] of Object.entries(files)) {
+    const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW
+    const fd = openSync(path.join(root, rel), flags, 0o644)
+    try {
+      writeSync(fd, typeof text === 'string' || Buffer.isBuffer(text) ? text : String(text))
+      fchmodSync(fd, 0o644)
+    } finally {
+      closeSync(fd)
+    }
+  }
+  return root
 }
 
 function root() {
@@ -129,12 +200,15 @@ export function runSubject(cmd, { cwd = '.', env = {}, input, timeout = 60 } = {
   const senv = subjectEnv(env)
   let argv
   let opts
+  let refusedPath = ''
   if (BROKER) {
-    argv = ['sh', '/vigil/run.sh', dir, String(timeout), '-', '--', ...cmd]
+    refusedPath = path.join(mkdtempSync(path.join(tmpdir(), 'vigil-refused-')), 'reason')
+    writeFileSync(refusedPath, '')
+    argv = ['sh', RUN_SH, dir, String(timeout), '-', '--', ...cmd]
     opts = {
       cwd: process.cwd(),
       env: {
-        PATH: process.env.PATH || '', VIGIL_BROKER: BROKER,
+        PATH: process.env.PATH || '', VIGIL_BROKER: BROKER, VIGIL_REFUSED: refusedPath,
         VIGIL_SUBJ_ENV: Object.entries(senv).map(([k, v]) => k + '=' + v).join('\n'),
       },
     }
@@ -146,6 +220,12 @@ export function runSubject(cmd, { cwd = '.', env = {}, input, timeout = 60 } = {
   const p = spawnSync(argv[0], argv.slice(1), {
     ...opts, input: input === undefined ? '' : input, encoding: 'utf8', killSignal: 'SIGKILL', maxBuffer: 16 << 20,
   })
+  if (refusedPath) {
+    let reason = ''
+    try { reason = readFileSync(refusedPath, 'utf8').slice(0, 2000).trim() } catch (e) {}
+    try { rmSync(path.dirname(refusedPath), { recursive: true, force: true }) } catch (e) {}
+    if (reason) throw new SubjectRefused(reason)
+  }
   check(!(p.error && p.error.code === 'ETIMEDOUT') && p.status !== 124, JSON.stringify(cmd) + ' timed out after ' + timeout + 's')
   return { returncode: p.status, stdout: p.stdout || '', stderr: p.stderr || '' }
 }
@@ -163,7 +243,7 @@ export function callSubjectBatch(calls, { cwd = '.', timeout = 60 } = {}) {
   const driver = DRIVER.replace('CHILD_SRC', () => JSON.stringify(CHILD)).replace('CHILD_SRC', () => JSON.stringify(CHILD))
   const denv = subjectEnv()
   denv.HOME = spec.home
-  if (BROKER) denv.VIGIL_BROKER = BROKER
+  if (BROKER) { denv.VIGIL_BROKER = BROKER; denv.VIGIL_RUN_SH = RUN_SH }
   const p = spawnSync(process.execPath, ['--input-type=module', '-e', driver], {
     input: nonce + '\n' + JSON.stringify(spec), env: denv, encoding: 'utf8',
     timeout: BROKER ? undefined : (timeout + 60) * 1000, killSignal: 'SIGKILL', maxBuffer: 16 << 20,
@@ -177,6 +257,7 @@ export function callSubjectBatch(calls, { cwd = '.', timeout = 60 } = {}) {
   } catch (e) {
     check(false, "the driver's frame is not JSON")
   }
+  if (frame.refused) throw new SubjectRefused(frame.refused)
   check(!frame.malformed, 'the subject wrote a malformed result stream')
   check(!frame.timed_out, 'the subject timed out after ' + timeout + 's')
   check(frame.results.length === calls.length, 'the subject returned the wrong number of results')
