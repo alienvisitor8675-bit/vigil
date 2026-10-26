@@ -248,6 +248,7 @@ unmetered, before #16.
 | 2.9 | **Lean retries.** A retry starts from the spec, the plan and the failure categories, not the full history. *Untiered; placed here.* | `vigild/jobs/runner.py` |
 | 2.10 | **Spend-rate alert.** Page when hourly spend exceeds 3× the trailing median, separately from the caps. *Untiered; placed here.* | `vigild/breakers.py` |
 | 2.11 | **Docs-freshness check.** After a merge, flag any doc layer that cites changed code, and file it as `vigil:proposed`. This merges with 2.6's staleness score: one check. *Untiered; placed here.* | `vigild/docs/staleness.py` |
+| 2.12 | **Replan changelog lists the resolved risks it removed.** When a replan amends a spec, the changelog also names every risk it dropped because it has since been answered. Phase 1 run: the coord kept three stale risks (owner, 2026-10-26). *Untiered by the owner; placed here.* | `vigild/jobs/runner.py` (amend path) |
 
 ### Tier 3: trigger-gated
 
