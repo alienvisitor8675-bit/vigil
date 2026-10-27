@@ -412,6 +412,28 @@ is not in use, and its sandbox is under review in ADR-0003, so it states no guar
   hidden tests were shown to a model" does not fire on its own account; pasting
   them into a session would count.
 
+### Send a ready PR back with findings
+
+A job's review can come back clean while the audit lists findings the reviewer missed,
+and the *Ready to merge* item then has no merge-blocking finding to act on. The item
+lists, per PR, every review and audit finding as `selectable` (ids `review:N` and
+`audit:N`, or the plain `index`). To send the PR back, pick the ones to fix and add a
+note if you like (8 KB at most):
+
+```sh
+curl -sS -X POST -H "Authorization: Bearer $VIGIL_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"task_id": "pa-0003-w1", "findings": ["audit:0", "audit:1"], "note": "Docs only."}' \
+  http://127.0.0.1:8787/api/inbox/<ready item id>/fix
+```
+
+The task's worker fixes them on the same branch and PR (the standard fix round: verifier,
+re-review and re-audit follow) and a new *Ready to merge* item appears, or a page if the
+round fails. It runs on what is left of the task's cap (`max_cost_usd` or $2, whichever
+is less, minus its spend); under $0.05 left the call is refused with a 409 saying so.
+It is also refused (409) for a merged or closed PR, a job that isn't ready, or findings
+that aren't the task's; over 8 KB of note is a 413. Each owner fix counts as a review
+round, so the second trips routing rule 5 as any fix round does.
+
 ### Check everything
 
 ```sh

@@ -179,6 +179,17 @@ def _findings(c: Ctx) -> list[str]:
     return [] if c.evidence.get("findings") else ["going back to building needs review findings"]
 
 
+def _owner_fix(c: Ctx) -> list[str]:
+    """The owner, from the inbox, sends a reviewed PR back with findings they chose
+    ("fix with findings"); the standard fix round follows."""
+    errs: list[str] = []
+    if c.actor is not Actor.OWNER or c.channel != "inbox":
+        errs.append("only the owner, from the inbox, sends a ready job back for a fix")
+    if c.evidence.get("action") != "fix":
+        errs.append("a fix from ready needs action=fix")
+    return [*errs, *_findings(c)]
+
+
 def _reviews_clean(c: Ctx) -> list[str]:
     """Stage 5 and 6 acceptance: every live task has a valid, clean review.json
     (an empty or invalid one fails), and where the review was sampled for
@@ -250,6 +261,7 @@ EDGES: dict[tuple[JobState, JobState], Guard] = {
     (S.IN_REVIEW, S.BUILDING): _findings,
     (S.IN_REVIEW, S.READY): lambda c: [*_reviews_clean(c), *_ready_has_prs(c), *_pr_trees_clean(c)],
     (S.READY, S.MERGED): _merged,
+    (S.READY, S.BUILDING): _owner_fix,
     (S.IN_REVIEW, S.MERGED): _merged_by_hand,
     (S.MERGED, S.VERIFYING): _none,
     (S.VERIFYING, S.DONE): _verified,

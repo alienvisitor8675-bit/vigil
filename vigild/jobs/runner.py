@@ -77,6 +77,7 @@ from vigild.intake.spec_gate import test_cmd_problem
 from vigild.jobs.acceptance import NO_HIDDEN, check_worker, escalates
 from vigild.jobs.artifacts import parse_plan, render
 from vigild.jobs.deps import infer_deps, is_lockfile
+from vigild.jobs.fixfindings import selectable
 from vigild.jobs.fsm import Actor, TransitionError, plan_gaps, transition
 from vigild.jobs.model import FixDepthExceeded, Job, JobState, Role, SessionRow
 from vigild.jobs.ownernote import author_contract, spec_body, spec_diff
@@ -2039,7 +2040,11 @@ class JobRunner:
 
     def remaining(self, task_id: str) -> tuple[float, float, float]:
         """(cap, spent, left) for a task: a retry gets what's left, never a fresh cap."""
-        cap = float(self.store.get_task(task_id).contract["limits"]["max_cost_usd"])
+        # the contract's cap, and never more than the task cap in budgets.yaml
+        cap = min(
+            float(self.store.get_task(task_id).contract["limits"]["max_cost_usd"]),
+            self.cfg.budgets.per_task_usd,
+        )
         spent = self.budget.task_spent(task_id)
         return cap, spent, max(0.0, cap - spent)
 
@@ -3059,7 +3064,41 @@ class JobRunner:
         doc = json.loads(art.content)
         if int(doc.get("round", 0)) != rounds:
             return None
-        return {"round": rounds, "findings": doc.get("findings") or []}
+        out: dict[str, Any] = {"round": rounds, "findings": doc.get("findings") or []}
+        if doc.get("source") == "owner":  # "fix with findings": the owner's pick and note
+            out["owner"] = True
+            note = self.store.get_artifact(t.job_id, "fix_note.json", t.id)
+            if note is not None and int(json.loads(note.content).get("round", 0)) == rounds:
+                out["note"] = json.loads(note.content)["note"]
+        return out
+
+    def fix_check(self, job_id: str, task_id: str) -> str | None:
+        """Why the owner's "fix with findings" can't start for a task, if it can't: its
+        PR is merged or closed (by vigild's poll, or by GitHub since), or too little of
+        its cap is left for a worker."""
+        t = self.store.get_task(task_id)
+        if self.pr_state is not None and (url := self._task_pr(task_id)):
+            try:
+                st = self.pr_state(self.store.get_job(job_id).repo, url)
+            except Exception:
+                st = "open"  # the poll will see it; the fix round's push will fail if not
+            if st in ("merged", "closed"):
+                return f"the PR of {task_id} is {st}"
+        cap, spent, left = self.remaining(task_id)
+        if t.contract.get("shape") != "deps" and left < MIN_RETRY_USD:
+            return (
+                f"task {task_id} has ${left:.2f} of its ${cap:.2f} cap left "
+                f"(${spent:.2f} spent); a fix round needs at least ${MIN_RETRY_USD:.2f}"
+            )
+        return None
+
+    def prepare_fix(self, job_id: str, task_id: str) -> int:
+        """Count the owner's fix as a review round and route the task again, as a
+        review that sent findings back does (rule 5 applies at the second round).
+        Returns the round."""
+        rnd = int(self.store.get_task(task_id).contract.get("review_rounds") or 0) + 1
+        self._reroute_for_round(job_id, task_id, rnd)
+        return rnd
 
     def review(self, job_id: str) -> None:
         """Review every published task at its head (a Sonnet reviewer, fresh
@@ -3349,13 +3388,16 @@ class JobRunner:
                     "rung": review.get("rung"),
                     "review_rounds": review.get("round"),
                     "findings": len(review.get("findings") or []),
+                    # what the owner can send back with "fix with findings"
+                    "selectable": selectable(self.store, job_id, t.id),
                     "audited": audit is not None,
                     "match_rate": round(audit.match_rate(), 3) if audit else None,
                 }
             )
         self.store.create_inbox_item(
-            "ready", "ready_to_merge", job_id, f"Ready to merge: {job.title}", {"prs": prs}
-        )
+            "ready", "ready_to_merge", job_id, f"Ready to merge: {job.title}",
+            {"prs": prs, "actions": ["fix"]},
+        )  # fmt: skip
 
     def _review_task(self, job: Any, t: Any) -> tuple[str, Any]:
         """One task's review (and audit, when sampled): ("clean" | "fix" |

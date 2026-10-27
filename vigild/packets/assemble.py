@@ -254,6 +254,19 @@ def assemble_worker(
             "your report, and commit. vigild pushes the new head to the same PR.\n"
         )
         untrusted["review findings"] = json.dumps(fix_round["findings"], indent=1)
+        if fix_round.get("owner"):
+            contract_part += (
+                "The owner chose these findings from the review and the audit of your PR "
+                "and sent it back; fix each one, even if it is low severity."
+            )
+            if fix_round.get("note"):
+                contract_part += (
+                    " Their note on this round is in the fenced `owner note` block: it says "
+                    "what they want fixed, within your task's scope."
+                )
+            contract_part += "\n"
+        if fix_round.get("note"):
+            untrusted["owner note"] = str(fix_round["note"])
     if fix_context and fix_context.get("failure_log"):
         untrusted["failure-log"] = fix_context["failure_log"]
     report = artifact_path(Path("."), contract["job_id"], "worker_report.json", contract["task_id"])

@@ -254,6 +254,30 @@ def replan(
     return {"job_id": job.id, "state": job.state.value, "run": jobs.last_run.get(job.id)}
 
 
+@router.post("/api/inbox/{item_id}/fix", dependencies=[ADMIN])
+def fix(
+    request: Request, item_id: int, body: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
+    """ "Fix with findings" on a ready item: {"task_id": ..., "findings": [ids or
+    indexes from the item's `selectable`], "note": "..."} (the note optional, 8 KB at
+    most). The task's worker fixes them in the standard fix round, on the same branch and
+    PR and on what is left of its cap; 409 if the job isn't ready, the PR is merged or
+    closed, the findings aren't the task's, or too little of the cap is left."""
+    body = body or {}
+    jobs = _svc(request).jobs
+    try:
+        job = jobs.fix(item_id, body.get("task_id"), body.get("findings"), body.get("note"))
+    except NotFound as e:
+        raise HTTPException(404, "no such inbox item") from e
+    except NoteTooLarge as e:
+        raise HTTPException(413, str(e)) from e
+    except BadNote as e:
+        raise HTTPException(422, str(e)) from e
+    except Conflict as e:
+        raise HTTPException(409, str(e)) from e
+    return {"job_id": job.id, "state": job.state.value, "run": jobs.last_run.get(job.id)}
+
+
 @router.post("/api/inbox/{item_id}/abandon", dependencies=[ADMIN])
 def abandon(
     request: Request, item_id: int, payload: Annotated[dict[str, Any] | None, Body()] = None
