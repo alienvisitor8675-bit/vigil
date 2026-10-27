@@ -310,7 +310,7 @@ def test_replan_with_a_note_from_the_spec_item_amends_the_draft_and_is_no_approv
     _arm(w)
     r = _replan(w, item)
     assert r.status_code == 200, r.text
-    assert r.json() == {"job_id": job, "state": "spec_pending"}
+    assert r.json() == {"job_id": job, "state": "spec_pending", "run": "started"}
     # the old item is closed and a new one is filed; it is not an approval
     assert w.store.get_inbox_item(item["id"]).status == "resolved"
     new = _spec_item(w)
@@ -571,3 +571,11 @@ def test_a_replan_while_the_runner_holds_the_job_is_refused_before_the_item_reso
         w.runner._running.discard(job)
     _arm(w)
     assert _replan(w, item).status_code == 200
+
+
+def test_the_coord_prompt_says_scope_paths_have_no_trailing_slash() -> None:
+    # pa-0003: the first draft failed the spec gate on `server/src/` and `docs/`
+    from pathlib import Path
+
+    text = (Path(__file__).parents[2] / "prompts" / "coord.md").read_text()
+    assert "no trailing slash" in text and "out_of_scope" in text

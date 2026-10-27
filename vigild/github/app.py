@@ -179,4 +179,10 @@ class GitHubApp:
             )
         if r.status_code != 200:
             raise GitHubError(f"reading {repo} failed (HTTP {r.status_code})")
-        return bool(r.json()["private"])
+        try:
+            answer = r.json().get("private")
+        except ValueError, AttributeError:
+            answer = None
+        # only a JSON true or false is an answer; null, a string or a missing
+        # key count as private (review A3)
+        return answer if isinstance(answer, bool) else True

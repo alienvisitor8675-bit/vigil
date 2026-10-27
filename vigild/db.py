@@ -35,6 +35,32 @@ from vigild.redact import redact
 
 PROV = "provenance TEXT NOT NULL CHECK (provenance IN ('claude','local','human'))"
 
+# Phase 2a: each new table's DDL is a constant, used by SCHEMA (a new
+# database) and by its migration step (an old one).
+LADDER_DDL = f"""CREATE TABLE IF NOT EXISTS ladder (
+  shape TEXT PRIMARY KEY, rung INTEGER NOT NULL, window_from INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL, reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS audits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, task_id TEXT NOT NULL,
+  shape TEXT NOT NULL, rung INTEGER NOT NULL, verify_level INTEGER NOT NULL,
+  match_rate REAL NOT NULL, missed_high INTEGER NOT NULL, missed_medium INTEGER NOT NULL,
+  false_findings INTEGER NOT NULL, ts TEXT NOT NULL, {PROV})"""
+
+INTAKE_DDL = """CREATE TABLE IF NOT EXISTS intake_seen (
+  repo TEXT NOT NULL, number INTEGER NOT NULL, job_id TEXT, seen_at TEXT NOT NULL,
+  PRIMARY KEY (repo, number))"""
+
+TRANSCRIPT_DDL = f"""CREATE TABLE IF NOT EXISTS transcripts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, sdk_session_id TEXT NOT NULL,
+  subpath TEXT, entry TEXT NOT NULL, ts TEXT NOT NULL, {PROV});
+CREATE INDEX IF NOT EXISTS transcripts_session ON transcripts(session_id, id)"""
+
+BREAKER_DDL = """CREATE TABLE IF NOT EXISTS breakers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, scope TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('closed','open','half_open')), count INTEGER NOT NULL,
+  item_id INTEGER, held TEXT NOT NULL, detail TEXT NOT NULL, reopen_at TEXT,
+  updated_at TEXT NOT NULL, UNIQUE (kind, scope))"""
+
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY, repo TEXT NOT NULL, base TEXT NOT NULL, title TEXT NOT NULL,
@@ -95,6 +121,10 @@ CREATE TABLE IF NOT EXISTS dev_images (
 CREATE TABLE IF NOT EXISTS ui_sessions (
   id_hash TEXT PRIMARY KEY, scope TEXT NOT NULL, created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL, revoked_at TEXT);
+{LADDER_DDL};
+{INTAKE_DDL};
+{TRANSCRIPT_DDL};
+{BREAKER_DDL};
 CREATE INDEX IF NOT EXISTS events_job ON events(job_id, id);
 CREATE INDEX IF NOT EXISTS calls_session ON model_calls(session_id);
 CREATE INDEX IF NOT EXISTS res_day ON reservations(day, status);
@@ -165,12 +195,95 @@ def _m5_scrub_private_keys(conn: sqlite3.Connection) -> None:
             conn.execute(f"UPDATE {table} SET {col}=?{extra} WHERE rowid=?", (*args, row[0]))  # noqa: S608
 
 
+def _create(conn: sqlite3.Connection, ddl: str) -> None:
+    """CREATE statements one at a time (executescript would commit the
+    migration's transaction)."""
+    for stmt in filter(str.strip, ddl.split(";")):
+        conn.execute(stmt)
+
+
+def _m6_trust_ladder(conn: sqlite3.Connection) -> None:
+    """Phase 2a, item 1: the ladder's live rungs and the audits that move them."""
+    _create(conn, LADDER_DDL)
+
+
+def _m7_label_intake(conn: sqlite3.Connection) -> None:
+    """Phase 2a, item 2: each labelled issue becomes a job exactly once."""
+    _create(conn, INTAKE_DDL)
+
+
+def _m8_transcripts(conn: sqlite3.Connection) -> None:
+    """Phase 2a, items 2-3: every session's transcript, for resume and forks."""
+    _create(conn, TRANSCRIPT_DDL)
+
+
+def _m9_breakers(conn: sqlite3.Connection) -> None:
+    """Phase 2a, item 4: one table for every circuit breaker."""
+    _create(conn, BREAKER_DDL)
+
+
+JEV_DRIFT_DDL = """CREATE TABLE IF NOT EXISTS jev_drift (
+  route TEXT NOT NULL, version TEXT NOT NULL, pin TEXT NOT NULL, item_id INTEGER,
+  first_seen TEXT NOT NULL, PRIMARY KEY (route, version))"""
+
+
+def _m10_live_visibility(conn: sqlite3.Connection) -> None:
+    """Owner, 2026-10-23: a session's token keeps the visibility read live at
+    dispatch; each Jev version drift pages once."""
+    _add_columns(conn, "gateway_tokens", {"private": "INTEGER"})
+    _create(conn, JEV_DRIFT_DDL)
+
+
+# A provenance column added to an existing table needs a default: these rows
+# are vigild's own records, which it tags `human` like its events.
+PROV_ADDED = "TEXT NOT NULL DEFAULT 'human' CHECK (provenance IN ('claude','local','human'))"
+
+LADDER_CHANGES_DDL = f"""CREATE TABLE IF NOT EXISTS ladder_changes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, shape TEXT NOT NULL, old_rung INTEGER NOT NULL,
+  new_rung INTEGER NOT NULL, reason TEXT NOT NULL, sample_size INTEGER NOT NULL,
+  match_rate REAL, ts TEXT NOT NULL, {PROV});
+CREATE INDEX IF NOT EXISTS ladder_changes_shape ON ladder_changes(shape, id)"""
+
+
+def _m11_round2(conn: sqlite3.Connection) -> None:
+    """2a round 2: provenance on the four phase 2a tables (review B14); the
+    repo on every model call, for the per-repo fallback cap (owner ruling 4);
+    each decision's question type (ruling 6); one row per rung change
+    (ruling 1)."""
+    for table in ("ladder", "intake_seen", "breakers", "jev_drift"):
+        _add_columns(conn, table, {"provenance": PROV_ADDED})
+    _add_columns(conn, "model_calls", {"repo": "TEXT"})
+    _add_columns(conn, "decisions", {"kind": "TEXT NOT NULL DEFAULT ''"})
+    _create(conn, LADDER_CHANGES_DDL)
+
+
+def _m12_issue_link(conn: sqlite3.Connection) -> None:
+    """A job's GitHub issue, as a column (owner, 2026-10-27): intake asks "does a
+    live job already carry this issue?" in one indexed query, which an artifact
+    could not answer. Jobs from before carry none (NULL); text is never parsed.
+    The partial unique index is the guard: one job per (repo, issue) that isn't
+    abandoned, enforced by the database, so a race or a second API call cannot
+    make two. (Merged and done jobs count: follow-up work is a new job.)"""
+    _add_columns(conn, "jobs", {"issue": "INTEGER"})
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS jobs_live_issue ON jobs(repo, issue)"
+        " WHERE issue IS NOT NULL AND state != 'abandoned'"
+    )
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
     _m3_job_blocked_on,
     _m4_call_truncated,
     _m5_scrub_private_keys,
+    _m6_trust_ladder,
+    _m7_label_intake,
+    _m8_transcripts,
+    _m9_breakers,
+    _m10_live_visibility,
+    _m11_round2,
+    _m12_issue_link,
 ]
 
 
@@ -255,6 +368,7 @@ class Store:
         source: str = "human",
         parent_job_id: str | None = None,
         provenance: Provenance | str = Provenance.HUMAN,
+        issue: int | None = None,
     ) -> Job:
         depth = 0
         if parent_job_id:
@@ -269,7 +383,7 @@ class Store:
             c.execute(
                 "INSERT INTO jobs (id, repo, base, title, request, notes, source, state,"
                 " blocked_from, parent_job_id, fix_depth, coord_session_id, created_at,"
-                " updated_at, provenance) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " updated_at, provenance, issue) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     job_id,
                     repo,
@@ -286,9 +400,23 @@ class Store:
                     now,
                     now,
                     require(provenance).value,
+                    issue,
                 ),
             )
         return self.get_job(job_id)
+
+    def live_job_for_issue(self, repo: str, issue: int) -> str | None:
+        """The id of the job of `repo` holding GitHub issue `issue` (any state but
+        abandoned), if there is one; the unique index `jobs_live_issue` allows one."""
+        rows = self.q(
+            "SELECT id FROM jobs WHERE repo=? AND issue=? AND state != 'abandoned'", (repo, issue)
+        )
+        return str(rows[0]["id"]) if rows else None
+
+    def jobs_for_issue(self, repo: str, issue: int) -> list[Job]:
+        """Jobs of `repo` that carry GitHub issue `issue`, oldest first."""
+        rows = self.q("SELECT id FROM jobs WHERE repo=? AND issue=? ORDER BY id", (repo, issue))
+        return [self.get_job(r["id"]) for r in rows]
 
     def get_job(self, job_id: str) -> Job:
         rows = self.q("SELECT * FROM jobs WHERE id=?", (job_id,))
@@ -312,6 +440,7 @@ class Store:
             updated_at=r["updated_at"],
             provenance=r["provenance"],
             blocked_on=r["blocked_on"],
+            issue=r["issue"],
         )
 
     def list_jobs(self) -> list[Job]:
@@ -509,6 +638,44 @@ class Store:
             " tokens_out=tokens_out+? WHERE id=?",
             (cost, tokens_in, tokens_out, session_id),
         )
+
+    # --- transcripts (phase 2a) -----------------------------------------------
+
+    def add_transcript(
+        self,
+        session_id: str,
+        sdk_session_id: str,
+        subpath: str | None,
+        entries: list[Any],
+        provenance: Provenance | str = Provenance.CLAUDE,
+    ) -> None:
+        """Transcript lines the harness mirrored from the SDK (its session
+        store), in order. Entries are opaque JSON; the SDK reads them back."""
+        now, prov = iso(), require(provenance).value
+        with self.tx() as c:
+            c.executemany(
+                "INSERT INTO transcripts (session_id, sdk_session_id, subpath, entry, ts,"
+                " provenance) VALUES (?,?,?,?,?,?)",
+                [(session_id, sdk_session_id, subpath, json.dumps(e), now, prov) for e in entries],
+            )
+
+    def transcript(self, session_id: str) -> tuple[str | None, list[Any]]:
+        """A session's main transcript (no subagents): the SDK session id it
+        last wrote under, and that session's entries in order."""
+        rows = self.q(
+            "SELECT sdk_session_id FROM transcripts WHERE session_id=? AND subpath IS NULL"
+            " ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        )
+        if not rows:
+            return None, []
+        sdk = str(rows[0]["sdk_session_id"])
+        entries = self.q(
+            "SELECT entry FROM transcripts WHERE session_id=? AND sdk_session_id=?"
+            " AND subpath IS NULL ORDER BY id",
+            (session_id, sdk),
+        )
+        return sdk, [json.loads(r["entry"]) for r in entries]
 
     # --- events -------------------------------------------------------------
 

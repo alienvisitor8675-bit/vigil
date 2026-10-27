@@ -21,7 +21,11 @@ from __future__ import annotations
 import json
 import re
 import tomllib
-from typing import Any
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Protocol
 
 from vigild.contract.models import DepRequest
 
@@ -81,3 +85,362 @@ def infer_deps(path: str, base_text: str | None, head_text: str | None) -> list[
         for pkg, ver in sorted(after.items())
         if before.get(pkg) != ver
     ]
+
+
+# --- phase 2a, item 5: the deps job ----------------------------------------------------------
+
+MIN_AGE_DAYS = 14
+PACKAGE = re.compile(r"^(@[a-z0-9][a-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]{0,213}$")
+EXACT = re.compile(r"^[0-9][0-9A-Za-z.+!-]{0,63}$")
+UV_LOCK, PNPM_LOCK = "uv.lock", "pnpm-lock.yaml"
+LOCKFILE_OF = {"pypi": UV_LOCK, "npm": PNPM_LOCK}
+
+
+def check_requests(lockfiles: list[str], deps: list[DepRequest]) -> list[str]:
+    """The deps job's spec gate: each request an exact version of a plain
+    package name, in an ecosystem whose lockfile the repo's dev image installs."""
+    errors: list[str] = []
+    if not deps:
+        errors.append("no dependency requested")
+    names = {p.rsplit("/", 1)[-1] for p in lockfiles}
+    for d in deps:
+        if not PACKAGE.match(d.package):
+            errors.append(f"{d.package!r} is not a package name")
+        if not EXACT.match(d.version):
+            errors.append(f"{d.package}: {d.version!r} is not an exact version")
+        if LOCKFILE_OF[d.ecosystem] not in names:
+            errors.append(f"{d.package}: the repo has no {LOCKFILE_OF[d.ecosystem]} to update")
+    return errors
+
+
+def uv_exclude_newer(lock_text: str | None) -> str | None:
+    """The cutoff a uv.lock was resolved with (`[options] exclude-newer`)."""
+    try:
+        doc = tomllib.loads(lock_text or "")
+    except tomllib.TOMLDecodeError:
+        return None
+    value = (doc.get("options") or {}).get("exclude-newer")
+    return str(value) if value else None
+
+
+def update_command(deps: list[DepRequest], exclude_newer: str | None = None) -> str:
+    """The package manager's lockfile-only update, as one shell line. A uv
+    lock's own cutoff is passed back, so the lock keeps its options (the 2a
+    done-when's reviewer caught `uv add` dropping it)."""
+    import shlex
+
+    parts: list[str] = []
+    py = [f"{d.package}=={d.version}" for d in deps if d.ecosystem == "pypi"]
+    js = [f"{d.package}@{d.version}" for d in deps if d.ecosystem == "npm"]
+    # No source builds (coord decision 11): uv resolves from wheels only, so no
+    # build backend runs; pnpm runs no install scripts. Cargo has no
+    # equivalent (a build.rs always runs), so a Rust repo has no deps jobs yet.
+    if py:
+        cutoff = f"--exclude-newer {shlex.quote(exclude_newer)} " if exclude_newer else ""
+        parts.append(f"uv add --no-sync --no-build {cutoff}" + " ".join(shlex.quote(x) for x in py))
+    if js:
+        parts.append(
+            "pnpm add -w --lockfile-only --ignore-scripts " + " ".join(shlex.quote(x) for x in js)
+        )
+    return " && ".join(parts)
+
+
+NO_BUILD = re.compile(r"no-build|no wheel|source distribution", re.IGNORECASE)
+
+
+def lock_packages(path: str, text: str | None) -> set[tuple[str, str]]:
+    """(name, version) for every registry package a lockfile pulls in."""
+    name = path.rsplit("/", 1)[-1]
+    out: set[tuple[str, str]] = set()
+    if not text:
+        return out
+    if name == UV_LOCK:
+        try:
+            doc = tomllib.loads(text)
+        except tomllib.TOMLDecodeError:
+            return out
+        for pkg in doc.get("package") or []:
+            src = pkg.get("source") or {}
+            if "registry" in src and pkg.get("name") and pkg.get("version"):
+                out.add((str(pkg["name"]).lower(), str(pkg["version"])))
+    elif name == PNPM_LOCK:
+        import yaml
+
+        try:
+            doc2 = yaml.safe_load(text) or {}
+        except yaml.YAMLError:
+            return out
+        pkgs = doc2.get("packages") if isinstance(doc2, dict) else None
+        for key in pkgs or {}:
+            k = str(key).lstrip("/").split("(", 1)[0]
+            pkg2, sep, ver = k.rpartition("@")
+            if sep and pkg2 and ver:
+                out.add((pkg2, ver))
+    return out
+
+
+def lock_hashes(path: str, text: str | None) -> dict[tuple[str, str], frozenset[str]]:
+    """The exact files a lockfile pins for each registry package, by hash
+    (review A4): a uv lock's sdist and wheel hashes (sha256 hex), a pnpm
+    lock's tarball integrity."""
+    name = path.rsplit("/", 1)[-1]
+    out: dict[tuple[str, str], frozenset[str]] = {}
+    if not text:
+        return out
+    if name == UV_LOCK:
+        try:
+            doc = tomllib.loads(text)
+        except tomllib.TOMLDecodeError:
+            return out
+        for pkg in doc.get("package") or []:
+            if "registry" not in (pkg.get("source") or {}):
+                continue
+            files = [pkg.get("sdist") or {}, *(pkg.get("wheels") or [])]
+            hashes = {
+                str(f["hash"]).split(":", 1)[-1]
+                for f in files
+                if isinstance(f, dict) and f.get("hash")
+            }
+            out[(str(pkg.get("name")).lower(), str(pkg.get("version")))] = frozenset(hashes)
+    elif name == PNPM_LOCK:
+        import yaml
+
+        try:
+            doc2 = yaml.safe_load(text) or {}
+        except yaml.YAMLError:
+            return out
+        for key, val in ((doc2.get("packages") if isinstance(doc2, dict) else None) or {}).items():
+            k = str(key).lstrip("/").split("(", 1)[0]
+            pkg2, sep, ver = k.rpartition("@")
+            integrity = ((val or {}).get("resolution") or {}).get("integrity")
+            if sep and pkg2 and ver and integrity:
+                out[(pkg2, ver)] = frozenset({str(integrity)})
+    return out
+
+
+def _strip_npm(d: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in d.items() if k not in NPM_SECTIONS}
+
+
+def _strip_pyproject(d: dict[str, Any]) -> dict[str, Any]:
+    d = json.loads(json.dumps(d))
+    proj = d.get("project") or {}
+    proj.pop("dependencies", None)
+    proj.pop("optional-dependencies", None)
+    d.pop("dependency-groups", None)
+    return d
+
+
+def manifest_errors(path: str, before: str | None, after: str | None) -> list[str]:
+    """A manifest may change its dependency fields and nothing else."""
+    name = path.rsplit("/", 1)[-1]
+    if before == after:
+        return []
+    if name == UV_LOCK:
+        # a uv lock may gain packages; its resolution options (the cutoff) stay
+        try:
+            same = (tomllib.loads(before or "").get("options") or {}) == (
+                tomllib.loads(after or "").get("options") or {}
+            )
+        except tomllib.TOMLDecodeError:
+            return [f"{path} isn't TOML"]
+        return [] if same else [f"{path}: its resolution options changed"]
+    if is_lockfile(path):
+        return []
+    if name == "package.json":
+        try:
+            a, b = json.loads(before or "{}"), json.loads(after or "{}")
+        except json.JSONDecodeError:
+            return [f"{path} isn't JSON"]
+        same = _strip_npm(a) == _strip_npm(b)
+        return [] if same else [f"{path}: changed outside its dependency fields"]
+    if name == "pyproject.toml":
+        try:
+            a2, b2 = tomllib.loads(before or ""), tomllib.loads(after or "")
+        except tomllib.TOMLDecodeError:
+            return [f"{path} isn't TOML"]
+        same = _strip_pyproject(a2) == _strip_pyproject(b2)
+        return [] if same else [f"{path}: changed outside its dependency fields"]
+    return [f"{path}: not a manifest or lockfile"]
+
+
+class Registry(Protocol):
+    def published(
+        self, ecosystem: str, name: str, version: str, hashes: frozenset[str] = frozenset()
+    ) -> datetime | None: ...
+
+
+def _when(t: str) -> datetime:
+    return datetime.fromisoformat(t.replace("Z", "+00:00"))
+
+
+class HttpRegistry:
+    """Upload times from the registries themselves (PyPI's JSON API, the npm
+    registry's packument), read by vigild on the host.
+
+    A release's age is the **newest** upload among the exact files the lock
+    pins (review A4): a wheel added yesterday to an old release is a new
+    file. A pinned file the registry doesn't list has no age (None)."""
+
+    def __init__(self, http: Any) -> None:
+        self.http = http
+
+    def published(
+        self, ecosystem: str, name: str, version: str, hashes: frozenset[str] = frozenset()
+    ) -> datetime | None:
+        if ecosystem == "pypi":
+            r = self.http.get(f"https://pypi.org/pypi/{name}/{version}/json", timeout=20.0)
+            if r.status_code != 200:
+                return None
+            files = r.json().get("urls") or []
+            if hashes:
+                files = [f for f in files if (f.get("digests") or {}).get("sha256") in hashes]
+                if {(f.get("digests") or {}).get("sha256") for f in files} != set(hashes):
+                    return None  # a pinned file the registry doesn't list
+            stamps = [_when(f["upload_time_iso_8601"]) for f in files
+                      if f.get("upload_time_iso_8601")]  # fmt: skip
+            return max(stamps) if stamps else None
+        r = self.http.get(f"https://registry.npmjs.org/{name}", timeout=20.0)
+        if r.status_code != 200:
+            return None
+        doc = r.json()
+        if hashes:
+            integrity = (((doc.get("versions") or {}).get(version) or {}).get("dist") or {}).get(
+                "integrity"
+            )
+            if integrity not in hashes:
+                return None  # the tarball the lock pins isn't the one published
+        t = (doc.get("time") or {}).get(version)
+        return _when(t) if t else None
+
+
+def too_new(
+    added: set[tuple[str, str, str]],
+    registry: Registry,
+    now: datetime,
+    pinned: dict[tuple[str, str, str], frozenset[str]] | None = None,
+) -> list[str]:
+    """Every (ecosystem, name, version) the lockfile newly pulls in must be at
+    least 14 days old by the newest upload of the files the lock pins for it;
+    the ones that aren't, or whose time can't be read, as a list."""
+    out = []
+    for eco, name, ver in sorted(added):
+        hashes = (pinned or {}).get((eco, name, ver), frozenset())
+        try:
+            when = registry.published(eco, name, ver, hashes)
+        except Exception as e:  # the registry is down: no proof of age
+            out.append(f"{name}=={ver}: publish time unreadable ({type(e).__name__})")
+            continue
+        if when is None:
+            out.append(f"{name}=={ver}: no publish time")
+        elif now - when < timedelta(days=MIN_AGE_DAYS):
+            out.append(f"{name}=={ver}: published {when.date()}, under {MIN_AGE_DAYS} days ago")
+    return out
+
+
+@dataclass
+class DepsResult:
+    files: dict[str, bytes] = field(default_factory=dict)  # changed manifests and lockfiles
+    errors: list[str] = field(default_factory=list)
+    added: list[str] = field(default_factory=list)  # name==version newly in a lockfile
+    output: str = ""
+
+
+Container = Callable[[str, Path, str], tuple[int, str]]  # (image, work dir, command)
+
+
+class DepsExecutor:
+    """No model (B39): the repo's manifests and lockfiles from the base, the
+    package manager's lockfile-only update in a build container with registry
+    egress and nothing else, then the checks. The work dir has no `.git` and
+    nothing of the repo but those files; vigild reads them back as regular
+    files only and commits them itself, in its own clone."""
+
+    def __init__(
+        self,
+        workspace: Any,
+        container: Container,
+        registry: Registry,
+        clock: Callable[[], datetime],
+        root: Path,
+    ) -> None:
+        self.workspace = workspace
+        self.container = container
+        self.registry = registry
+        self.clock = clock
+        self.root = root
+
+    def run(
+        self, repo: str, base_sha: str, lockfiles: list[str], deps: list[DepRequest], image: str
+    ) -> DepsResult:
+        import secrets
+        import shutil
+
+        from vigild.safefile import UnsafeFile, safe_read_bytes
+
+        work = self.root / f"deps-{secrets.token_hex(6)}"
+        work.mkdir(parents=True)
+        work.chmod(0o777)  # the build container's uid writes here
+        try:
+            self.workspace.export_files(repo, base_sha, lockfiles, work)
+            before = {p: (work / p).read_bytes() for p in lockfiles if (work / p).is_file()}
+            for p in work.rglob("*"):
+                p.chmod(0o777 if p.is_dir() else 0o666)
+            cutoff = next(
+                (
+                    uv_exclude_newer(before[p].decode(errors="replace"))
+                    for p in before
+                    if p.rsplit("/", 1)[-1] == UV_LOCK
+                ),
+                None,
+            )
+            code, output = self.container(image, work, update_command(deps, cutoff))
+            res = DepsResult(output=output[-4000:])
+            if code != 0:
+                res.errors.append(f"the package manager failed (exit {code})")
+                if NO_BUILD.search(output):
+                    res.errors.append(
+                        "a dependency has no prebuilt wheel or tarball and needs a source "
+                        "build, which deps jobs refuse: the owner decides (add it by hand, "
+                        "or pick a version with a wheel)"
+                    )
+                return res
+            others = sorted(
+                str(p.relative_to(work))
+                for p in work.rglob("*")
+                if p.is_file() and str(p.relative_to(work)) not in lockfiles
+            )
+            if others:
+                res.errors.append(f"files other than manifests and lockfiles: {others[:20]}")
+            for path in lockfiles:
+                try:
+                    data = safe_read_bytes(work, work / path, 64 << 20)
+                except FileNotFoundError:
+                    continue
+                except (OSError, UnsafeFile) as e:
+                    res.errors.append(f"{path}: {e}")
+                    continue
+                if before.get(path) != data:
+                    res.files[path] = data
+            if not res.files:
+                res.errors.append("the update changed nothing")
+            for path, data in res.files.items():
+                old = before.get(path, b"").decode(errors="replace")
+                res.errors += manifest_errors(path, old or None, data.decode(errors="replace"))
+            added: set[tuple[str, str, str]] = set()
+            pinned: dict[tuple[str, str, str], frozenset[str]] = {}
+            for eco, lock in LOCKFILE_OF.items():
+                for path in [p for p in lockfiles if p.rsplit("/", 1)[-1] == lock]:
+                    if path in res.files:
+                        text = res.files[path].decode(errors="replace")
+                        new = lock_packages(path, text)
+                        old_set = lock_packages(
+                            path, before.get(path, b"").decode(errors="replace")
+                        )
+                        added |= {(eco, n, v) for n, v in new - old_set}
+                        pinned |= {(eco, n, v): h for (n, v), h in lock_hashes(path, text).items()}
+            res.added = sorted(f"{n}=={v}" for _, n, v in added)
+            res.errors += too_new(added, self.registry, self.clock(), pinned)
+            return res
+        finally:
+            shutil.rmtree(work, ignore_errors=True)

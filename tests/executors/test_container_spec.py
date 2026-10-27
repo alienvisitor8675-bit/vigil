@@ -51,7 +51,7 @@ def test_hardening_flags(cfg: Config, spec: SessionSpec) -> None:
     assert "no-new-privileges" in kw["security_opt"]
     assert kw["pids_limit"] == 512
     assert kw["mem_limit"] == "4g"
-    assert set(kw["tmpfs"]) == {"/tmp"}
+    assert set(kw["tmpfs"]) == {"/tmp", "/run/vigil"}
     assert kw["network"] == "vigil-s-abc123"
     assert kw["stdin_open"] is True and kw["privileged"] is False
 
@@ -143,11 +143,20 @@ def test_the_verifier_container_has_no_network_and_a_read_only_checkout(
         {"Target": "/src", "Source": str(src), "Type": "bind", "ReadOnly": True}
     ]
     assert set(kw["tmpfs"]) == {"/tmp", "/work"} and kw["read_only"] is True
-    assert kw["user"] == "10001:10001" and kw["cap_drop"] == ["ALL"] and "cap_add" not in kw
+    # phase 2a, item 0: the script is root with only SETUID and SETGID, and
+    # the prepare hook and the test run as the agent uid, so the test can't
+    # read the marker from PID 1's memory
+    assert kw["user"] == "0:0" and kw["cap_drop"] == ["ALL"]
+    assert kw["cap_add"] == ["SETUID", "SETGID"]
     # test_cmd is an argument, never spliced; the report marker comes on stdin
     assert kw["command"] == [PREPARE, "pytest -q"] and kw["stdin_open"] is True
     assert PREPARE.startswith("read -r m || exit 125; exec </dev/null;")
-    assert "bash -o pipefail -o errexit" in PREPARE
+    drop = "setpriv --reuid=10001 --regid=10001 --clear-groups --inh-caps=-all --"
+    assert f'{drop} bash -o pipefail -o errexit -c "$0"' in PREPARE
+    assert f"{drop} /usr/local/bin/vigil-prepare" in PREPARE
+    assert f"{drop} cp -a /src/. /work/" in PREPARE
+    assert f"{drop} mkdir -p /tmp/vigil-report" in PREPARE  # never root (2a round 2)
+    assert '[ -f "$f" ] && [ ! -L "$f" ]' in PREPARE  # root never follows a planted link
     assert kw["environment"]["PYTEST_ADDOPTS"].startswith("--junitxml=/tmp/vigil-report/")
     assert kw["mem_limit"] == cfg.vigild.container.verifier_memory
 
@@ -243,3 +252,107 @@ def test_the_output_cap_reaches_the_container_env(cfg: Config, spec: SessionSpec
     spec.max_output_tokens = 16384
     env = worker_kwargs(cfg, spec, network="n")["environment"]
     assert env["VIGIL_MAX_OUTPUT_TOKENS"] == "16384"
+
+
+def test_a_resumed_session_gets_its_transcript_read_only(cfg: Config, spec: SessionSpec) -> None:
+    """Phase 2a, items 2-3: the transcript to resume is a read-only file the
+    harness's session store loads; nothing else about the container changes."""
+    import json
+
+    from vigild.executors.base import Resume
+    from vigild.executors.runtime import write_session_files
+
+    spec.resume = Resume("sdk-1", [{"type": "user", "uuid": "u1"}], fork=True)
+    write_session_files(cfg, spec)
+    kw = worker_kwargs(cfg, spec, network="vigil-s-abc123")
+    (m,) = [m for m in kw["mounts"] if m["Target"] == "/vigil/resume.jsonl"]
+    assert m["ReadOnly"] and m["Source"] == str(spec.session_dir / "resume.jsonl")
+    lines = (spec.session_dir / "resume.jsonl").read_text().splitlines()
+    assert [json.loads(x) for x in lines] == [{"type": "user", "uuid": "u1"}]
+    assert kw["environment"]["VIGIL_RESUME_SESSION"] == "sdk-1"
+    assert kw["environment"]["VIGIL_RESUME_FORK"] == "1"
+    spec.resume = None
+    kw = worker_kwargs(cfg, spec, network="vigil-s-abc123")
+    assert "VIGIL_RESUME_SESSION" not in kw["environment"]
+    assert not [m for m in kw["mounts"] if m["Target"] == "/vigil/resume.jsonl"]
+
+
+def test_a_deps_container_reaches_the_registries_only(cfg: Config, tmp_path: Path) -> None:
+    """Plan 2a, item 5 (B39): no gateway, no secret, no token, the work dir
+    (manifests and lockfiles) the only mount."""
+    from vigild.executors.runtime import deps_kwargs
+
+    assert allowlist(cfg, Role.DEPS) == ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]
+    assert cfg.egress.gateway.host not in allowlist(cfg, Role.DEPS)
+    work = tmp_path / "deps-abc"
+    kw = deps_kwargs(cfg, "vigil-dev/x:1", work, network="vigil-deps-abc")
+    assert kw["mounts"] == [
+        {"Target": "/work", "Source": str(work), "Type": "bind", "ReadOnly": False}
+    ]
+    assert kw["user"] == "10001:10001" and kw["cap_drop"] == ["ALL"] and "cap_add" not in kw
+    assert kw["read_only"] is True and kw["network"] == "vigil-deps-abc"
+    env = kw["environment"]
+    assert not any("TOKEN" in k or "KEY" in k or "ANTHROPIC" in k for k in env)
+    assert env["HTTPS_PROXY"].startswith("http://egress:")
+
+
+def test_a_finished_log_stream_is_closed(cfg: Config, tmp_path: Path) -> None:
+    """Phase 2a, item 0: an unclosed stream's response, or the attach
+    socket's, printed "I/O operation on closed file" when garbage-collected."""
+    from vigild.executors.runtime import DockerTestRunner
+
+    closed: list[bool] = []
+
+    class Stream:
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            yield b"ok\n"
+
+        def close(self) -> None:
+            closed.append(True)
+
+    class Response:
+        def close(self) -> None:
+            closed.append(True)
+
+    class Sock:
+        _response = Response()
+
+        def sendall(self, data: bytes) -> None: ...
+
+        def shutdown(self, how: int) -> None: ...
+
+        def close(self) -> None: ...
+
+    class Container:
+        def attach_socket(self, **kw: object) -> Sock:
+            return Sock()
+
+        def start(self) -> None: ...
+
+        def logs(self, **kw: object) -> Stream:
+            return Stream()
+
+        def wait(self) -> dict[str, int]:
+            return {"StatusCode": 0}
+
+        def remove(self, **kw: object) -> None: ...
+
+    class Client:
+        class containers:
+            @staticmethod
+            def create(**kw: object) -> Container:
+                return Container()
+
+    DockerTestRunner(cfg, Client()).run("img", tmp_path, "true", timeout_s=5, max_output=1000)
+    assert closed == [True, True]  # the attach response, then the log stream
+
+
+def test_the_stop_hooks_inputs_live_in_a_root_owned_tmpfs(cfg: Config, spec: SessionSpec) -> None:
+    """2a round 2, review A6/B12: the harness writes the hook's inputs and
+    block count where the agent uid can read but not write or rename."""
+    from vigild.executors.runtime import HOOK_DIR
+
+    kw = worker_kwargs(cfg, spec, network="n")
+    opts = kw["tmpfs"][HOOK_DIR]
+    assert HOOK_DIR == "/run/vigil" and "uid=0" in opts and "mode=0755" in opts
+    assert kw["environment"]["VIGIL_HOOK_DIR"] == HOOK_DIR

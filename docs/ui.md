@@ -302,15 +302,19 @@ confidence bucket against your labels.
 ### 5. `/review`
 
 The trust ladder. For each task shape:
-- its rung;
+- its rung, its starting rung and its limit (and why it stops there);
+- who reviews and who audits at that rung, and the audit rate;
 - a sparkline of the audit match rate;
 - false findings per PR;
-- the promotions and demotions, with dates and the audit numbers behind
-  each.
+- its **last change**: old and new rung, the reason, the audit sample size
+  and match rate behind it, and when (owner, 2026-10-23); the full history
+  of promotions and demotions below it.
 
-Money, auth and consent shapes are marked `rung 0 · fixed`.
+Money, auth and consent shapes are marked `rung 0 · fixed`, deps
+`rung ≤ 1 · fixed`. Until a local reviewer passes its eval, the page says
+so: no shape passes rung 1.
 
-**API:** `GET /api/ladder`.
+**API:** `GET /api/review/ladder`.
 
 ### 6. `/new`
 
@@ -320,7 +324,7 @@ Start a session. It is one form, not a wizard, with these fields:
 - **Backend:** a preset, or a custom endpoint as `{kind, base_url,
   model, key_ref}`. `key_ref` is a choice among variable names, never a
   value field.
-- **The contract's spec:** goal, `test_cmd`, `must_fail_first`,
+- **The contract's spec:** goal, `test_cmd`, `must_fail_first` (with its reason when false),
   `files_in_scope`, `done_when`, `out_of_scope`.
 - **Why, value and risk.**
 - **Limits:** max turns, minutes and cost, never above the per-task cap.

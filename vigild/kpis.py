@@ -9,6 +9,11 @@ each KPI is computed where data exists and is None until then.
 - revert_fix_job_rate: fix jobs opened against shipped jobs, over shipped jobs.
 - cost_per_merged_pr: metered spend of merged jobs' sessions, per merged PR.
 - median_spec_to_merge_hours: job creation to the `merged` transition.
+
+`decider_report` is the decider's own (owner ruling 6): per question type,
+how its answers' confidence is spread and how many escalated to Haiku. The
+owner reads it after the first 50 real ParkAgent decisions, before any
+threshold moves (act 0.85, escalate 0.6).
 """
 
 from __future__ import annotations
@@ -65,3 +70,38 @@ def compute(store: Store) -> dict[str, Any]:
         fixes = sum(len(store.child_jobs(j)) for j in merged)
         result["revert_fix_job_rate"] = fixes / len(merged)
     return result
+
+
+DECIDER_KINDS = ("choice", "score", "noul")
+
+
+def _bucket(p: float) -> str:
+    lo = min(int(p * 10), 9) / 10
+    return f"{lo:.1f}-{lo + 0.1:.1f}"
+
+
+def decider_report(store: Store) -> dict[str, Any]:
+    """Per question type: answers (`n`), their confidence in tenths
+    (`buckets`), how many escalated to Haiku, how many acted, and how many
+    decisions got no answer at all."""
+    out: dict[str, Any] = {
+        k: {"n": 0, "buckets": {}, "escalated": 0, "acted": 0, "no_answer": 0}
+        for k in DECIDER_KINDS
+    }
+    rows = store.q("SELECT kind, probability, backend, action FROM decisions ORDER BY id")
+    for r in rows:
+        kind = r["kind"]
+        if kind not in out:
+            continue
+        k = out[kind]
+        if r["backend"] == "no-answer":
+            k["no_answer"] += 1
+            continue
+        k["n"] += 1
+        b = _bucket(float(r["probability"]))
+        k["buckets"][b] = k["buckets"].get(b, 0) + 1
+        k["escalated"] += r["action"] == "escalated"
+        k["acted"] += r["action"] == "act"
+    for k in out.values():
+        k["buckets"] = dict(sorted(k["buckets"].items()))
+    return out

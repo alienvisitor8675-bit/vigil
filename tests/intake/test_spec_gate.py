@@ -503,3 +503,34 @@ def test_a_new_worker_may_depend_on_an_existing_task() -> None:
         parse_spec(SPEC), parse_plan(plan), MONEY, existing_task_ids={"pa-0001-w1", "pa-0001-w2"}
     )
     assert errors == []
+
+
+# --- #31 item 2: must_fail_first off states why ---------------------------------------------
+
+
+def _off(reason: str | None) -> str:
+    extra = "" if reason is None else f', "must_fail_first_reason": {json.dumps(reason)}'
+    return PLAN.replace(
+        '"files_in_scope": ["docs/runbook.md"], "must_fail_first": true}',
+        f'"files_in_scope": ["docs/runbook.md"], "must_fail_first": false{extra}}}',
+    )
+
+
+@pytest.mark.parametrize("reason", [None, "", "   "])
+def test_must_fail_first_off_needs_a_reason(reason: str | None) -> None:
+    errors = check_job_spec(parse_spec(SPEC), parse_plan(_off(reason)), MONEY)
+    assert any(
+        "pa-0001-w2" in e and "must_fail_first" in e and "must_fail_first_reason" in e
+        for e in errors
+    ), errors
+
+
+def test_must_fail_first_off_with_a_reason_passes() -> None:
+    plan = parse_plan(_off("tests only, code unchanged"))
+    assert check_job_spec(parse_spec(SPEC), plan, MONEY) == []
+
+
+def test_a_task_with_it_off_and_no_reason_needs_a_spec() -> None:
+    res = check_task(_task(must_fail_first=False))
+    assert not res.ok and any("must_fail_first_reason" in e for e in res.errors)
+    assert check_task(_task(must_fail_first=False, must_fail_first_reason="tests only")).ok

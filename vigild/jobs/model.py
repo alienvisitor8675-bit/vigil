@@ -31,6 +31,7 @@ class Role(StrEnum):
     AUDITOR = "auditor"
     SUBAGENT = "subagent"
     HIDDEN_TEST_AUTHOR = "hidden_test_author"  # a fresh session; never a worker or reviewer
+    DEPS = "deps"  # a deps job's build container: no model, registry egress only (B39)
 
 
 class FixDepthExceeded(ValueError):
@@ -55,6 +56,7 @@ class Job:
     updated_at: str
     provenance: str
     blocked_on: str | None = None  # a deps job this one waits for (round 3)
+    issue: int | None = None  # the GitHub issue in this repo it answers, if any
 
 
 @dataclass

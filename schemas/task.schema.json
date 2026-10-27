@@ -71,14 +71,17 @@
       "type": "object"
     },
     "Shape": {
-      "description": "The kind of change, for the review ladder (phase 2). `deps` changes\nonly manifests and lockfiles, runs no model, starts at rung 1 and always\nneeds the owner's review (round 3).",
+      "description": "The kind of change, for the review ladder (phase 2). `deps` changes\nonly manifests and lockfiles, runs no model, starts at rung 1, is capped\nthere and always needs the owner's review (round 3; owner 2026-10-23).\n`money`, `auth` and `consent` stay at rung 0 permanently.",
       "enum": [
         "docs",
         "tests",
         "feature",
         "fix",
         "refactor",
-        "deps"
+        "deps",
+        "money",
+        "auth",
+        "consent"
       ],
       "title": "Shape",
       "type": "string"
@@ -131,6 +134,18 @@
           "default": true,
           "title": "Must Fail First",
           "type": "boolean"
+        },
+        "must_fail_first_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Must Fail First Reason"
         },
         "out_of_scope": {
           "items": {

@@ -98,6 +98,24 @@ def check_tests(spec: dict[str, Any], tests: dict[str, Any] | None) -> list[str]
         if ids.get("not_passing_after"):
             still = ids["not_passing_after"]
             errors.append(f"the worker's tests that failed before don't pass after: {still}")
+    if not spec.get("must_fail_first", True):
+        # #31 item 1: tests-only tasks still have to bring tests, and they must run and pass
+        if not ids.get("checked"):
+            errors.append(
+                "must_fail_first is off: that the worker's own tests ran can't be confirmed "
+                f"({ids.get('note') or 'the runner gave no report'})"
+            )
+        else:
+            if not ids.get("worker_ran"):
+                errors.append(
+                    "must_fail_first is off, so at least one new test id (absent from the "
+                    "base runs) in the worker's test files must run and pass; none of the worker's "
+                    "new tests ran (zero "
+                    "collected; skipped, xfail and todo don't count, and an edited test that "
+                    "keeps its id isn't new)"
+                )
+            if ids.get("not_passing_after"):
+                errors.append(f"the worker's tests don't pass: {ids['not_passing_after']}")
     ran = tests.get("ran") or {}
     if ran.get("unknown"):
         errors.append(f"what ran can't be compared: {ran.get('note')}")

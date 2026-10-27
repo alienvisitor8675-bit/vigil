@@ -130,28 +130,59 @@ def test_in_review_back_to_building_needs_findings(store: Store) -> None:
 
 
 # in_review -> ready
+def _review(tid: str, jid: str, **kw: object) -> str:
+    from vigild.contract.models import CHECKLIST
+
+    doc = {
+        "verdict": "clean", "findings": [], "checklist": {c: True for c in CHECKLIST},
+        "task_id": tid, "job_id": jid, "head": "a" * 40, "shape": "docs", "rung": 0,
+        "round": 1, "audit_required": False, "reviewer": "claude-sonnet",
+        "provenance": "claude", **kw,
+    }  # fmt: skip
+    return json.dumps(doc)
+
+
 def test_in_review_to_ready_needs_clean_reviews(store: Store) -> None:
     jid = _job(store, S.IN_REVIEW)
     tid = _worker(store, jid, pr=True, report=True)
     with pytest.raises(TransitionError, match="review"):
         transition(store, jid, S.READY, Actor.VIGILD)
-    store.add_artifact(
-        jid,
-        "review.json",
-        json.dumps({"verdict": "changes", "findings": [{"severity": "medium"}]}),
-        Provenance.CLAUDE,
-        task_id=tid,
-    )
-    with pytest.raises(TransitionError, match="review"):
+    # phase 2a, item 1: an empty review.json fails the stage gate
+    store.add_artifact(jid, "review.json", "{}", Provenance.CLAUDE, task_id=tid)
+    with pytest.raises(TransitionError, match=r"review\.json is invalid"):
         transition(store, jid, S.READY, Actor.VIGILD)
+    medium = {"severity": "medium", "file": "a.py", "line": 1, "claim": "c", "fix": "f"}
     store.add_artifact(
-        jid,
-        "review.json",
-        json.dumps({"verdict": "clean", "findings": []}),
-        Provenance.CLAUDE,
-        task_id=tid,
+        jid, "review.json", _review(tid, jid, verdict="changes", findings=[medium]),
+        Provenance.CLAUDE, task_id=tid,
+    )  # fmt: skip
+    with pytest.raises(TransitionError, match="not clean"):
+        transition(store, jid, S.READY, Actor.VIGILD)
+    # a review sampled for audit needs the audit of the same head
+    store.add_artifact(
+        jid, "review.json", _review(tid, jid, audit_required=True), Provenance.CLAUDE, task_id=tid
     )
-    assert transition(store, jid, S.READY, Actor.VIGILD).state is S.READY
+    with pytest.raises(TransitionError, match=r"audit\.json"):
+        transition(store, jid, S.READY, Actor.VIGILD)
+    audit = {
+        "findings": [{**medium, "matched": None}], "false_findings": [], "task_id": tid,
+        "job_id": jid, "head": "a" * 40, "shape": "docs", "rung": 0, "auditor": "claude-opus",
+        "provenance": "claude",
+    }  # fmt: skip
+    store.add_artifact(jid, "audit.json", json.dumps(audit), Provenance.CLAUDE, task_id=tid)
+    with pytest.raises(TransitionError, match="missed"):
+        transition(store, jid, S.READY, Actor.VIGILD)
+    audit["findings"] = []
+    store.add_artifact(jid, "audit.json", json.dumps(audit), Provenance.CLAUDE, task_id=tid)
+    # Tier 1: and a PR record naming the commit vigild sent now, with no job `.vigil`
+    with pytest.raises(TransitionError, match="no record"):
+        transition(store, jid, S.READY, Actor.VIGILD)
+    sent = "b" * 40
+    store.add_event("pr_open", {"published": sent}, Provenance.HUMAN, job_id=jid, task_id=tid)
+    heads = {tid: {"published": sent, "vigil": False}}
+    assert (
+        transition(store, jid, S.READY, Actor.VIGILD, evidence={"pr_heads": heads}).state is S.READY
+    )
 
 
 # ready -> merged

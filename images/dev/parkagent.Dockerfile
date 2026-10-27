@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.28.0@sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b
 # Dev image for thomasbardhi01/parkagent (owner direction, review round 2).
 # linux/arm64. vigild builds it, keyed on this file and the lockfiles below at
 # the base commit, and validates it by running the suites in configs/repos.yaml
@@ -72,10 +72,11 @@ RUN pnpm install --frozen-lockfile \
  && chmod -R a+rX /opt/deps /ms-playwright
 WORKDIR /opt/deps
 
-# data/'s Python deps, frozen, into a venv outside the checkout.
+# data/'s Python deps, frozen, into a venv outside the checkout; wheels only
+# (--no-build: no build backend runs at image build, coord decision 11).
 COPY data/pyproject.toml data/uv.lock data/.python-version data/
 RUN cd data && uv python install "$(cat .python-version)" \
- && uv sync --frozen --no-install-project \
+ && uv sync --frozen --no-build --no-install-project \
  && chmod -R a+rX /opt/python /opt/data-venv
 
 # vigil-session-prepare: puts the dependencies above next to whatever is at

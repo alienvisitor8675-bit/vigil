@@ -84,14 +84,18 @@ def test_off_a_flagged_task_opens_the_owner_review_draft_pr_and_nothing_escalate
     w.runner.verifier.host_key = None  # a missing VIGIL_HOST_KEY does not matter
     w.standin.worker_edit = _flag_edit()
     job = _approve(w)
-    assert w.store.get_job(job).state.value == "in_review"
+    assert w.store.get_job(job).state.value == "ready"  # then 2a's review: clean
     pr = next(p for p in w.publisher.prs if p["head"] == f"vigil/{job}-w1")
     assert pr["title"] == TITLE and pr["draft"] is True
     assert "`tools/check.py`" in pr["body"] and "Hidden tests are disabled" in pr["body"]
     other = next(p for p in w.publisher.prs if p["head"] == f"vigil/{job}-w2")
     assert other["title"] != TITLE and "Owner review required" not in other["body"]
-    assert w.store.get_task(f"{job}-w1").state == "pr_open"
+    assert w.store.get_task(f"{job}-w1").state == "reviewed"
     assert w.store.get_task(f"{job}-w1").contract["runner_file_change"] == ["tools/check.py"]
+    # a runner-file task is reviewed and audited at rung 0, and its audit counts for
+    # nothing: only the other task's audit is in the ladder's tally (finding #2)
+    assert w.store.get_artifact(job, "audit.json", task_id=f"{job}-w1") is not None
+    assert [r["task_id"] for r in w.store.q("SELECT task_id FROM audits")] == [f"{job}-w2"]
     rec = json.loads(w.store.get_artifact(job, "tests.json", task_id=f"{job}-w1").content)
     assert "hidden" not in rec and rec["runner_files"] == ["tools/check.py"]
     assert rec["after"]["outcome"] == "pass"  # verified on its visible tests

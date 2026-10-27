@@ -61,15 +61,85 @@ feature: vigild logs `config: <feature> is off`, `/api/health` lists it in
 | `ANTHROPIC_API_KEY` | The gateway's key for every Claude call: coord, workers, reviewer, auditor, the Haiku decider. | Console → org **vigil** → API keys. It already exists. | Org "vigil" only. Set a Console spend limit at or under the monthly credit; vigild's caps sit below it ($5/day, $2/task, $100/month, `configs/budgets.yaml`). | 1 | `GET /v1/models` → 200 |
 | `GITHUB_APP_ID` | The vigil-worker App's numeric App ID: the `iss` of its JWT. Not secret, but kept with its key. | GitHub → Settings → Developer settings → GitHub Apps → vigil-worker → **App ID**. | — | 1 | `GET /app` → slug `vigil-worker` |
 | `GITHUB_APP_KEY_PATH` | Path to the App's private key, normally `~/.config/vigil/vigil-worker.pem`. | Same page → **Generate a private key**. Save it beside the env file and `chmod 600` it. | Never mounted into any container. | 1 | one installation; mint + revoke a token per repo in `configs/repos.yaml`, and a `contents:read` one on claude-mods |
-| `PHOENIX_SECRET` | Phoenix signs its JWTs with it. | `printf 's%s' "$(openssl rand -hex 24)"` (at least 32 characters, with a digit and a lowercase letter). | Compose only. | 1 | — |
-| `PHOENIX_ADMIN_SECRET` | The collector's bearer token for Phoenix's OTLP endpoint. It acts as Phoenix's first system user. | `printf 'a%s' "$(openssl rand -hex 24)"`. It must differ from `PHOENIX_SECRET`. | Compose only: Phoenix and the collector. | 1 | Phoenix `healthz`, collector port |
+| `PHOENIX_SECRET` | Phoenix signs its JWTs with it. | **You generate it** (below), with the `a1` prefix. | Compose only. | 1 | — |
+| `PHOENIX_ADMIN_SECRET` | The collector's bearer token for Phoenix's OTLP endpoint. It acts as Phoenix's first system user. | **You generate it** (below), with the `a1` prefix. Two runs of the command never give the same value, so it differs from `PHOENIX_SECRET`, which Phoenix requires. | Compose only: Phoenix and the collector. | 1 | Phoenix `healthz`, collector port |
 | `PHOENIX_DEFAULT_ADMIN_INITIAL_PASSWORD` | Your Phoenix login (user `admin`) on first start. | Choose it. Changing it later has no effect; change the password in Phoenix. | 127.0.0.1 / `tailscale serve` only. | 1 | — |
-| `VIGIL_API_TOKEN` | Admin bearer token for the REST API and the CLI; the one-time login for the web UI. | `openssl rand -hex 32`. | Full control of vigild. | 1 | `GET /api/health` → 200 |
-| `VIGIL_METRICS_TOKEN` | Read-only token: GET endpoints, `/metrics` (phase 3), and a read-only UI login. | `openssl rand -hex 32`. Hand it to Hearth yourself. | Read only. | 1 (reads), 3 (metering) | — |
-| `VIGIL_HEARTBEAT_TOKEN` | Lets an outside session post heartbeats for the UI's `/sessions` page. | `openssl rand -hex 32`. | Write heartbeats; nothing else. | 3 | — |
-| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | Jev on Workers AI (zero retention), the default decider. Without them, Haiku decides. | Cloudflare → My Profile → API Tokens → Custom token: **Account · Workers AI · Read** and **Edit**, that one account. | Workers AI only. | 1 (optional) | reported missing |
-| `OPENROUTER_API_KEY` | The OpenRouter preset and Jev's other route. | openrouter.ai → Keys, with a **credit limit**. | Never for a private repo: vigild refuses to start if `repos.yaml` lists it for one. | 4 | — |
-| `LLAMA_API_KEY` | llama-server's `--api-key`. In **both** the env file and the tower's `/etc/vigil/llama.env`. | `openssl rand -hex 32`. | Tower only, over Tailscale. | 5 | — |
+| `VIGIL_API_TOKEN` | Admin bearer token for the REST API and the CLI; the one-time login for the web UI. | **You generate it** (below). | Full control of vigild. | 1 | `GET /api/health` → 200 |
+| `VIGIL_METRICS_TOKEN` | Read-only token: GET endpoints, `/metrics` (phase 3), and a read-only UI login. | **You generate it** (below). Hand it to Hearth yourself. | Read only. | 1 (reads), 3 (metering) | — |
+| `VIGIL_HEARTBEAT_TOKEN` | Lets an outside session post heartbeats for the UI's `/sessions` page. | **You generate it** (below). | Write heartbeats; nothing else. | 3 | — |
+| `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | Jev on Workers AI (zero retention): the decider route for **private** repos only. No repo lists it while both are public, and `vigil doctor` skips these then. | Cloudflare → My Profile → API Tokens → Custom token: **Account · Workers AI · Read** and **Edit**, that one account. | Workers AI only. | 1 (optional) | skipped unless a repo lists `jev-cloudflare`; then reported missing |
+| `OPENROUTER_API_KEY` | Jev on OpenRouter's Decisions API: **the decider for public repos** (owner, 2026-10-23), with Haiku as the escalation; later the OpenRouter preset (phase 4). | openrouter.ai → Keys, with a **credit limit**. Set. | Never for a private repo: vigild refuses to start if `repos.yaml` lists it for one. | 2a | `GET /api/v1/key` → 200, and one `decider:` line per repo naming its route |
+| `LLAMA_API_KEY` | llama-server's `--api-key`. In **both** the env file and the tower's `/etc/vigil/llama.env`. | **You generate it** (below), then copy the same line to the tower. | Tower only, over Tailscale. | 5 | — |
+
+### The decider: Jev (owner, 2026-10-23)
+
+- **Routes.** A repo's `decider:` lists `jev`: Jev on OpenRouter while the
+  repo is public, on Cloudflare while it's private (read live, once per
+  decision; unreadable, or anything but a plain true/false from GitHub,
+  means private). Haiku is the escalation where it's allowed.
+- **Answers.** A `choice` gives the option and every option's probability, a
+  `score` a number on 1-5, a `noul` yes/no with the probability of yes; the
+  thresholds (act at 0.85, escalate at 0.6) read that probability, so a sure
+  "no" waits for you. `GET /api/decider/report` shows, per question type, how
+  confident the answers are and how many went to Haiku; read it after the
+  first 50 real ParkAgent decisions before changing a threshold.
+- **Cloudflare credit.** Cloudflare bills Jev through AI Gateway credit:
+  $0.042 per million input tokens, output free, plus a 5% fee when you buy
+  credit (vigild meters $0.0441/M). When the credit runs out Cloudflare
+  answers error 2021, "Insufficient balance": vigild trips the
+  `decider_credit` breaker and pages once, "Cloudflare Jev credit is empty
+  (2021); decisions now on Haiku fallback" (or "waiting for the owner"). Buy
+  credit in the Cloudflare dashboard (AI Gateway), then press **Reset**; until
+  then that route is off and Haiku's answers count as fallback.
+- **Fallback cap.** Haiku answers that stand in for Jev (drift, failure,
+  credit) are capped at $1 per repo per UTC day
+  (`decider_fallback_per_repo_usd` in `configs/budgets.yaml`). Jev costs
+  cents a day, so crossing a dollar means it has drifted or is failing: the
+  call is refused before it is sent, and "breaker tripped:
+  decider_fallback_cap (repo:<repo>)" holds that repo's dispatch. Look at
+  the Jev pages, then press **Reset**.
+- **Version pin.** Each Jev route has a `version_pin` in
+  `configs/backends.yaml` (Cloudflare `jev-1.13.0`, OpenRouter
+  `typesafe/jev-1.13-20260917`). A reply with another version, or none, pages
+  once per new version: "Jev version drift: <route> returned <version>,
+  pinned <pin>; decisions now on Haiku fallback" (or "waiting for the
+  owner"), with today's fallback spend. **A version bump happens only by PR,
+  after the decider eval set has been replayed against the new version.**
+  OpenRouter stays pinned to `typesafe/jev-1.13`; Cloudflare's
+  `typesafe/jev` is a floating alias, held by the pin; never
+  `typesafe/jev-1.14.0` (beta).
+
+### Secrets you generate (owner, 2026-10-23)
+
+**You create every self-generated secret yourself; an agent never does.** No
+Claude session (coord, worker, or a build session) generates, prints or
+stores one. One command per variable, which appends a fresh value to the env
+file without showing it:
+
+```sh
+printf 'VIGIL_API_TOKEN=%s\n' "$(openssl rand -hex 32)" >> ~/.config/vigil/env
+```
+
+Do the same for `VIGIL_METRICS_TOKEN`, `VIGIL_HEARTBEAT_TOKEN` and
+`LLAMA_API_KEY`. **Phoenix's two secrets keep a prefix.** Phoenix 20.19.0
+still requires each to be at least 32 characters with at least one digit and
+one lowercase letter (`phoenix.auth.REQUIREMENTS_FOR_PHOENIX_SECRET`, checked
+in the running container on 2026-10-22). 64 hex characters almost always have
+both, but not always, so the `a1` prefix guarantees it:
+
+```sh
+printf 'PHOENIX_SECRET=a1%s\n' "$(openssl rand -hex 32)" >> ~/.config/vigil/env
+printf 'PHOENIX_ADMIN_SECRET=a1%s\n' "$(openssl rand -hex 32)" >> ~/.config/vigil/env
+```
+
+**To rotate one:** delete its line from `~/.config/vigil/env`, run its
+command again, and restart vigild (it reads the file once, at start). For the
+Phoenix secrets, also restart the trace stack
+(`docker compose --env-file ~/.config/vigil/env up -d`); for `LLAMA_API_KEY`,
+copy the new line to the tower's `/etc/vigil/llama.env` and restart
+llama-server. Secrets someone else issues (`ANTHROPIC_API_KEY`, the GitHub
+App's key, the Cloudflare token) rotate where they were issued, then the same
+way: delete the line, add the new one, restart vigild.
 
 Non-secret settings (hosts, ports, image names, the data directory) live in
 `configs/*.yaml`, not here. Langfuse's variables are gone: Phoenix replaced
@@ -136,7 +206,10 @@ status issue (#1), and waits for you.
 - Even so, nothing vigil runs bind-mounts from the repo: the collector's
   config is baked into its image, and vigild's data (`~/vigil-data`: clones,
   session files) lives outside the checkout.
-- The CLI is at `~/.docker/bin/docker`. Put it on `PATH` for launchd jobs.
+- The CLI is at `~/.docker/bin/docker`. vigild and `scripts/build-images.py`
+  put its directory (and the one it links to, where
+  `docker-credential-desktop` lives) first on the docker CLI's `PATH`
+  themselves, so a launchd job or a bare shell needs nothing extra.
 
 ### Build the images
 
@@ -200,10 +273,15 @@ image, with no network. There is no timer and no launchd job.
   (`container.verifier_concurrency` in `configs/vigild.yaml`); raise it only
   if the Docker VM has the memory (6 GiB each, plus tmpfs).
 - **A task that needs a dependency** blocks with an inbox item listing the
-  packages and the worker's manifest and lockfile diff. Until phase 2's deps
-  job exists, make the dependency change yourself in its own PR (manifest and
-  lockfile only), let it merge, then press **Retry** on the item: the new
-  base changes the dev image key, so vigild builds the new image first.
+  packages and the worker's manifest and lockfile diff, and vigild files a
+  **deps job** in *Specs to approve*. Approving it lets the package manager
+  run: no model, a lockfile-only update in a container that reaches the
+  registries and nothing else. It fails, with the list, if anything new in
+  the lockfile is under 14 days old, or if a manifest changed outside its
+  dependency fields. Then vigild rebuilds the dev image on the new lockfiles,
+  runs every suite offline, and opens the PR. **Review it yourself** (deps
+  PRs always need you) and merge it: within two minutes vigild's PR poll sees
+  the merge, and the blocked job resumes on its own, on the new image.
 - `dev_image_tools` is what a `test_cmd` may use; the spec gate refuses a
   test that needs anything else. `dev_excluded` says which suites can't run
   in a Linux container and why: for ParkAgent, the iOS app (Xcode).
@@ -221,7 +299,7 @@ $2 coord reservation (it was $1 until PR 15) before it began. To raise the cap, 
 (minimum 1,024) and restart vigild; vigild refuses a job with a 422 and the
 numbers if a role's worst-case first call no longer fits its reservation, and
 `tests/gateway/test_first_call.py` fails the same way, so raise
-`coord_session_usd` with it and keep a job's reservations under the $5 day. With the coord at $2, an Opus coord is refused only when its request reaches about 600k characters with ~$0.30 spent (at $1 it was 230-270k). A session whose reservation does not fit what is left of the day waits (events `queued`, `dequeued`) rather than failing; a wave of three workers at $2 runs two and the third waits for one to settle. A call refused mid-run (output below the floor, or out of reservation) ends that session with a page naming the cap and the shortfall; main has no checkpoint resume.
+`coord_session_usd` with it and keep a job's reservations under the $5 day. With the coord at $2, an Opus coord is refused only when its request reaches about 600k characters with ~$0.30 spent (at $1 it was 230-270k). A session whose reservation does not fit what is left of the day waits (events `queued`, `dequeued`) rather than failing; a wave of three workers at $2 runs two and the third waits for one to settle. A call refused mid-run (output below the floor, or out of reservation) ends that session with a page naming the cap and the shortfall (a crashed or killed worker, by contrast, resumes from its last checkpoint).
 A session whose final model call stopped at the cap is marked failed
 ("truncated at the output cap"), not done.
 
@@ -341,7 +419,10 @@ uv run python cli/vigil doctor
 ```
 
 It prints one `pass`, `fail` or `skip` line per check, never a value. Add
-`--repo <owner/name>` to limit the token checks to some repos.
+`--repo <owner/name>` to limit it to some repos: it then makes no call about
+any other repo (no token, no visibility read), and lists each of them as
+`decider: <repo> (not checked: not selected)`. A build session always passes
+`--repo thomasbardhi01/vigil`.
 
 ### Keep development off the production data
 
@@ -358,11 +439,12 @@ uv run python -m vigild
 ```
 
 - **At start** vigild:
-  - reads each repo's real visibility through the App. It refuses to start
-    if `configs/repos.yaml` says public for a repo that is private, or if it
-    can't check (so the App must be configured). A repo the YAML keeps
-    private that is public on GitHub only logs a warning: the YAML's stricter
-    rule stays in force;
+  - reads each repo's visibility live through the App (there is no YAML
+    field: nothing to edit when a repo changes visibility; vigild follows
+    GitHub) and checks the private-repo rule against it. A repo it can't
+    read counts as private. It refuses to start when a private repo's
+    entries break the rule, and later refuses a dispatch the same way, with
+    a page;
   - migrates an older `vigil.db` in place: every `MIGRATIONS` step runs on
     every start (all are idempotent), so a DB another branch advanced repairs
     itself on restart;
@@ -370,8 +452,19 @@ uv run python -m vigild
     containers removed, reservations settled, mid-flight jobs blocked with a
     page in the inbox (retry, re-plan or abandon), an `in_review` job whose plan has a
     task with no open PR paged (re-plan or abandon), a draft whose coord died
-    paged (retry or cancel);
-  - starts approved builds that never began, once the gateway is listening.
+    paged (retry or cancel), and a draft stuck in `spec_pending` with no open
+    inbox item (its coord failed and the page was resolved) paged once with
+    **re-plan** and **abandon** ("pa-NNNN is waiting for a spec that was never
+    drafted"); the same check runs every 10 minutes. A task whose PR has merged
+    is never reviewed;
+  - starts approved builds that never began, once the gateway is listening;
+  - **resumes** building jobs a restart cut off when that's safe: their
+    workers' image is unchanged, each has at least $0.05 of its cap left,
+    and none has crashed `scheduler.resume_attempts` (2) times in a row.
+    They pick up from their last checkpoint with their transcript.
+- **A worker container that dies or is killed** (OOM, `docker kill`)
+  resumes on its own the same way, up to two times; then its job blocks
+  with the usual retry, re-plan or abandon.
 - **When a worker fails**, its job is blocked after its wave with one inbox
   item: **Retry** runs the failed tasks again on what's left of each task's
   cap (offered only when there is at least $0.05 left), **Re-plan** sends
@@ -391,4 +484,69 @@ uv run python -m vigild
 - The gateway is at 127.0.0.1:8788. Containers reach it as
   `host.docker.internal:8788` through their proxy; Docker Desktop forwards
   that to the Mac's loopback.
-- Running it under launchd arrives with phase 2, together with the CLI.
+- **The fleet** (`scheduler` in `configs/vigild.yaml`): three sessions at
+  once across every job; four open fleet PRs per repo (`wip_per_repo` in
+  `configs/budgets.yaml`). At the limit the repo's WIP breaker pages
+  once, listing the stack: merge or close one, then press **Reset**.
+- **Circuit breakers** (`breakers` in `configs/vigild.yaml`). Each pages
+  once, as "breaker tripped: <kind> (<scope>)", and pauses dispatch for
+  its scope: the day's or month's cap (once metered spend reaches it), a
+  task's cap, the WIP limit, escalations per day, fix-job depth, a
+  backend's errors, a repo's failed jobs, the verifier's unknowns, the
+  Cloudflare credit, a repo's decider fallback. Fix the cause, then press
+  **Reset**: the jobs it held resume (`queued` if one's last run is still
+  finishing; it picks up right after). Or press **Abandon** on the breaker's
+  page, naming one of the jobs it holds, to give that job up; abandoning
+  its last job resolves the page but leaves the breaker open, so dispatch
+  waits for its own condition (or your reset). A backend breaker also closes itself
+  after a successful probe five minutes on, resolving its page; meanwhile
+  its work goes to the preset's fallback in `configs/routing.yaml`.
+- **Midnight.** Work still running at UTC midnight counts against the new
+  day (and month) until it settles, since its whole cost books to the day it
+  settles; the new day's room is $5 less that.
+- **Money held after a session ended.** A reservation stays open (and
+  counted) while a call made against it is still in flight, up to the
+  upstream timeout (10 minutes) plus 2; then it settles with what the call
+  cost. Every 10 minutes vigild settles anything nothing holds
+  (`reservation_swept` events), so held money never outlives its work.
+- **Dismiss** on a breaker's page is refused while it holds a job: press
+  **Reset**, or **Abandon** each job it holds.
+- **A full day waits.** A worker (or a coord) the day has no room for is not
+  refused: it waits its turn, first in first out, and runs when a reservation
+  settles or the UTC day rolls over (`queued` and `dequeued` events, no page).
+  A wait ends if the job is abandoned or held meanwhile. A day whose metered
+  spend has reached the cap is not waited for: the daily breaker trips.
+- **Budget pages.** A job whose workers can't fit a cap that waiting won't
+  free (a task's own cap, the month) gets its own page, "the budget can't fit
+  this work now": retry later, re-plan with smaller `max_cost_usd`, or
+  abandon.
+- **Review caps.** A job entering review reserves $1.20 per task under review
+  (`review_session_usd` $0.40 + `audit_session_usd` $0.80 in
+  `configs/budgets.yaml`); what isn't used goes back when the pass ends,
+  before any fix round builds. A pass reviews at most 4 tasks; a job with
+  more is reviewed in passes, one after another. A
+  review that runs past its cap still completes, charged to the day (the
+  daily and monthly caps stay hard). "Review caps too low for shape <shape>:
+  2 overages; consider re-sizing" means raise those two values. Re-size
+  them from real ParkAgent reviews after the phase 1 run.
+- **Deps PRs.** vigild opens them with no source builds (wheels and
+  tarballs only) and builds the new dev image only after you merge. A review
+  that fails closes the PR and makes it again once; a second failure closes
+  that one and pages you. Merging one by hand at any point resumes the job
+  that waits on it.
+- **Label intake** is off until a repo says `intake: true` in
+  `configs/repos.yaml`. Then every five minutes vigild turns each open
+  issue labelled `vigil:ready` into a job, once; `value:N` and `risk:N`
+  labels score it (3 each by default). Anyone who can label issues there
+  can start work, so turn it on only where you trust everyone with triage
+  access. A labelled issue starts a coord draft (up to `coord_session_usd`,
+  $2, against the day); nothing runs past `spec_pending` until you approve
+  the spec. On today: `thomasbardhi01/parkagent` (owner, 2026-10-27). An issue that
+  already has a job is skipped, matched by the job's `issue` field, and so is
+  a second `POST /api/jobs` for it (409). Every job not abandoned blocks,
+  merged and done included: a merged job's issue is not re-taken by label;
+  submit a new job for follow-up work. Label an issue only if it wasn't
+  submitted through the API, or abandon the API job first (jobs from before
+  the field carry none). An issue intake took itself stays claimed even
+  after its job is abandoned; to redo it, submit a new job through the API.
+- Running it under launchd arrives with phase 2b, together with the CLI.

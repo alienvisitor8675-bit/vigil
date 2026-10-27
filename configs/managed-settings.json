@@ -43,9 +43,25 @@
   },
   "claudeMods": {
     "guard": {
-      "secretPaths": ["run/**", "Config.xcconfig"],
+      "secretPaths": [
+        "run/**",
+        "Config.xcconfig"
+      ],
       "denyWorkflowRunOnDefaultBranch": true,
       "blockedMessage": "vigil worker: a human merges every PR; vigild pushes and opens PRs; secrets never enter a worker."
     }
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/vigil-venv/bin/python /opt/vigil/stop_hook.py",
+            "timeout": 900
+          }
+        ]
+      }
+    ]
   }
 }

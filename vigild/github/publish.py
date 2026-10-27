@@ -7,6 +7,12 @@ every file changed since the base commit vigild recorded (renames counted as
 delete + add) is in the contract's scope or the job's own `.vigil/`
 artifacts, then pushes the commit from the vault with a one-hour
 installation token and opens a draft PR. A draft or nothing.
+
+Tier 1 (owner, 2026-10-26): `.vigil/<job>/` stays in the vault. What goes out
+is the checked tree without `.vigil/` (`Workspace.public_commit`), on the last
+commit sent to the branch; the vault keeps the worker's full head. vigild only
+fast-forwards: a branch sent before this (no record, `.vigil/` on it) is refused
+(`LegacyBranch`) and left to the owner.
 """
 
 from __future__ import annotations
@@ -28,6 +34,11 @@ PROTECTED = {"main", "master"}
 
 class PublishError(RuntimeError):
     pass
+
+
+class LegacyBranch(PublishError):
+    """The PR's branch predates artifact stripping: it is on the remote with
+    `.vigil/` and vigild has no record of sending it. Only the owner can fix it."""
 
 
 class Pulls(Protocol):
@@ -66,6 +77,39 @@ class RestPulls:
         url: str = r.json()["html_url"]
         return url
 
+    def close(self, repo: str, number: int) -> None:
+        """Close a PR vigild opened (a deps PR its review failed; owner, 2026-10-23)."""
+        r = self.http.patch(
+            f"{self.api}/repos/{repo}/pulls/{number}",
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            json={"state": "closed"},
+            timeout=30.0,
+        )
+        if r.status_code != 200:
+            raise PublishError(f"closing {repo}#{number} failed (HTTP {r.status_code})")
+
+    def state(self, repo: str, number: int) -> str:
+        """A PR's state: open, merged or closed (vigild's PR poll, plan 2a item 5)."""
+        r = self.http.get(
+            f"{self.api}/repos/{repo}/pulls/{number}",
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=30.0,
+        )
+        if r.status_code != 200:
+            raise PublishError(f"reading {repo}#{number} failed (HTTP {r.status_code})")
+        doc = r.json()
+        if doc.get("merged"):
+            return "merged"
+        return "closed" if doc.get("state") == "closed" else "open"
+
 
 def artifact_paths(job_id: str, task_id: str) -> list[str]:
     """The only places under `.vigil/` a worker may write: its own task's
@@ -100,8 +144,11 @@ def publish(
     pulls: Pulls,
     scope: Sequence[str],
     token: str | None = None,
+    existing: str | None = None,
 ) -> str:
-    """Check, push `head` to `branch`, and open a draft PR into `base`."""
+    """Check, push `head` to `branch`, and open a draft PR into `base`. With
+    `existing` (a fix round on a published branch, phase 2a), the same checks
+    and the push, and the PR that's already open stands."""
     from vigild.workspace import WorkspaceError
 
     if branch in PROTECTED or branch == base or not BRANCH.match(branch) or ".." in branch:
@@ -110,13 +157,28 @@ def publish(
         changed = [path for _, path in ws.changed(repo, base_sha, head)]
     except WorkspaceError as e:
         raise PublishError(str(e)) from e
-    if not changed:
-        raise PublishError(f"{branch} changes nothing since {base_sha[:12]}")
     outside = out_of_scope(changed, scope)
     if outside:
         raise PublishError(f"files changed outside the contract's scope: {outside}")
     try:
-        ws.push(repo, head, branch, token)
+        # Tier 1: the job's `.vigil/` artifacts stay in the vault; what goes to the
+        # target repo is the same tree without them (the base's own `.vigil` kept)
+        send = ws.public_commit(repo, head, base_sha, branch)
+        if existing and ws.published_sha(repo, branch) is None and send != head:
+            raise LegacyBranch(
+                f"{branch} predates artifact stripping and carries .vigil/; vigild never "
+                "forces a branch: the owner must clean it by hand, or re-plan"
+            )
+        sent = [path for _, path in ws.changed(repo, base_sha, send)]
+        if not sent:
+            raise PublishError(f"{branch} changes nothing since {base_sha[:12]}")
+        outside = out_of_scope(sent, scope)  # what is sent, too
+        if outside:
+            raise PublishError(f"files in the commit sent are outside the scope: {outside}")
+        ws.push(repo, send, branch, token)
+        ws.record_published(repo, branch, send)
     except WorkspaceError as e:
         raise PublishError(str(e)) from e
+    if existing:
+        return existing
     return pulls.create_pull(repo, head=branch, base=base, title=title, body=body, draft=True)

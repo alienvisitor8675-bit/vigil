@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Any
 
 import httpx2
 import jwt
@@ -233,3 +234,27 @@ def test_is_private_uses_a_metadata_read_token_and_revokes_it(
     mint = next(r for r in seen if r.url.path.endswith("/access_tokens"))
     assert json.loads(mint.content)["permissions"] == {"metadata": "read"}
     assert any(r.method == "DELETE" for r in seen)
+
+
+@pytest.mark.parametrize("payload", [{"private": None}, {"private": "false"}, {"private": 0}, {}])
+def test_is_private_reads_only_a_json_bool_and_anything_else_is_private(
+    keypair: tuple[bytes, rsa.RSAPublicKey], payload: dict[str, Any]
+) -> None:
+    """Review A3: `bool(None)` made a null answer public. Only JSON true or
+    false is read; null, a string, a number or a missing key count as private."""
+
+    def handler(req: httpx2.Request) -> httpx2.Response:
+        if req.url.path.endswith("/installation"):
+            return httpx2.Response(200, json={"id": 1})
+        if req.url.path.endswith("/access_tokens"):
+            body = json.loads(req.content)
+            return httpx2.Response(
+                201, json={"token": "ghs_m", "expires_at": "z", "permissions": body["permissions"]}
+            )
+        if req.url.path == "/repos/thomasbardhi01/vigil":
+            return httpx2.Response(200, json=payload)
+        return httpx2.Response(204)
+
+    app = GitHubApp("1", keypair[0], http=httpx2.Client(transport=httpx2.MockTransport(handler)),
+                    claude_mods=CLAUDE_MODS, allowed_repos=["thomasbardhi01/vigil"])  # fmt: skip
+    assert app.is_private("thomasbardhi01/vigil") is True

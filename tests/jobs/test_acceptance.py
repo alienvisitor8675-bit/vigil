@@ -318,3 +318,57 @@ def test_failing_hidden_tests_reject_a_task_whose_visible_tests_pass(
     assert not escalates({**FLAGGED, "hidden": hidden})  # they exist; the task just fails
     # and the failure names no hidden test: it can reach the coord's replan context
     assert "test_hidden" not in " ".join(errors)
+
+
+# --- #31 item 1: must_fail_first off needs the worker's own tests to have run ---------------
+
+OFF = {**CONTRACT, "spec": {**CONTRACT["spec"], "must_fail_first": False}}
+AFTER_ONLY = {"after": {"outcome": "pass"}, "source": "verifier"}
+
+
+def _ids(ran: int, bad: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "checked": True,
+        "mode": "after_only",
+        "worker_ran": ran,
+        "not_passing_after": bad or [],
+    }
+
+
+def test_mff_off_with_no_worker_test_run_is_refused(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _result(ws, tmp_path)
+    errors = _check(ws, base, head, contract=OFF, tests={**AFTER_ONLY, "ids": _ids(0)})
+    assert any("must_fail_first is off" in e and "none of the worker's" in e for e in errors)
+
+
+def test_mff_off_with_a_failing_worker_test_is_refused(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _result(ws, tmp_path)
+    tests = {**AFTER_ONLY, "ids": _ids(2, ["t::a"])}
+    assert any("t::a" in e for e in _check(ws, base, head, contract=OFF, tests=tests))
+
+
+def test_mff_off_with_every_worker_test_passing_is_accepted(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _result(ws, tmp_path)
+    assert _check(ws, base, head, contract=OFF, tests={**AFTER_ONLY, "ids": _ids(2)}) == []
+
+
+def test_mff_off_without_an_id_record_is_refused(ws: Workspace, tmp_path: Path) -> None:
+    base, head = _result(ws, tmp_path)
+    errors = _check(ws, base, head, contract=OFF, tests=AFTER_ONLY)
+    assert any("can't be confirmed" in e for e in errors)
+
+
+def test_mff_off_unsettled_ids_are_refused_with_the_reason() -> None:
+    from vigild.jobs.acceptance import check_tests
+
+    tests = {
+        "source": "verifier",
+        "after": {"outcome": "pass"},
+        "ids": {"checked": False, "note": "the second base run gave no report"},
+    }
+    errors = check_tests({"test_cmd": "pytest -q", "must_fail_first": False}, tests)
+    assert any("second base run" in e for e in errors), errors
+    ok = {"source": "verifier", "after": {"outcome": "pass"},
+          "ids": {"checked": True, "worker_ran": 0, "not_passing_after": []}}  # fmt: skip
+    errors = check_tests({"test_cmd": "pytest -q", "must_fail_first": False}, ok)
+    assert any("new test id" in e for e in errors), errors

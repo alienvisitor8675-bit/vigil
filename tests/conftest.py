@@ -115,3 +115,29 @@ def fixture_repo(tmp_path: Path) -> dict[str, Any]:
     git(seed, "remote", "add", "origin", str(bare))
     git(seed, "push", "-q", "origin", "main")
     return {"bare": bare, "seed": seed}
+
+
+@pytest.fixture(autouse=True)
+def public_repos() -> Iterator[None]:
+    """vigild reads visibility live from GitHub (owner, 2026-10-23); tests see
+    every repo as public unless they set their own source. Without one,
+    vigild treats a repo as private."""
+    from vigild.repos import set_visibility_source
+
+    set_visibility_source(lambda repo: False)
+    yield
+    set_visibility_source(None)
+
+
+def hold_usd(gw: Any, session_id: str, usd: float, model: str = "claude-sonnet-5-5") -> float:
+    """Hold a call of about `usd` against a session, as one in flight: output tokens only
+    (no input), the session's output cap lifted so any amount can be asked for. Returns
+    the amount held; the gateway's clamp and reviewer allowance apply as for a real call."""
+    from vigild.metering.calls import CallUsage
+
+    rate = gw.prices.cost(model, CallUsage(tokens_out=1_000_000)) / 1_000_000
+    n = max(1, round(usd / rate))
+    gw.cfg.budgets.session_max_output_tokens = max(gw.cfg.budgets.session_max_output_tokens, n)
+    body = {"model": model, "max_tokens": n}
+    amount, _body, _raw = gw._hold_clamped(session_id, model, body, b"")
+    return float(amount)

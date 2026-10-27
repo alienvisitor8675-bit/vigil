@@ -6,6 +6,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from vigild import db
 from vigild.db import Store
 
@@ -57,8 +59,8 @@ def _drifted(path: Path) -> None:
     conn = sqlite3.connect(path)
     conn.executescript(db.SCHEMA)
     conn.execute("ALTER TABLE model_calls DROP COLUMN truncated")
-    conn.execute("CREATE TABLE breakers (name TEXT PRIMARY KEY, n INTEGER)")
-    conn.execute("INSERT INTO breakers VALUES ('b', 3)")
+    conn.execute("CREATE TABLE mystery (name TEXT PRIMARY KEY, n INTEGER)")
+    conn.execute("INSERT INTO mystery VALUES ('b', 3)")
     conn.execute(
         "INSERT INTO model_calls (purpose, provider, model, tokens_in, tokens_out, cost_usd,"
         " ts, provenance, tokens_cache_read, tokens_cache_write_5m, tokens_cache_write_1h)"
@@ -76,7 +78,7 @@ def test_every_step_runs_whatever_user_version_says(tmp_path: Path) -> None:
     assert "truncated" in _cols(store, "model_calls")
     row = store.q("SELECT * FROM model_calls")[0]
     assert row["cost_usd"] == 0.5 and row["truncated"] == 0
-    assert store.q("SELECT n FROM breakers WHERE name='b'")[0]["n"] == 3
+    assert store.q("SELECT n FROM mystery WHERE name='b'")[0]["n"] == 3
     assert store.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)
 
 
@@ -92,3 +94,130 @@ def test_running_migrate_twice_is_a_no_op(tmp_path: Path) -> None:
     after = [tuple(r) for r in store.q("SELECT * FROM sqlite_master ORDER BY name")]
     assert before == after
     assert len(store.q("SELECT * FROM inbox_items")) == 1
+
+
+def test_round2_adds_provenance_and_the_new_columns(tmp_path: Path) -> None:
+    """Review B14: the four phase 2a tables carry provenance; owner rulings 1,
+    4 and 6 add ladder_changes, model_calls.repo and decisions.kind."""
+    path = tmp_path / "v.db"
+    store = Store.open(path)
+    for table in ("ladder", "intake_seen", "breakers", "jev_drift"):
+        assert "provenance" in _cols(store, table), table
+    assert "repo" in _cols(store, "model_calls") and "kind" in _cols(store, "decisions")
+    assert {"shape", "old_rung", "new_rung", "reason", "sample_size", "match_rate",
+            "provenance"} <= _cols(store, "ladder_changes")  # fmt: skip
+    store.x(
+        "INSERT INTO breakers (kind, scope, state, count, held, detail, updated_at)"
+        " VALUES ('wip','repo:o/r','closed',0,'[]','{}','t')"
+    )
+    assert store.q("SELECT provenance FROM breakers")[0][0] == "human"
+    store.conn.close()
+
+
+def test_round2_migrates_an_m8_database_and_keeps_its_rows(tmp_path: Path) -> None:
+    path = tmp_path / "v.db"
+    store = Store.open(path)
+    store.conn.execute("PRAGMA user_version = 8")
+    store.conn.close()
+    again = Store.open(path)  # m9 runs again: idempotent
+    assert again.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)
+
+
+def _shape(conn: sqlite3.Connection) -> dict[str, list[tuple[str, str]]]:
+    tables = [
+        r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    ]
+    return {
+        t: sorted((r[1], r[2]) for r in conn.execute(f"PRAGMA table_info({t})").fetchall())
+        for t in tables
+    }
+
+
+def test_two_a_steps_follow_mains_and_end_with_the_full_schema(tmp_path: Path) -> None:
+    """A DB at main's steps (1-5) has none of 2a's tables or columns; 2a's steps,
+    appended after, build them, tolerate tables an earlier dev run already made,
+    and a second pass changes nothing."""
+    assert [s.__name__ for s in db.MIGRATIONS[:5]] == [
+        "_m1_gateway_token_binding",
+        "_m2_dev_image_keys",
+        "_m3_job_blocked_on",
+        "_m4_call_truncated",
+        "_m5_scrub_private_keys",
+    ]
+    fresh = Store.open(tmp_path / "fresh.db")  # SCHEMA, then every step
+    want = _shape(fresh.conn)
+    fresh.conn.close()
+
+    path = tmp_path / "main.db"
+    conn = sqlite3.connect(path)
+    conn.isolation_level = None
+    conn.executescript(db.SCHEMA)
+    for t in ("ladder", "ladder_changes", "intake_seen", "transcripts", "breakers", "jev_drift"):
+        conn.execute(f"DROP TABLE IF EXISTS {t}")  # what main's steps leave: none of 2a's
+    for table, col in (
+        ("model_calls", "repo"),
+        ("decisions", "kind"),
+        ("gateway_tokens", "private"),
+    ):
+        if col in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+            conn.execute(f"ALTER TABLE {table} DROP COLUMN {col}")
+    for step in db.MIGRATIONS[:5]:  # main's steps, exactly as main has them
+        conn.execute("BEGIN IMMEDIATE")
+        step(conn)
+        conn.execute("COMMIT")
+    conn.execute("PRAGMA user_version = 5")
+    conn.execute(  # a table a 2a dev run already made, with a row in it
+        "CREATE TABLE IF NOT EXISTS jev_drift (route TEXT NOT NULL, version TEXT NOT NULL,"
+        " pin TEXT NOT NULL, item_id INTEGER, first_seen TEXT NOT NULL,"
+        " PRIMARY KEY (route, version))"
+    )
+    conn.execute("INSERT INTO jev_drift VALUES ('r','v','p',NULL,'t')")
+    assert _shape(conn) != want
+    db.migrate(conn)
+    assert _shape(conn) == want
+    assert conn.execute("SELECT route FROM jev_drift").fetchone()[0] == "r"
+    before = [tuple(r) for r in conn.execute("SELECT * FROM sqlite_master ORDER BY name")]
+    db.migrate(conn)
+    assert before == [tuple(r) for r in conn.execute("SELECT * FROM sqlite_master ORDER BY name")]
+    conn.close()
+
+
+def test_the_issue_link_column_is_added_idempotently(tmp_path: Path) -> None:
+    """A job from before the issue link keeps its row, with no link; the step runs twice."""
+    path = tmp_path / "issue.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db.SCHEMA)
+    assert "issue" not in {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    conn.commit()
+    conn.close()
+    store = Store.open(path)
+    assert "issue" in _cols(store, "jobs")
+    db.migrate(store.conn)
+    db.migrate(store.conn)
+    assert "issue" in _cols(store, "jobs")
+
+
+def test_one_live_job_per_issue_is_a_unique_index(tmp_path: Path) -> None:
+    """A DB at step 11 gains the partial unique index; twice is the same; a second
+    live job for (repo, issue) fails, an abandoned one does not count."""
+    path = tmp_path / "step11.db"
+    conn = sqlite3.connect(path)
+    conn.isolation_level = None
+    conn.executescript(db.SCHEMA)
+    for step in db.MIGRATIONS[:11]:
+        step(conn)
+    conn.execute("PRAGMA user_version = 11")
+    conn.close()
+    store = Store.open(path)
+    db.migrate(store.conn)
+    db.migrate(store.conn)
+    names = {r["name"] for r in store.q("PRAGMA index_list(jobs)") if r["unique"]}
+    assert "jobs_live_issue" in names
+    first = store.create_job(repo="o/r", base="main", title="t", request="r", notes=[], issue=5)
+    with pytest.raises(sqlite3.IntegrityError):
+        store.create_job(repo="o/r", base="main", title="t", request="r", notes=[], issue=5)
+    store.create_job(repo="o/r", base="main", title="t", request="r", notes=[], issue=None)
+    store.create_job(repo="o/r", base="main", title="t", request="r", notes=[], issue=None)
+    store.create_job(repo="o/other", base="main", title="t", request="r", notes=[], issue=5)
+    store.x("UPDATE jobs SET state='abandoned' WHERE id=?", (first.id,))
+    store.create_job(repo="o/r", base="main", title="t", request="r", notes=[], issue=5)

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -86,8 +87,12 @@ class Sources(Protocol):
     """What DevImages needs from the Workspace: blob ids and files at a commit
     in vigild's mirror, and a clean checkout of it."""
 
-    def blob_ids(self, repo: str, sha: str, paths: list[str]) -> dict[str, str | None]: ...
-    def export_files(self, repo: str, sha: str, paths: list[str], dest: Path) -> None: ...
+    def blob_ids(
+        self, repo: str, sha: str, paths: list[str], source: str = "mirror"
+    ) -> dict[str, str | None]: ...
+    def export_files(
+        self, repo: str, sha: str, paths: list[str], dest: Path, source: str = "mirror"
+    ) -> None: ...
     def verify_checkout(
         self,
         repo: str,
@@ -142,9 +147,9 @@ class DevImages:
     def dockerfile(self, repo: str) -> Path:
         return ROOT / self.cfg.repo(repo).dev_dockerfile
 
-    def key(self, repo: str, base_sha: str) -> str:
+    def key(self, repo: str, base_sha: str, source: str = "mirror") -> str:
         pol = self.cfg.repo(repo)
-        blobs = self.sources.blob_ids(repo, base_sha, list(pol.dev_lockfiles))
+        blobs = self.sources.blob_ids(repo, base_sha, list(pol.dev_lockfiles), source)
         h = hashlib.sha256()
         h.update(self.dockerfile(repo).read_bytes())
         for path in sorted(blobs):
@@ -182,10 +187,14 @@ class DevImages:
             return False, f"{tag} changed since it was validated"
         return True, tag
 
-    def ensure_fresh(self, repo: str, base_sha: str, *, force: bool = False) -> str:
-        """The validated image for this base, built now if its key is new."""
+    def ensure_fresh(
+        self, repo: str, base_sha: str, *, force: bool = False, source: str = "mirror"
+    ) -> str:
+        """The validated image for this base, built now if its key is new.
+        `source="vault"`: a commit only vigild's vault has (a deps job's head,
+        plan 2a item 5): built from its lockfiles, its suites run on it."""
         with self._lock(repo):
-            key = self.key(repo, base_sha)
+            key = self.key(repo, base_sha, source)
             tag = self.tag(repo, key)
             last = self.latest(repo, key)
             if last is not None and not force:
@@ -197,18 +206,20 @@ class DevImages:
                 current = self.docker.image_id_of(tag)
                 if current is not None and current == last["image_id"]:
                     return tag
-            v = self.build_and_validate(repo, base_sha, key)
+            v = self.build_and_validate(repo, base_sha, key, source)
             if not v.ok:
                 self._page(v)
                 raise StaleDevImage(f"{repo}: dev image {tag} failed its {v.stage}")
             return tag
 
-    def build_and_validate(self, repo: str, base_sha: str, key: str) -> Validation:
+    def build_and_validate(
+        self, repo: str, base_sha: str, key: str, source: str = "mirror"
+    ) -> Validation:
         pol = self.cfg.repo(repo)
         tag = self.tag(repo, key)
         ctx = Path(tempfile.mkdtemp(prefix="vigil-devctx-"))
         try:
-            self.sources.export_files(repo, base_sha, list(pol.dev_lockfiles), ctx)
+            self.sources.export_files(repo, base_sha, list(pol.dev_lockfiles), ctx, source)
             ok, out = self.docker.build(ctx, self.dockerfile(repo), tag, timeout_s=BUILD_SECONDS)
         finally:
             shutil.rmtree(ctx, ignore_errors=True)
@@ -216,7 +227,7 @@ class DevImages:
         if not ok or image_id is None:
             failed: dict[str, Any] = {"build": out[-TAIL:]}
             return self._record(repo, key, tag, None, False, "build", failed, base_sha)
-        src = self.sources.verify_checkout(repo, f"devimage-{key[:16]}", base_sha, source="mirror")
+        src = self.sources.verify_checkout(repo, f"devimage-{key[:16]}", base_sha, source=source)
         suites: dict[str, dict[str, Any]] = {}
         try:
             for name, cmd in pol.dev_suites.items():
@@ -288,6 +299,7 @@ EXECUTOR_LAYER = ROOT / "images" / "claude-executor"
 LAYER_LABEL = "dev.vigil.layer-digest"
 SESSION_KEY_LABEL = "dev.vigil.session-key"
 MANAGED_SETTINGS = ROOT / "configs" / "managed-settings.json"
+REPORT_SCHEMA = ROOT / "schemas" / "worker_report.schema.json"  # the Stop hook's (item 6)
 # What a session image must have: the CLI at its pin, the harness's Python
 # with the SDK, setpriv for the agent uid, and guard seeded.
 SESSION_CHECK = (
@@ -304,7 +316,7 @@ def layer_digest() -> str:
     files = sorted(
         f for f in EXECUTOR_LAYER.rglob("*") if f.is_file() and "__pycache__" not in f.parts
     )
-    for f in [*files, MANAGED_SETTINGS]:
+    for f in [*files, MANAGED_SETTINGS, REPORT_SCHEMA]:
         h.update(str(f.relative_to(ROOT)).encode() + b"\0" + f.read_bytes() + b"\0")
     return h.hexdigest()
 
@@ -377,7 +389,11 @@ class SessionImages:
             tag,
             timeout_s=BUILD_SECONDS,
             build_args={"BASE": dev_tag},
-            contexts={"claude_mods": self.claude_mods(), "vigil_configs": ROOT / "configs"},
+            contexts={
+                "claude_mods": self.claude_mods(),
+                "vigil_configs": ROOT / "configs",
+                "vigil_schemas": ROOT / "schemas",
+            },
             labels={LAYER_LABEL: layer_digest(), SESSION_KEY_LABEL: key},
         )
         image_id = self.dev.docker.image_id_of(tag) if ok else None
@@ -391,6 +407,21 @@ class SessionImages:
         )
 
 
+def docker_cli(cli: str | None = None) -> tuple[str, dict[str, str]]:
+    """The docker CLI and an environment it can run in (phase 2a, item 0).
+
+    Docker Desktop's CLI calls `docker-credential-desktop`, which lives beside
+    the real binary (`~/.docker/bin/docker` is a symlink to it). vigild under
+    launchd, or any bare shell, may not have that directory on PATH; the CLI
+    then fails with "executable file not found". So the CLI's own directory,
+    and the directory it resolves to, go first on PATH."""
+    path = cli or shutil.which("docker") or str(Path.home() / ".docker/bin/docker")
+    dirs = [str(Path(path).parent), str(Path(path).resolve().parent)]
+    rest = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+    env = {**os.environ, "PATH": os.pathsep.join(dict.fromkeys([*dirs, *rest]))}
+    return path, env
+
+
 class DockerImages:
     """The real DockerLike. Builds go through the docker CLI, so they get
     BuildKit (the dev Dockerfiles use heredocs and `COPY --chmod`); they have
@@ -399,7 +430,7 @@ class DockerImages:
 
     def __init__(self, client: Any, cli: str | None = None) -> None:
         self.client = client
-        self.cli = cli or shutil.which("docker") or str(Path.home() / ".docker/bin/docker")
+        self.cli, self.env = docker_cli(cli)
 
     def image_id_of(self, image: str) -> str | None:
         import docker.errors
@@ -437,6 +468,7 @@ class DockerImages:
                 text=True,
                 timeout=timeout_s,
                 check=False,
+                env=self.env,
             )
         except subprocess.TimeoutExpired:
             return False, f"the build took longer than {timeout_s} s"

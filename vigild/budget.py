@@ -4,7 +4,7 @@ Before any session starts (coord, worker, reviewer, auditor) or vigild makes
 a model call of its own (the decider), it reserves that session's
 max_cost_usd. A reservation is refused unless
 
-    spent (today) + open reservations (today) + this one <= daily cap,
+    spent (today) + every open reservation + this one <= daily cap,
 
 the same against the month, and the task's own spend + this one <= the
 per-task cap. Settling turns a reservation into metered spend (the sum of the
@@ -52,18 +52,15 @@ class Budget:
         return self._sum("SELECT SUM(amount_usd) FROM ledger WHERE day=?", (self._day(),))
 
     def open_today(self) -> float:
-        # Open reservations count against the day they were made. One left open
-        # by a crash stops counting at midnight; the startup reconcile settles it.
-        return self._sum(
-            "SELECT SUM(amount_usd) FROM reservations WHERE status='open' AND day=?",
-            (self._day(),),
-        )
+        """Every open reservation, whatever day it was made (2a round 7): a
+        session still running at UTC midnight books its whole cost to the
+        day it settles, so the new day's cap must already see it. One a
+        crash left open is settled by the startup reconcile."""
+        return self._sum("SELECT SUM(amount_usd) FROM reservations WHERE status='open'", ())
 
     def open_month(self) -> float:
-        return self._sum(
-            "SELECT SUM(amount_usd) FROM reservations WHERE status='open' AND month=?",
-            (self._month(),),
-        )
+        """Every open reservation, whatever month it was made (2a round 7)."""
+        return self._sum("SELECT SUM(amount_usd) FROM reservations WHERE status='open'", ())
 
     def spent_month(self) -> float:
         return self._sum("SELECT SUM(amount_usd) FROM ledger WHERE month=?", (self._month(),))
@@ -122,7 +119,9 @@ class Budget:
 
     def settle(self, reservation_id: int, amount: float | None = None) -> float:
         """Close a reservation; its session's metered cost (or `amount`, for a
-        call vigild made itself) becomes spend."""
+        call vigild made itself, or a session whose spend is unknown) becomes spend.
+        For a session an `amount` may be as much as all its open reservations together,
+        and the others (an over-cap extension, a draw's top-up) close with it."""
         with self.store.tx() as c:
             row = c.execute(
                 "SELECT session_id, task_id, status FROM reservations WHERE id=?",
@@ -131,7 +130,30 @@ class Budget:
             if row is None or row["status"] != "open":
                 return 0.0
             if amount is not None:
-                spent = amount
+                # never more than was reserved (2a round 8): the rest is recorded,
+                # and the caller (the gateway) trips the daily breaker for it
+                if row["session_id"]:
+                    held = float(
+                        c.execute(
+                            "SELECT SUM(amount_usd) FROM reservations"
+                            " WHERE session_id=? AND status='open'",
+                            (row["session_id"],),
+                        ).fetchone()[0]
+                    )
+                else:
+                    held = float(
+                        c.execute(
+                            "SELECT amount_usd FROM reservations WHERE id=?", (reservation_id,)
+                        ).fetchone()[0]
+                    )
+                spent = min(amount, held)
+                if amount > held + EPS:
+                    self.store.add_event(
+                        "settle_excess",
+                        {"reservation": reservation_id, "reserved_usd": round(held, 6),
+                         "reported_usd": round(amount, 6), "excess_usd": round(amount - held, 6)},
+                        "human",
+                    )  # fmt: skip
             elif row["session_id"]:
                 spent = session_cost(self.store, row["session_id"])
             else:
@@ -140,6 +162,14 @@ class Budget:
                 "UPDATE reservations SET status='settled', closed_at=? WHERE id=?",
                 (iso(self.clock()), reservation_id),
             )
+            if row["session_id"]:
+                # the session's other reservations (a draw's top-up, an
+                # over-cap extension) close with it: its cost is booked once
+                c.execute(
+                    "UPDATE reservations SET status='released', closed_at=?"
+                    " WHERE session_id=? AND status='open' AND id != ?",
+                    (iso(self.clock()), row["session_id"], reservation_id),
+                )
             c.execute(
                 "INSERT INTO ledger (reservation_id, session_id, task_id, amount_usd, day, month,"
                 " ts) VALUES (?,?,?,?,?,?,?)",
@@ -166,6 +196,53 @@ class Budget:
                 (session_id, task_id, amount, self._day(), self._month(), iso(self.clock())),
             )
 
+    def draw(self, parent_id: int, *, session_id: str, amount: float, purpose: str) -> int:
+        """A session's own reservation, taken out of a job's review-stage
+        reservation (owner, 2026-10-23): the stage shrinks by what the session
+        takes, so the total held doesn't change. Every open reservation counts
+        against today and this month whatever day it was made (2a round 7),
+        so a draw after UTC midnight moves money within the new day's count.
+        If the stage has less left than `amount`, the rest is reserved under
+        the caps as usual; if that is refused, the draw is undone."""
+        rid, take = 0, 0.0
+        with self.store.tx() as c:
+            row = c.execute(
+                "SELECT amount_usd, status FROM reservations WHERE id=?", (parent_id,)
+            ).fetchone()
+            if row is not None and row["status"] == "open":
+                take = min(amount, float(row["amount_usd"]))
+            if take > 0:
+                c.execute(
+                    "UPDATE reservations SET amount_usd = amount_usd - ? WHERE id=?",
+                    (take, parent_id),
+                )
+                cur = c.execute(
+                    "INSERT INTO reservations (session_id, task_id, purpose, amount_usd, status,"
+                    " day, month, created_at) VALUES (?,?,?,?, 'open', ?,?,?)",
+                    (session_id, None, purpose, take, self._day(), self._month(),
+                     iso(self.clock())),
+                )  # fmt: skip
+                rid = int(cur.lastrowid or 0)
+        if take <= 0:
+            return self.reserve(session_id=session_id, task_id=None, amount=amount, purpose=purpose)
+        if amount - take > EPS:
+            try:
+                self.reserve(
+                    session_id=session_id, task_id=None, amount=amount - take, purpose=purpose
+                )
+            except BudgetExceeded:
+                with self.store.tx() as c:  # undo the draw: nothing is left behind
+                    c.execute(
+                        "UPDATE reservations SET status='released', closed_at=? WHERE id=?",
+                        (iso(self.clock()), rid),
+                    )
+                    c.execute(
+                        "UPDATE reservations SET amount_usd = amount_usd + ? WHERE id=?",
+                        (take, parent_id),
+                    )
+                raise
+        return rid
+
     def settle_session(self, session_id: str) -> float:
         rows = self.store.q(
             "SELECT id FROM reservations WHERE session_id=? AND status='open'", (session_id,)
@@ -181,6 +258,16 @@ class Budget:
             return 0.0
         return held - session_cost(self.store, session_id)
 
+    def spent_today_by_purpose(self) -> dict[str, float]:
+        """Today's metered spend per purpose: a Haiku decider call made because
+        Jev failed or drifted books `decider_fallback`, apart from `decider`
+        (owner, 2026-10-23), so a drift can't quietly eat the day."""
+        rows = self.store.q(
+            "SELECT purpose, SUM(cost_usd) n FROM model_calls WHERE ts LIKE ? GROUP BY purpose",
+            (f"{self._day()}%",),
+        )
+        return {str(r["purpose"]): round(float(r["n"] or 0), 6) for r in rows}
+
     def summary(self) -> dict[str, float]:
         return {
             "daily_cap": self.cfg.daily_usd,
@@ -189,4 +276,6 @@ class Budget:
             "spent_today": round(self.spent_today(), 6),
             "reserved_open": round(self.open_today(), 6),
             "spent_month": round(self.spent_month(), 6),
+            "decider_today": self.spent_today_by_purpose().get("decider", 0.0),
+            "decider_fallback_today": self.spent_today_by_purpose().get("decider_fallback", 0.0),
         }

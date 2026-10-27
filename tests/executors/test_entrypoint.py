@@ -336,3 +336,127 @@ def test_an_authors_files_at_its_vitest_placement_are_committed_only_with_its_ow
     shown = _run(work, "show", "--name-only", "--format=", head)
     assert f"{folder}/a.test.ts" in shown and "stray.ts" not in shown
     assert "server/stray.ts" in left_out
+
+
+# --- phase 2a, item 1: reviewers and auditors read and answer ----------------------------
+
+
+def test_reviewers_get_read_only_tools_and_structured_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ep = _entrypoint()
+    schema = {"type": "object", "properties": {"verdict": {"type": "string"}}}
+    (tmp_path / "schema.json").write_text(json.dumps(schema))
+    monkeypatch.setenv("VIGIL_GATEWAY_URL", "http://gw")
+    monkeypatch.setenv("VIGIL_OUTPUT_SCHEMA", str(tmp_path / "schema.json"))
+    for role in ("reviewer", "auditor"):
+        opts = ep.agent_options(role, TOKEN, print)
+        assert opts["tools"] == ["Read", "Grep", "Glob"]
+        assert {"Bash", "Edit", "Write", "NotebookEdit"} <= set(opts["disallowed_tools"])
+        assert opts["output_format"] == {"type": "json_schema", "schema": schema}
+    monkeypatch.delenv("VIGIL_OUTPUT_SCHEMA")
+    worker = ep.agent_options("worker", TOKEN, print)
+    assert "tools" not in worker and "output_format" not in worker
+
+
+def test_a_review_commits_nothing_and_answers_on_the_result_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    work, base = _work(tmp_path)
+    (work / ".vigil" / "task.json").write_text(json.dumps(_task(base)))
+    ep = _harness(tmp_path, work)
+    answer = {"verdict": "clean", "findings": []}
+
+    async def agent(packet: str, role: str, token: str) -> dict[str, Any]:
+        return {"plugins": ["guard"], "structured_output": answer}
+
+    monkeypatch.setattr(ep, "run_agent", agent)
+    monkeypatch.setenv("VIGIL_ROLE", "reviewer")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"gateway_token": TOKEN}) + "\n"))
+    assert ep.main() == 0
+    result = json.loads(capsys.readouterr().out.splitlines()[-1])["vigil_result"]
+    assert result["status"] == "done" and result["structured_output"] == answer
+    assert "head" not in result
+    assert not (ep.OUT / "result.bundle").exists()
+    assert _run(work, "rev-parse", BRANCH) == base
+
+
+# --- phase 2a, items 2-3: transcripts go out as they're written; resume reads them back ---
+
+
+def test_the_transcript_store_mirrors_lines_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import asyncio
+
+    ep = _entrypoint()
+    store = ep.TranscriptStore(TOKEN)
+    entries = [{"type": "user", "uuid": "u1", "message": {"content": f"token {TOKEN}"}}]
+    asyncio.run(store.append({"project_key": "-work", "session_id": "sdk-1"}, entries))
+    (line,) = capsys.readouterr().out.splitlines()
+    out = json.loads(line)["vigil_transcript"]
+    assert out["session_id"] == "sdk-1" and out["subpath"] is None
+    assert TOKEN not in line and out["entries"][0]["uuid"] == "u1"
+    # it never loads: a store-backed resume lands in a root-only temp dir
+    assert asyncio.run(store.load({"project_key": "-work", "session_id": "sdk-1"})) is None
+
+
+SID = "0b6f1a52-6c4e-4c5e-9a43-1f2d3e4c5b6a"
+
+
+def test_a_resume_places_vigilds_transcript_where_the_cli_looks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ep = _entrypoint()
+    ep.WORK = Path("/work")
+    ep.RESUME = tmp_path / "resume.jsonl"
+    ep.RESUME.write_text('{"type": "user", "uuid": "u1"}\n{"type": "assistant", "uuid": "a1"}\n')
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "home" / ".claude"))
+    monkeypatch.setenv("VIGIL_GATEWAY_URL", "http://gw")
+    monkeypatch.setenv("VIGIL_RESUME_SESSION", SID)
+    monkeypatch.setenv("VIGIL_RESUME_FORK", "1")
+    assert ep.place_resume() == SID
+    placed = tmp_path / "home" / ".claude" / "projects" / "-work" / f"{SID}.jsonl"
+    assert placed.read_text() == ep.RESUME.read_text()
+    opts = ep.agent_options("worker", TOKEN, print)
+    assert opts["resume"] == SID and opts["fork_session"] is True
+    assert opts["session_store_flush"] == "eager" and opts["session_store"] is not None
+    monkeypatch.setenv("VIGIL_RESUME_SESSION", "../../etc/passwd")
+    with pytest.raises(ep.HarnessRefused):
+        ep.place_resume()
+    monkeypatch.delenv("VIGIL_RESUME_SESSION")
+    assert ep.place_resume() is None
+    assert "resume" not in ep.agent_options("worker", TOKEN, print)
+
+
+def test_a_checkpoint_bundles_the_work_without_touching_the_branch(tmp_path: Path) -> None:
+    """Phase 2a, item 3: the work so far as a commit off the branch; the
+    branch, HEAD and the agent's index stay as they were."""
+    work, base = _work(tmp_path)
+    (work / "a.txt").write_text("changed\n")
+    (work / "b.txt").write_text("new, in scope\n")
+    (work / "junk.log").write_text("not the work\n")
+    _run(work, "add", "a.txt")  # the agent staged something itself
+    staged = _run(work, "diff", "--cached", "--name-only")
+    ep = _harness(tmp_path, work)
+    commit = ep.checkpoint(_task(base), 4)
+    assert _run(work, "rev-parse", BRANCH) == base  # the branch didn't move
+    assert _run(work, "diff", "--cached", "--name-only") == staged  # nor did the index
+    files = _run(work, "ls-tree", "-r", "--name-only", commit).split()
+    assert {"a.txt", "b.txt"} <= set(files) and "junk.log" not in files
+    assert _run(work, "show", f"{commit}:a.txt") == "changed"
+    heads = _run(work, "bundle", "list-heads", str(ep.OUT / "checkpoint.bundle"))
+    assert heads == f"{commit} refs/vigil/checkpoint"
+
+
+def test_a_review_caps_each_calls_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gateway holds a call's worst case (max_tokens of output) against the
+    reservation; a reviewer's cap keeps that inside a review's reservation."""
+    ep = _entrypoint()
+    monkeypatch.setenv("VIGIL_GATEWAY_URL", "http://gw")
+    monkeypatch.setenv("VIGIL_MAX_OUTPUT_TOKENS", "8192")
+    assert (
+        ep.agent_options("reviewer", TOKEN, print)["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "8192"
+    )
+    monkeypatch.delenv("VIGIL_MAX_OUTPUT_TOKENS")
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in ep.agent_options("worker", TOKEN, print)["env"]

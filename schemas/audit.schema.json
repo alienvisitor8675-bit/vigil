@@ -1,0 +1,160 @@
+{
+  "$defs": {
+    "AuditFinding": {
+      "additionalProperties": false,
+      "description": "One finding of the auditor's own review. `matched` is the index of the\nreviewer's finding that caught it, or None when the reviewer missed it.",
+      "properties": {
+        "claim": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "title": "Claim",
+          "type": "string"
+        },
+        "file": {
+          "maxLength": 500,
+          "minLength": 1,
+          "title": "File",
+          "type": "string"
+        },
+        "fix": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "title": "Fix",
+          "type": "string"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Line"
+        },
+        "matched": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Matched"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity"
+        }
+      },
+      "required": [
+        "severity",
+        "file",
+        "claim",
+        "fix"
+      ],
+      "title": "AuditFinding",
+      "type": "object"
+    },
+    "Provenance": {
+      "enum": [
+        "claude",
+        "local",
+        "human"
+      ],
+      "title": "Provenance",
+      "type": "string"
+    },
+    "Severity": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "title": "Severity",
+      "type": "string"
+    },
+    "Shape": {
+      "description": "The kind of change, for the review ladder (phase 2). `deps` changes\nonly manifests and lockfiles, runs no model, starts at rung 1, is capped\nthere and always needs the owner's review (round 3; owner 2026-10-23).\n`money`, `auth` and `consent` stay at rung 0 permanently.",
+      "enum": [
+        "docs",
+        "tests",
+        "feature",
+        "fix",
+        "refactor",
+        "deps",
+        "money",
+        "auth",
+        "consent"
+      ],
+      "title": "Shape",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "audit.json (stage 6). vigild computes the match rate from the list;\nit never takes the auditor's number.",
+  "properties": {
+    "auditor": {
+      "title": "Auditor",
+      "type": "string"
+    },
+    "false_findings": {
+      "items": {
+        "type": "integer"
+      },
+      "maxItems": 100,
+      "title": "False Findings",
+      "type": "array"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/AuditFinding"
+      },
+      "maxItems": 100,
+      "title": "Findings",
+      "type": "array"
+    },
+    "head": {
+      "title": "Head",
+      "type": "string"
+    },
+    "job_id": {
+      "title": "Job Id",
+      "type": "string"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "rung": {
+      "maximum": 3,
+      "minimum": 0,
+      "title": "Rung",
+      "type": "integer"
+    },
+    "shape": {
+      "$ref": "#/$defs/Shape"
+    },
+    "task_id": {
+      "title": "Task Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "findings",
+    "task_id",
+    "job_id",
+    "head",
+    "shape",
+    "rung",
+    "auditor",
+    "provenance"
+  ],
+  "title": "Audit",
+  "type": "object"
+}

@@ -14,3 +14,18 @@ hidden_tests_session_usd: 1.00  # cap for one task's whole author stage, regener
 # the model's price against a session's reservation, so an uncapped Opus call
 # ($20/M) could cost more than the reservation before it began.
 session_max_output_tokens: 16384
+# Review and audit caps (owner, 2026-10-23): per-session limits, checked call
+# by call (spend so far plus the next call's worst case), never reserved at
+# dispatch. A job reserves its review stage once, when it enters review:
+# (reviewer + auditor) x the tasks under review; sessions draw from that and
+# the rest goes back when the pass ends. A review or audit that would cross its
+# cap completes, its overage charged to the day (still a hard stop); a shape's
+# second overage pages. Starting values: re-size them from real ParkAgent
+# reviews after the phase 1 run. Not counted in the task's cap.
+review_session_usd: 0.40 # one reviewer session (Sonnet)
+audit_session_usd: 0.80  # one auditor session (Opus)
+# Haiku decisions Jev couldn't give (drift, failure, Cloudflare credit), per
+# repo per UTC day. Jev costs cents a day, so a dollar of fallback means it has
+# drifted or is failing: the repo's breaker trips, pages, and holds its
+# dispatch until the owner resets it (owner, 2026-10-23).
+decider_fallback_per_repo_usd: 1.00
