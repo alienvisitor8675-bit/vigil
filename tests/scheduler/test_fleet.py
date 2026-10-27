@@ -197,3 +197,28 @@ def test_a_task_turns_pr_open_and_records_its_pr_in_one_transaction(
     monkeypatch.setattr(w.store, "add_event", add_event)
     _run(w, 2)
     assert seen and all(seen), seen
+
+
+def test_nothing_commits_between_pr_open_and_its_pr_event(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two writes share one transaction (#41 review, round 2): from the task's
+    `pr_open` state write to its PR event, the connection never commits, so no
+    other reader can see one without the other."""
+    w = world
+    trace: list[str] = []
+    w.store.conn.set_trace_callback(trace.append)
+    try:
+        _run(w, 2)
+    finally:
+        w.store.conn.set_trace_callback(None)
+    starts = [i for i, sql in enumerate(trace) if "UPDATE tasks" in sql and "pr_open" in sql]
+    assert starts, "no pr_open state write was traced"
+    for i in starts:
+        end = next(j for j in range(i, len(trace)) if "INSERT INTO events" in trace[j]
+                   and "pr_open" in trace[j])  # fmt: skip
+        assert not any(sql.strip().upper() == "COMMIT" for sql in trace[i:end]), trace[i:end]
+        # and the state write itself is inside an explicit transaction, not autocommit
+        marks = [sql.strip().upper() for sql in trace[:i]
+                 if sql.strip().upper().startswith(("BEGIN", "COMMIT", "ROLLBACK"))]  # fmt: skip
+        assert marks and marks[-1].startswith("BEGIN"), marks[-3:]
