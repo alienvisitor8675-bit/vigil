@@ -7,6 +7,12 @@ every file changed since the base commit vigild recorded (renames counted as
 delete + add) is in the contract's scope or the job's own `.vigil/`
 artifacts, then pushes the commit from the vault with a one-hour
 installation token and opens a draft PR. A draft or nothing.
+
+Tier 1 (owner, 2026-10-26): `.vigil/<job>/` stays in the vault. What goes out
+is the checked tree without `.vigil/` (`Workspace.public_commit`), on the last
+commit sent to the branch; the vault keeps the worker's full head. vigild only
+fast-forwards: a branch sent before this (no record, `.vigil/` on it) is refused
+(`LegacyBranch`) and left to the owner.
 """
 
 from __future__ import annotations
@@ -28,6 +34,11 @@ PROTECTED = {"main", "master"}
 
 class PublishError(RuntimeError):
     pass
+
+
+class LegacyBranch(PublishError):
+    """The PR's branch predates artifact stripping: it is on the remote with
+    `.vigil/` and vigild has no record of sending it. Only the owner can fix it."""
 
 
 class Pulls(Protocol):
@@ -146,13 +157,26 @@ def publish(
         changed = [path for _, path in ws.changed(repo, base_sha, head)]
     except WorkspaceError as e:
         raise PublishError(str(e)) from e
-    if not changed:
-        raise PublishError(f"{branch} changes nothing since {base_sha[:12]}")
     outside = out_of_scope(changed, scope)
     if outside:
         raise PublishError(f"files changed outside the contract's scope: {outside}")
     try:
-        ws.push(repo, head, branch, token)
+        # Tier 1: the job's `.vigil/` artifacts stay in the vault; what goes to the
+        # target repo is the same tree without them (the base's own `.vigil` kept)
+        send = ws.public_commit(repo, head, base_sha, branch)
+        if existing and ws.published_sha(repo, branch) is None and send != head:
+            raise LegacyBranch(
+                f"{branch} predates artifact stripping and carries .vigil/; vigild never "
+                "forces a branch: the owner must clean it by hand, or re-plan"
+            )
+        sent = [path for _, path in ws.changed(repo, base_sha, send)]
+        if not sent:
+            raise PublishError(f"{branch} changes nothing since {base_sha[:12]}")
+        outside = out_of_scope(sent, scope)  # what is sent, too
+        if outside:
+            raise PublishError(f"files in the commit sent are outside the scope: {outside}")
+        ws.push(repo, send, branch, token)
+        ws.record_published(repo, branch, send)
     except WorkspaceError as e:
         raise PublishError(str(e)) from e
     if existing:

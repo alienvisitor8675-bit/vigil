@@ -69,7 +69,7 @@ from vigild.db import SessionRoleError, Store, iso, utcnow
 from vigild.devimage import DevImages, SessionImages, StaleDevImage, missing_tools
 from vigild.executors.base import ExecOutcome, Executor, Resume, SessionSpec
 from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
-from vigild.github.publish import PublishError, artifact_paths, vigild_paths
+from vigild.github.publish import LegacyBranch, PublishError, artifact_paths, vigild_paths
 from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
 from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, Place, entry_suite, load_suite, place_for
 from vigild.intake.github import issue_text
@@ -2694,7 +2694,13 @@ class JobRunner:
         self.store.update_task(task_id, state="pr_open")
         self.store.add_event(
             "pr_open",
-            {"pr_url": url, "branch": branch, "head": head, "runner_file_change": overlap},
+            {
+                "pr_url": url,
+                "branch": branch,
+                "head": head,
+                "runner_file_change": overlap,
+                **self._pub_facts(job.repo, branch, base_sha),
+            },
             Provenance.HUMAN,
             job_id=job_id,
             session_id=s.id,
@@ -2852,7 +2858,8 @@ class JobRunner:
         )
         self.store.update_task(task_id, state="pr_open")
         self.store.add_event(
-            "pr_open", {"pr_url": url, "branch": branch, "head": head},
+            "pr_open", {"pr_url": url, "branch": branch, "head": head,
+                        **self._pub_facts(job.repo, branch, base_sha)},
             Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
         )  # fmt: skip
         return True
@@ -2950,6 +2957,90 @@ class JobRunner:
             (task_id,),
         )
         return str(json.loads(rows[0]["data"])["head"]) if rows else None
+
+    def _pub_facts(self, repo: str, branch: str, base_sha: str) -> dict[str, Any]:
+        """What reached the target repo, from vigild's own record and the vault: the
+        commit sent, and whether its `.vigil` differs from the base's (None: unknown)."""
+        try:
+            sha = self.workspace.published_sha(repo, branch)
+            leak = None if sha is None else self.workspace.has_vigil(repo, sha, base_sha)
+        except WorkspaceError:
+            sha, leak = None, None
+        return {"base_sha": base_sha, "published": sha, "vigil_in_pr": leak}
+
+    def _live_pr_rows(self, job_id: str) -> dict[str, dict[str, Any] | None]:
+        """Each live, unmerged task's latest `pr_open` event data (None: no row)."""
+        out: dict[str, dict[str, Any] | None] = {}
+        for t in self.store.list_tasks(job_id):
+            if t.state in (*DEAD_TASK, "merged"):
+                continue
+            rows = self.store.q(
+                "SELECT data FROM events WHERE task_id=? AND type='pr_open' "
+                "ORDER BY id DESC LIMIT 1",
+                (t.id,),
+            )
+            out[t.id] = json.loads(rows[0]["data"]) if rows else None
+        return out
+
+    def _pr_heads(self, job_id: str) -> dict[str, dict[str, Any]]:
+        """The `ready` guard's evidence, read now from the vault: each task's last
+        commit sent and whether its `.vigil` differs from the base's."""
+        job = self.store.get_job(job_id)
+        heads: dict[str, dict[str, Any]] = {}
+        for tid, data in self._live_pr_rows(job_id).items():
+            if data is None:
+                continue
+            try:
+                base_sha = data.get("base_sha") or self.workspace.base_sha(tid)
+                facts = self._pub_facts(job.repo, data["branch"], base_sha)
+            except WorkspaceError, KeyError, OSError, ValueError:
+                continue
+            heads[tid] = {"published": facts["published"], "vigil": facts["vigil_in_pr"]}
+        return heads
+
+    def _unstripped(self, job: Job) -> tuple[dict[str, str], set[str]]:
+        """Tier 1: each live task whose PR may not match what vigild means to have
+        sent (no record, a record behind the vault head, `.vigil/` on it), as
+        {task: why}, and the ones only the owner can fix. A task that needs sending
+        again is sent, fast-forward only, to the same PR; one whose event is merely
+        stale gets a fresh event."""
+        left: dict[str, str] = {}
+        legacy: set[str] = set()
+        for tid, data in self._live_pr_rows(job.id).items():
+            if data is None:
+                left[tid] = "no PR record"
+                continue
+            t = self.store.get_task(tid)
+            try:
+                base_sha = data.get("base_sha") or self.workspace.base_sha(tid)
+                facts = self._pub_facts(job.repo, data["branch"], base_sha)
+                want = self.workspace.public_commit(
+                    job.repo, data["head"], base_sha, data["branch"]
+                )
+                if facts["published"] != want or facts["vigil_in_pr"] is not False:
+                    spec = t.contract.get("spec") or {}
+                    self.publisher.publish(
+                        repo=job.repo, head=data["head"], base_sha=base_sha, branch=data["branch"],
+                        base=job.base, title="", body="", existing=data["pr_url"],
+                        scope=[*(spec.get("files_in_scope") or []), *artifact_paths(job.id, tid),
+                               *vigild_paths(job.id)],
+                    )  # fmt: skip
+                    facts = self._pub_facts(job.repo, data["branch"], base_sha)
+            except LegacyBranch as e:
+                left[tid] = str(e)[:300]
+                legacy.add(tid)
+                continue
+            except (PublishError, WorkspaceError, KeyError, OSError, ValueError) as e:
+                left[tid] = f"its PR could not be brought up to date without .vigil/: {e}"[:300]
+                continue
+            if facts["vigil_in_pr"] is not False or facts["published"] != want:
+                left[tid] = ".vigil/ is still on its PR head"
+                continue
+            if data.get("published") != facts["published"] or data.get("vigil_in_pr") is not False:
+                self.store.add_event(
+                    "pr_open", {**data, **facts}, Provenance.HUMAN, job_id=job.id, task_id=tid
+                )
+        return left, legacy
 
     def _task_pr(self, task_id: str) -> str | None:
         rows = self.store.q(
@@ -3118,6 +3209,22 @@ class JobRunner:
             return "dispatch" if moved else "done"
         if more:
             return "next"  # clean so far; the next pass reviews the rest
+        left, legacy = self._unstripped(self.store.get_job(job_id))
+        if left:
+            self._block(job_id, f".vigil/ on the PR head of {sorted(left)}")
+            body: dict[str, Any] = {"kind": "vigil_in_pr", "tasks": left}
+            if legacy:  # retry can't help: the branch predates stripping
+                body["actions"] = ["replan", "abandon"]
+                body["next"] = "the branch predates artifact stripping and needs the owner's hand"
+            else:
+                body["actions"] = ["retry", "abandon"]
+            self._page(
+                job_id,
+                f"{job_id}: .vigil/ is on the PR head of {', '.join(sorted(left))}",
+                body,
+                resumable=not legacy,
+            )
+            return "done"
         if not self._move_on(job_id, JobState.READY, sorted(outcomes)):
             return "done"
         self.breakers.success(Kind.REPO_FAILURES, f"repo:{job.repo}")
@@ -3135,6 +3242,8 @@ class JobRunner:
         or a regeneration, or to ready). If the PR poll merged the job since
         the pass's re-check, the move is dropped quietly (`review_dropped`,
         2a rounds 6-7); a refusal for any other reason still raises."""
+        if to is JobState.READY:
+            evidence = {**(evidence or {}), "pr_heads": self._pr_heads(job_id)}
         try:
             transition(self.store, job_id, to, Actor.VIGILD, evidence=evidence)
         except TransitionError as e:

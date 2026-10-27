@@ -174,7 +174,15 @@ def test_in_review_to_ready_needs_clean_reviews(store: Store) -> None:
         transition(store, jid, S.READY, Actor.VIGILD)
     audit["findings"] = []
     store.add_artifact(jid, "audit.json", json.dumps(audit), Provenance.CLAUDE, task_id=tid)
-    assert transition(store, jid, S.READY, Actor.VIGILD).state is S.READY
+    # Tier 1: and a PR record naming the commit vigild sent now, with no job `.vigil`
+    with pytest.raises(TransitionError, match="no record"):
+        transition(store, jid, S.READY, Actor.VIGILD)
+    sent = "b" * 40
+    store.add_event("pr_open", {"published": sent}, Provenance.HUMAN, job_id=jid, task_id=tid)
+    heads = {tid: {"published": sent, "vigil": False}}
+    assert (
+        transition(store, jid, S.READY, Actor.VIGILD, evidence={"pr_heads": heads}).state is S.READY
+    )
 
 
 # ready -> merged

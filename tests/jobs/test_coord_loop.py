@@ -487,13 +487,26 @@ def test_end_to_end(world: World) -> None:
     assert w.standin.max_running == 2
     assert w.store.get_job(job).state.value == "ready"
 
-    # two draft PRs, from the host, each branch with its own worker_report.json
+    # two draft PRs, from the host; `.vigil/` never reaches the target repo (Tier 1)
+    # and the vault still holds each worker's whole result
     assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
     assert all(p["draft"] for p in w.publisher.prs)
     for n in (1, 2):
         files = git(w.bare, "ls-tree", "-r", "--name-only", f"vigil/{job}-w{n}")
-        assert f".vigil/{job}/{job}-w{n}/worker_report.json" in files
-        assert f".vigil/{job}/spec.md" in files and f".vigil/{job}/plan.md" in files
+        assert ".vigil" not in files and files
+        vault_head = w.runner._task_head(f"{job}-w{n}")
+        assert vault_head
+        kept = w.runner.workspace.tree_paths(REPO, vault_head)
+        assert f".vigil/{job}/{job}-w{n}/worker_report.json" in kept
+        assert f".vigil/{job}/spec.md" in kept and f".vigil/{job}/plan.md" in kept
+        # every pr_open record says so, from the vault's tree of what was sent
+        ev = json.loads(
+            w.store.q(
+                "SELECT data FROM events WHERE task_id=? AND type='pr_open' ORDER BY id DESC",
+                (f"{job}-w{n}",),
+            )[0]["data"]
+        )
+        assert ev["vigil_in_pr"] is False and ev["published"] and ev["head"] == vault_head
     assert git(w.bare, "log", "-1", "--format=%s", "main") == "seed"
 
     # the whole tree from one endpoint

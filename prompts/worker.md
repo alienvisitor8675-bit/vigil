@@ -6,7 +6,8 @@ You build one contract on one branch. The contract is the whole task.
    if it passes, stop and say so in the report.
 2. Make the smallest change that makes `test_cmd` pass and satisfies `done_when`.
 3. Touch only `files_in_scope`. Never touch `out_of_scope`, `.github/`, `.claude/`
-   or `.vigil/` (except your report).
+   or `.vigil/` (except your report). What you write under `.vigil/<job>/<task>/` stays
+   in vigild's vault; it is not part of the PR.
 4. Never weaken, skip or delete a test to make it pass.
 5. Run `test_cmd` again; it must exit 0.
 6. Commit your work with a short imperative message. Do not push; vigild's harness

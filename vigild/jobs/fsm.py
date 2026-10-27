@@ -147,6 +147,34 @@ def _ready_has_prs(c: Ctx) -> list[str]:
     ]
 
 
+def _pr_trees_clean(c: Ctx) -> list[str]:
+    """Tier 1: no task's PR head may carry `.vigil/` (it stays in the vault). Every
+    live task needs a `pr_open` row (none fails closed), and the row must name the
+    commit vigild sent now (`pr_heads`, read from the vault by the runner at the
+    move) with no job `.vigil` in its tree."""
+    heads = c.evidence.get("pr_heads")
+    heads = heads if isinstance(heads, dict) else {}
+    errs: list[str] = []
+    for t in c.store.list_tasks(c.job.id):
+        if t.state in ("superseded", "abandoned", "merged"):
+            continue
+        rows = c.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='pr_open' ORDER BY id DESC LIMIT 1",
+            (t.id,),
+        )
+        now = heads.get(t.id)
+        if not rows:
+            errs.append(f"the PR head of {t.id} has no record")
+        elif (
+            not isinstance(now, dict)
+            or not now.get("published")
+            or now.get("vigil") is not False
+            or json.loads(rows[0]["data"]).get("published") != now["published"]
+        ):
+            errs.append(f"the PR head of {t.id} may carry .vigil/ or its record is stale")
+    return errs
+
+
 def _findings(c: Ctx) -> list[str]:
     return [] if c.evidence.get("findings") else ["going back to building needs review findings"]
 
@@ -220,7 +248,7 @@ EDGES: dict[tuple[JobState, JobState], Guard] = {
     (S.PLANNING, S.BUILDING): _workers_routed,
     (S.BUILDING, S.IN_REVIEW): _workers_done,
     (S.IN_REVIEW, S.BUILDING): _findings,
-    (S.IN_REVIEW, S.READY): lambda c: [*_reviews_clean(c), *_ready_has_prs(c)],
+    (S.IN_REVIEW, S.READY): lambda c: [*_reviews_clean(c), *_ready_has_prs(c), *_pr_trees_clean(c)],
     (S.READY, S.MERGED): _merged,
     (S.IN_REVIEW, S.MERGED): _merged_by_hand,
     (S.MERGED, S.VERIFYING): _none,
