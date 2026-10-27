@@ -43,7 +43,7 @@ from vigild.verifier import runner_overlap
 class Runner(Protocol):
     def on_job_created(self, job_id: str, needs_spec: bool) -> None: ...
     def on_approved(self, job_id: str) -> None: ...
-    def on_resume(self, job_id: str, *, replan: bool = False) -> None: ...
+    def on_resume(self, job_id: str, *, replan: bool = False) -> str | None: ...
     def on_rebuild(self, repo: str, base_sha: str) -> None: ...
     def busy(self, job_id: str) -> bool: ...
 
@@ -179,6 +179,9 @@ class JobService:
         self.cfg = cfg
         self.store = store
         self.runner = runner
+        # how each job's last resume, retry or re-plan ran: "started", or
+        # "queued" behind its current run (2a round 3), for the API to say
+        self.last_run: dict[str, str | None] = {}
 
     # --- submissions ----------------------------------------------------------
 
@@ -292,7 +295,10 @@ class JobService:
         self.runner.on_job_created(job.id, False)
         return SubmitOutcome("spec_pending", task.task_id, job.id)
 
-    def submit_request(self, req: JobRequest) -> Job:
+    def submit_request(self, req: JobRequest, *, issue: dict[str, Any] | None = None) -> Job:
+        """A free-form request becomes a job its coord drafts. `issue` (label
+        intake, plan 2a item 2) is the GitHub issue it came from: stored as
+        `issue.json` before the coord starts, and fenced in its packet."""
         try:
             self.cfg.repo(req.repo)
             self._first_call_fits(req.repo)
@@ -308,6 +314,8 @@ class JobService:
             source=req.source.value,
         )
         self.store.add_artifact(job.id, "intake.json", req.model_dump_json(), Provenance.HUMAN)
+        if issue is not None:
+            self.store.add_artifact(job.id, "issue.json", json.dumps(issue), Provenance.HUMAN)
         self.runner.on_job_created(job.id, True)
         return job
 
@@ -525,6 +533,76 @@ class JobService:
             },
         )
 
+    def file_deps(
+        self, job_id: str, deps: list[Any], parent_id: str, parent_tasks: list[str]
+    ) -> list[str]:
+        """A deps job's spec (plan 2a, item 5; B39), rendered by vigild from
+        the requests: the deps gate, then Specs to approve. Approving it is the
+        owner's go-ahead for the package manager to run."""
+        from vigild.jobs.deps import check_requests
+
+        job = self.store.get_job(job_id)
+        pol = self.cfg.repo(job.repo)
+        reqs = [d.model_dump() for d in deps]
+        names = ", ".join(f"{d['package']}=={d['version']} ({d['ecosystem']})" for d in reqs)
+        errors = check_requests(list(pol.dev_lockfiles), list(deps))
+        why = "; ".join(str(d.get("why") or "") for d in reqs if d.get("why"))[:500]
+        self.store.add_artifact(
+            job_id, "intake.json",
+            json.dumps({"why": f"{parent_id} needs {names}", "value": 3, "risk": 2,
+                        "source": "self", "labels": ["deps"]}),
+            Provenance.HUMAN,
+        )  # fmt: skip
+        self.store.add_artifact(
+            job_id, "deps.json",
+            json.dumps({"deps": reqs, "parent_job": parent_id, "parent_tasks": parent_tasks}),
+            Provenance.CLAUDE,  # the requests came from a worker
+        )  # fmt: skip
+        files = "\n".join(f"- `{f}`" for f in pol.dev_lockfiles)
+        spec = (
+            f"# Spec: deps: {names}\n\n## Goal\nAdd {names}, which {', '.join(parent_tasks)} "
+            f"(job `{parent_id}`) needs.\n\n## Non-goals\n- Any change outside the manifests' "
+            "dependency fields and the lockfiles.\n\n## Acceptance criteria\n- AC1: the lockfiles "
+            "hold the requested versions, and every package they newly pull in is at least 14 days "
+            "old by its registry. test: vigild's deps checks\n- AC2: the dev image rebuilds from "
+            "them and every suite passes offline. test: the dev image validation\n\n"
+            f"## Files in scope\n{files}\n\n## Files out of scope\n- everything else\n\n"
+            "## Money paths\nnone\n\n## Risks\n- A supply-chain change: the owner reviews the PR.\n"
+            f"- The worker's reason (untrusted): {why or '(none given)'}\n\n"
+            "## Rollback\nRevert the PR.\n"
+        )
+        plan = (
+            "# Plan\n\nOne deps task, no model (B39): the package manager's lockfile-only update "
+            "in a build container with registry egress only, the checks, the dev image rebuilt "
+            "and validated, and its own PR at rung 1.\n\n```json\n"
+            + json.dumps({"deps": reqs, "lockfiles": pol.dev_lockfiles}, indent=1)
+            + "\n```\n"
+        )
+        self.store.add_artifact(job_id, "spec.md", spec, Provenance.HUMAN)
+        self.store.add_artifact(job_id, "plan.md", plan, Provenance.HUMAN)
+        self.store.add_artifact(
+            job_id, "spec_gate.json", json.dumps({"ok": not errors, "errors": errors}),
+            Provenance.HUMAN,
+        )  # fmt: skip
+        if errors:
+            self.page(job_id, f"{job_id}: the deps gate refused", {"errors": errors,
+                      "actions": ["abandon"]})  # fmt: skip
+            return errors
+        self.store.create_inbox_item(
+            "specs", "spec", job_id, f"Approve deps job: {names}"[:200],
+            {
+                "repo": job.repo, "deps": reqs, "parent_job": parent_id,
+                "parent_tasks": parent_tasks, "shape": "deps", "money_paths": [],
+                "workers": [{
+                    "task_id": f"{job_id}-w1", "goal": f"deps: {names}",
+                    "test_cmd": "(no model; the dev image's suites, offline)",
+                    "must_fail_first": False, "changes_how_tests_run": list(pol.dev_lockfiles),
+                    "size": "S", "files_in_scope": list(pol.dev_lockfiles), "depends_on": [],
+                }],
+            },
+        )  # fmt: skip
+        return []
+
     def page(
         self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
     ) -> InboxItem:
@@ -611,7 +689,7 @@ class JobService:
             for other in self.store.list_inbox():
                 if other.job_id == job.id and other.body.get("resumable") and other.id != item_id:
                     self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
-        self.runner.on_resume(job.id)
+        self.last_run[job.id] = self.runner.on_resume(job.id)
         return job
 
     def _offered(self, item_id: int, action: str) -> InboxItem:
@@ -662,7 +740,7 @@ class JobService:
                     raise Conflict(str(e)) from e
                 self._record_replan(job.id, item_id, note, item.body.get("tasks") or {})
                 self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
-        self.runner.on_resume(job.id, replan=True)
+        self.last_run[job.id] = self.runner.on_resume(job.id, replan=True)
         return job
 
     def _replan_spec(self, item: InboxItem, note: str | None) -> Job:
@@ -710,28 +788,76 @@ class JobService:
                 )
         self.store.add_event("replan", data, Provenance.HUMAN, job_id=job_id)
 
-    def abandon(self, item_id: int) -> Job:
-        """Give the job up: nothing more runs; open PRs stay for you to close."""
+    def abandon(self, item_id: int, job_id: str | None = None) -> Job:
+        """Give the job up: nothing more runs; open PRs stay for you to close.
+        A breaker's page (one page however many jobs it holds) abandons the
+        held job its caller names (2a round 3): any job a breaker holds can
+        be abandoned from the inbox."""
+        from vigild.breakers import Breakers
+
+        breakers = Breakers(self.store, self.cfg)
         with self.store.tx():
-            item = self._offered(item_id, "abandon")
-            assert item.job_id is not None
+            item = self._question(item_id)
+            if "abandon" not in (item.body.get("actions") or []):
+                raise Conflict(f"inbox item {item_id} doesn't offer abandon")
+            target = item.job_id
+            if item.body.get("kind") == "breaker":
+                held = breakers.held_by(int(item.body.get("breaker") or 0))
+                target = job_id or (item.job_id if item.job_id in held else None)
+                if target is None or target not in held:
+                    raise Conflict(f"name a job breaker page {item_id} holds: {held}")
+            elif job_id not in (None, item.job_id):
+                raise Conflict(f"inbox item {item_id} is about {item.job_id}, not {job_id}")
+            if target is None:
+                raise Conflict(f"inbox item {item_id} names no job")
             try:
                 job = transition(
-                    self.store, item.job_id, JobState.ABANDONED, Actor.OWNER,
+                    self.store, target, JobState.ABANDONED, Actor.OWNER,
                     channel="inbox", evidence={"inbox_item_id": item_id, "action": "abandon"},
                 )  # fmt: skip
             except TransitionError as e:
                 raise Conflict(str(e)) from e
             for t in self.store.list_tasks(job.id):
-                if t.state != "pr_open":
+                if t.state not in ("pr_open", "reviewed"):
                     self.store.update_task(t.id, state="abandoned")
             self.store.add_event(
                 "abandon", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=job.id
             )
             for other in self.store.list_inbox():
-                if other.job_id == job.id and other.queue == "questions":
+                # the job's own pages; a breaker's page stays for its reset
+                # and for the other jobs it holds (2a round 6)
+                if (other.job_id == job.id and other.queue == "questions"
+                        and other.body.get("kind") != "breaker"):  # fmt: skip
                     self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
+            # a breaker that then holds nothing resolves its page but stays
+            # open: only its own condition reopens dispatch (owner, 2026-10-23);
+            # one that still holds a job keeps its page for it (2a round 7)
+            breakers.unhold(job.id, by=Actor.OWNER.value)
+        failed = getattr(self.runner, "job_failed", None)
+        if failed is not None:
+            failed(job)  # an abandoned job counts toward the repo's breaker (item 4)
         return job
+
+    def reset(self, item_id: int) -> dict[str, list[str]]:
+        """Reset a tripped circuit breaker (plan 2a, item 4): it closes, and
+        the jobs it paused resume: `resumed`, or `queued` behind their own
+        run that is still finishing (review B4)."""
+        with self.store.tx():
+            item = self._question(item_id)
+            if item.body.get("kind") != "breaker" or "reset" not in (
+                item.body.get("actions") or []
+            ):
+                raise Conflict(f"inbox item {item_id} doesn't offer reset")
+            self.store.add_event(
+                "reset", {"inbox_item_id": item_id, "breaker": item.body.get("breaker")},
+                Provenance.HUMAN, job_id=item.job_id,
+            )  # fmt: skip
+            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+        reset = getattr(self.runner, "on_breaker_reset", None)
+        if reset is None:
+            return {"resumed": [], "queued": []}
+        out = reset(int(item.body["breaker"]), item_id)
+        return out if isinstance(out, dict) else {"resumed": list(out), "queued": []}
 
     def rebuild(self, item_id: int) -> None:
         """Build and validate a repo's failed dev image again (round 2)."""
@@ -748,8 +874,17 @@ class JobService:
         self.runner.on_rebuild(str(item.body["repo"]), str(item.body["base_sha"]))
 
     def dismiss(self, item_id: int) -> None:
+        """Resolve a page with nothing to act on. A breaker's page that still
+        holds jobs can't be dismissed: they would wait with no page (2a
+        round 9); reset the breaker or abandon them."""
+        from vigild.breakers import Breakers
+
         with self.store.tx():
             item = self._question(item_id)
+            if item.body.get("kind") == "breaker":
+                held = Breakers(self.store, self.cfg).held_by(int(item.body.get("breaker") or 0))
+                if held:
+                    raise Conflict(f"breaker page {item_id} holds {held}: reset it or abandon them")
             self.store.add_event(
                 "dismiss", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=item.job_id
             )

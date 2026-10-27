@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from vigild.contract.models import Backend
 
@@ -42,6 +42,15 @@ class DeciderRoute(_M):
     model: str | None = None
     key_ref: str | None = None
     live: bool = True
+    # Jev: the exact version its responses must report (owner, 2026-10-23);
+    # required on every Jev route, so no route skips the drift guard (review A8)
+    version_pin: str | None = None
+
+    @model_validator(mode="after")
+    def _jev_is_pinned(self) -> DeciderRoute:
+        if self.backend.startswith("jev_") and not self.version_pin:
+            raise ValueError(f"a {self.backend} route needs its version_pin")
+        return self
 
 
 class BackendsFile(_M):
@@ -59,7 +68,8 @@ class HiddenTestsPolicy(_M):
 
 
 class RepoPolicy(_M):
-    visibility: Literal["public", "private"]
+    # No `visibility`: GitHub's live answer is the only source (owner,
+    # 2026-10-23; vigild/repos.py `live_private`).
     decider: list[str]
     backends: list[str]
     worker_overflow: list[str] = Field(default_factory=list)
@@ -80,6 +90,9 @@ class RepoPolicy(_M):
     # Commands a test_cmd may use in the image. A test_cmd that needs anything
     # else is refused at the spec gate (review r1, blocker 4).
     dev_image_tools: list[str]
+    # Poll the repo's open issues labelled `vigil:ready` into jobs (plan 2a,
+    # item 2). Off unless a repo turns it on.
+    intake: bool = False
 
 
 class ReposFile(_M):
@@ -99,6 +112,9 @@ class Routing(_M):
     xs_labels: list[str]
     escalate_attempt: int = 3
     escalate_review_rounds: int = 2
+    # Where a preset's work goes while its backend breaker is open (plan 2a,
+    # item 4), in order. A preset with no healthy fallback pauses dispatch.
+    fallbacks: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class Budgets(_M):
@@ -111,6 +127,41 @@ class Budgets(_M):
     hidden_tests_session_usd: float = Field(gt=0)  # one task's whole author stage
     # Each model call's output cap for every coord and worker session.
     session_max_output_tokens: int = Field(ge=1024)
+    # Reservations for one reviewer and one auditor session (phase 2a). They
+    # count against the day and the month, not the task's own cap, so a fix
+    # round gets what's left of the worker's budget.
+    review_session_usd: float = Field(default=0.40, gt=0)
+    audit_session_usd: float = Field(default=0.80, gt=0)
+    # Haiku decisions Jev couldn't give, per repo per UTC day (owner ruling 4)
+    decider_fallback_per_repo_usd: float = Field(default=1.00, gt=0)
+
+
+class ShapePolicy(_M):
+    rung: int = Field(ge=0, le=3)
+    max_rung: int = Field(default=3, ge=0, le=3)
+
+
+class RungPolicy(_M):
+    reviewer: str
+    auditor: str
+    audit: float = Field(ge=0, le=1)  # base share of reviews audited
+    promote_after: int | None = Field(default=None, ge=1)  # weighted PRs; None: never promotes
+    min_match: float = Field(default=0.9, ge=0, le=1)
+    max_false_per_pr: float | None = Field(default=None, ge=0)
+
+
+class ReviewPolicy(_M):
+    """configs/review.yaml: where each shape starts and what moves it (item 1)."""
+
+    shapes: dict[str, ShapePolicy]
+    rungs: dict[int, RungPolicy]
+    verify_weight: dict[int, float]
+    level0_audit_factor: float = Field(default=1.0, ge=1)
+    # The passed local-reviewer eval (design: "a reviewer enters rung 1 only if
+    # it matches >= 80% of the auditor's findings on the eval set"), named by
+    # its results file. None until phase 7: no shape passes rung 1, and every
+    # rung keeps Sonnet reviewing and Opus auditing every review.
+    local_reviewer_eval: str | None = None
 
 
 class LongContext(_M):
@@ -196,6 +247,26 @@ class ContainerLimits(_M):
     verifier_concurrency: int = Field(default=1, ge=1)
 
 
+class Scheduler(_M):
+    """The fleet (plan 2a, items 2-3)."""
+
+    sessions: int = Field(default=3, ge=1)  # sessions at once, across every job
+    intake_poll_seconds: int = Field(default=300, ge=10)  # the vigil:ready label
+    pr_poll_seconds: int = Field(default=120, ge=10)  # merged PRs (deps auto-resume)
+    resume_attempts: int = Field(default=2, ge=0)  # crash resumes per task
+    checkpoint_seconds: int = Field(default=30, ge=1)  # a worker's checkpoints, at most this often
+
+
+class BreakerLimits(_M):
+    """Circuit breakers (plan 2a, item 4; vigild/breakers.py)."""
+
+    backend_errors: int = Field(default=3, ge=1)  # 5xx or timeouts in a row
+    backend_cooldown_seconds: int = Field(default=300, ge=1)  # then one half-open probe
+    repo_failures: int = Field(default=3, ge=1)  # failed or abandoned jobs in a row
+    verifier_unknowns: int = Field(default=3, ge=1)  # `unknown` verdicts in a row
+    max_escalations_per_day: int = Field(default=5, ge=0)
+
+
 class Vigild(_M):
     data_dir: str
     api: Bind
@@ -205,6 +276,8 @@ class Vigild(_M):
     collector: Collector
     github: GitHub
     container: ContainerLimits
+    scheduler: Scheduler = Field(default_factory=Scheduler)
+    breakers: BreakerLimits = Field(default_factory=BreakerLimits)
 
     @property
     def data_path(self) -> Path:
@@ -219,6 +292,7 @@ class Config(_M):
     prices: Prices
     egress: Egress
     vigild: Vigild
+    review: ReviewPolicy
 
     def preset(self, name: str) -> Preset:
         try:
@@ -241,6 +315,7 @@ FILES = {
     "prices": "prices.yaml",
     "egress": "egress.yaml",
     "vigild": "vigild.yaml",
+    "review": "review.yaml",
 }
 
 
@@ -264,6 +339,10 @@ def validate(cfg: Config) -> None:
     for role in ("fallback", "coord", "reviewer", "auditor"):
         if getattr(cfg.routing, role) not in presets:
             raise ConfigError(f"routing.{role} names an unknown preset")
+    for preset, falls in cfg.routing.fallbacks.items():
+        for name in (preset, *falls):
+            if name not in presets:
+                raise ConfigError(f"routing.fallbacks names an unknown preset {name}")
     for name, route in cfg.backends.decider_routes.items():
         if route.preset and route.preset not in presets:
             raise ConfigError(f"decider route {name} names unknown preset {route.preset}")
@@ -278,6 +357,9 @@ def validate(cfg: Config) -> None:
             if path.startswith("/") or ".." in Path(path).parts:
                 raise ConfigError(f"{repo}: bad dev_lockfiles entry {path!r}")
     validate_repo_policies(cfg)
+    from vigild.review.ladder import validate_policy
+
+    validate_policy(cfg)
 
 
 # --- the env file -------------------------------------------------------------

@@ -55,10 +55,11 @@ def live(
     cfg.routing.coord = cfg.routing.fallback = "claude-haiku"
     cfg.budgets.coord_session_usd = 0.30
     cfg.budgets.per_task_usd = 0.30
+    cfg.budgets.review_session_usd = 0.50
+    cfg.budgets.audit_session_usd = 0.90
     cfg.repos.repos[REPO] = RepoPolicy(
-        visibility="public",
         decider=["haiku"],
-        backends=["claude-haiku"],
+        backends=["claude-haiku", "claude-sonnet", "claude-opus"],  # review, audit
         dev_dockerfile="images/dev/fixture.Dockerfile",
         dev_lockfiles=["README.md"],
         dev_suites={"smoke": "python -m pytest --version"},
@@ -132,18 +133,22 @@ def test_two_workers_build_in_their_own_containers(
         headers=auth(tokens.admin),
         json={
             "repo": REPO,
-            "title": "Document the rate limit",
+            # 2a round 4: nothing here may claim what the fixture repo doesn't
+            # have (round 3's spec asked for a rate limit it lacks, and the
+            # reviewer and worker rightly stalled on it)
+            "title": "Say the fixture repo is empty",
             "request": (
-                "Two independent doc edits. (1) Add a line containing the words 'rate limit' to "
-                "docs/feature-map.md, with a pytest test tests/test_feature_map.py that reads "
-                "the file and asserts it. (2) Add a line containing RATE_LIMIT to "
-                "docs/runbook.md saying it is the env var that sets the limit, with a pytest "
-                "test tests/test_runbook.py that asserts it. One worker per doc and its test, in "
-                "parallel; each test_cmd is `pytest -q tests/<its test file>`. Keep max_cost_usd "
-                "at 0.25 per worker."
+                "Two independent doc edits about this repo as it is: it has no code yet. "
+                "(1) Add a line to docs/feature-map.md saying 'No features yet: this repo has "
+                "no code.', with a pytest test tests/test_feature_map.py that reads the file and "
+                "asserts the words 'No features yet'. (2) Add a line to docs/runbook.md saying "
+                "'Nothing to run yet: this repo has no code.', with a pytest test "
+                "tests/test_runbook.py that asserts the words 'Nothing to run yet'. One worker "
+                "per doc and its test, in parallel; each test_cmd is `pytest -q tests/<its test "
+                "file>`. Keep max_cost_usd at 0.25 per worker."
             ),
             "notes": ["keep it to one line per file"],
-            "why": "the limit is undocumented",
+            "why": "the docs don't say the repo is empty",
             "value": 3,
             "risk": 1,
         },
@@ -173,10 +178,15 @@ def test_two_workers_build_in_their_own_containers(
     coord = [r for r in tree["sessions"] if r["role"] == "coord"][-1]
     workers = coord["children"]
     print("workers:", [(w["id"], w["status"], w["pr_url"]) for w in workers])
-    assert len(workers) == 2
-    assert all(w["status"] == "pr_open" for w in workers)
-    assert tree["job"]["state"] == "in_review"
+    # two tasks; a review finding sends one back for a fix round on its PR
+    assert len({w["task_id"] for w in workers}) == 2
+    latest = {w["task_id"]: w for w in workers}
+    assert all(w["status"] == "pr_open" for w in latest.values())
+    # phase 2a: each PR reviewed (Sonnet) and audited (Opus, rung 0), then ready
+    assert tree["job"]["state"] == "ready", inbox["questions"]
+    for w in latest.values():
+        assert v.store.get_artifact(tree["job"]["id"], "review.json", w["task_id"]) is not None
     for p in publisher.prs:
         files = git(fixture_repo["bare"], "ls-tree", "-r", "--name-only", p["head"])
         assert "worker_report.json" in files
-    assert spend() < 1.0
+    assert spend() < 1.5

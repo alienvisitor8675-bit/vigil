@@ -819,3 +819,61 @@ def test_a_metering_failure_fails_closed(
     r = client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
     assert r.status_code == 401
     assert len(upstream.requests) == 1
+
+
+def test_settling_waits_for_the_sessions_calls_in_flight(
+    gw: Gateway, store: Store, budget: Budget
+) -> None:
+    """2a round 2 (found by the done-when): a killed worker's last streamed
+    call was booked after its reservation settled, so the ledger missed it
+    and its resume was given a little more than its cap's remainder.
+    `drain` waits for the session's holds before vigild settles."""
+    import threading
+    import time
+
+    from vigild.gateway.service import Hold
+
+    sid, _tok = _session(store, budget, gw)
+    body = _msg(max_tokens=4096)
+    amount, body, raw = gw._hold_clamped(sid, "claude-sonnet-5-5", body, json.dumps(body).encode())
+    hold = Hold(sid, amount, gw.cfg.preset("claude-sonnet"), body, raw)
+    assert gw.drain(sid, timeout=0.1) is False  # a call still in flight
+    threading.Timer(0.2, gw.release, args=(hold,)).start()
+    t = time.monotonic()
+    assert gw.drain(sid, timeout=5) is True
+    assert 0.1 < time.monotonic() - t < 5
+    assert gw.drain(sid, timeout=0.01) is True  # nothing in flight
+
+
+# --- 2a round 8, R4(b): a metered call reserves its worst case and never settles past it -------
+
+
+def test_a_metered_call_reserves_its_worst_case(gw: Gateway, store: Store, cfg: Config) -> None:
+    amounts: list[float] = []
+    real = gw.budget.reserve
+
+    def spy(**kw: Any) -> int:
+        amounts.append(float(kw["amount"]))
+        return real(**kw)
+
+    gw.budget.reserve = spy  # type: ignore[method-assign]
+    payload = {"result": {"usage": {"input_tokens": 400, "output_tokens": 10}}}
+    gw.metered(repo=PA, route="jev-openrouter", provider="openrouter", model="typesafe/jev-1.13",
+               purpose="decider", job_id=None, run=lambda: payload, private=False,
+               body_chars=3_000_000)  # fmt: skip
+    assert amounts and amounts[0] > cfg.budgets.decider_call_usd  # sized from the body
+
+
+def test_a_metered_call_costing_more_than_reserved_trips_the_daily_breaker(
+    gw: Gateway, store: Store, cfg: Config
+) -> None:
+    from vigild.breakers import GLOBAL, Breakers, Kind
+
+    gw.breakers = Breakers(store, cfg)
+    payload = {"result": {"usage": {"input_tokens": 10_000_000, "output_tokens": 0}}}  # $0.42
+    gw.metered(repo=PA, route="jev-openrouter", provider="openrouter", model="typesafe/jev-1.13",
+               purpose="decider", job_id=None, run=lambda: payload, private=False,
+               body_chars=30)  # fmt: skip
+    assert gw.budget.spent_today() <= cfg.budgets.decider_call_usd + 1e-9  # booked: the reservation
+    assert gw.breakers.is_open(Kind.DAILY, GLOBAL)
+    assert [e for e in store.events() if e.type == "settle_excess"]

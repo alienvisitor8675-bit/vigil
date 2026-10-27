@@ -310,7 +310,7 @@ def test_replan_with_a_note_from_the_spec_item_amends_the_draft_and_is_no_approv
     _arm(w)
     r = _replan(w, item)
     assert r.status_code == 200, r.text
-    assert r.json() == {"job_id": job, "state": "spec_pending"}
+    assert r.json() == {"job_id": job, "state": "spec_pending", "run": "started"}
     # the old item is closed and a new one is filed; it is not an approval
     assert w.store.get_inbox_item(item["id"]).status == "resolved"
     new = _spec_item(w)

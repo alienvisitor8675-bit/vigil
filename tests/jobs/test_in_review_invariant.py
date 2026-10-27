@@ -67,6 +67,10 @@ def _assert_paged(w: World, job: str, *tasks: str) -> None:
 
 
 def _built(w: World) -> str:
+    # The invariant is about entering `in_review`. Phase 2a's review stage then runs
+    # and moves a clean job on to `ready`, so it is held off here: the job stays where
+    # the guard let it in.
+    w.runner.review = lambda job_id: None  # type: ignore[method-assign]
     job = _approve(w)
     assert w.store.get_job(job).state is S.IN_REVIEW
     return job
@@ -92,6 +96,21 @@ def test_path_dispatch_complete(world: World) -> None:
     _back_to_building(w, job)
     w.runner.dispatch(job)
     _assert_paged(w, job, f"{job}-w2")
+
+
+def test_the_review_stage_never_starts_for_a_plan_task_without_its_pr(world: World) -> None:
+    """Phase 2a's review stage is entered only through the guard: a job whose plan
+    names a task with no open PR for that work blocks before any reviewer runs."""
+    w = world
+    job = _approve(w)
+    assert w.store.get_job(job).state is S.READY  # a valid job is reviewed
+    reviewers = lambda: [s for s in w.standin.specs if s.role in (Role.REVIEWER, Role.AUDITOR)]  # noqa: E731
+    before = len(reviewers())
+    _tamper(w, job)
+    _back_to_building(w, job)
+    w.runner.dispatch(job)
+    _assert_paged(w, job, f"{job}-w2")
+    assert len(reviewers()) == before
 
 
 def test_path_retry(world: World) -> None:
@@ -168,6 +187,7 @@ def test_path_replan_that_reuses_an_id_is_refused_at_the_gate(world: World) -> N
 
 def test_path_replan_with_fresh_ids_reaches_review(world: World) -> None:
     w = world
+    w.runner.review = lambda job_id: None  # type: ignore[method-assign]  # see _built
     w.standin.worker_edit = _flaky({"w1"})
     job = _approve(w)
     item = _failure_item(w, job)

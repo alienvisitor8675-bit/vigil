@@ -116,3 +116,32 @@ def test_forged_reports_count_for_nothing(
     r = _run(runner, cfg, source, cmd)
     assert r.exit == 0 and r.reports == {}, r
     assert "SEEN=0" in r.output
+
+
+def test_the_test_cannot_read_the_scripts_memory(
+    runner: DockerTestRunner, cfg: Config, source: Path
+) -> None:
+    """Phase 2a, item 0 (architecture B33): the script holding the marker is
+    root; the test runs as the agent uid and can't open PID 1's memory."""
+    cmd = (
+        "id -u; stat -c %u /proc/1; "
+        "python3 -c \"\ntry:\n open('/proc/1/mem','rb'); print('MEM=open')\n"
+        "except OSError as e:\n print('MEM=refused', type(e).__name__)\""
+    )
+    r = _run(runner, cfg, source, cmd)
+    assert r.exit == 0, r.output
+    lines = r.output.splitlines()
+    assert lines[:2] == ["10001", "0"], r.output
+    assert "MEM=refused" in r.output and "MEM=open" not in r.output
+
+
+def test_the_report_dir_is_made_by_the_agent_uid_not_root(
+    runner: DockerTestRunner, cfg: Config, source: Path
+) -> None:
+    """2a round 2 (review A, untested): the script's `mkdir` of the report dir
+    runs as the agent uid; made by root, the test couldn't write its report."""
+    from vigild.verifier import REPORT_DIR
+
+    r = _run(runner, cfg, source, f"stat -c %u {REPORT_DIR}")
+    assert r.exit == 0, r.output
+    assert r.output.splitlines()[0] == "10001", r.output

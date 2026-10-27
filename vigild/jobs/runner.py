@@ -4,8 +4,9 @@
   plan.md; vigild runs the spec gate; up to three drafts, each its own session,
   then it pages you (resumable: resuming drafts again).
 - on_approved (only from the inbox): planning turns plan.md's contracts into
-  routed tasks; building runs them in dependency waves, each wave's workers in
-  parallel, each in its own container, clone and branch.
+  routed tasks; building runs them as a dependency graph (each task once its
+  dependencies have published), in parallel, each in its own container, clone
+  and branch.
 - After any session, the harness has left a git bundle in the session's out
   dir and named its head on its result line. vigild imports the bundle into
   its own vault (refusing a tip that isn't that head) and does every read,
@@ -32,22 +33,31 @@ and writes its events (secrets redacted).
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
 from pydantic import ValidationError
 
+from vigild.breakers import CAP_KIND, GLOBAL, Breaker, Breakers, Kind, escalations_today
 from vigild.budget import Budget, BudgetExceeded
 from vigild.config import Config
 from vigild.contract.models import (
+    BLOCKING,
+    Audit,
+    AuditOutput,
     Limits,
+    Review,
+    ReviewOutput,
     Spec,
     Task,
     TestOutcome,
@@ -55,27 +65,43 @@ from vigild.contract.models import (
     WorkerContract,
     WorkerReport,
 )
-from vigild.db import SessionRoleError, Store, iso
+from vigild.db import SessionRoleError, Store, iso, utcnow
 from vigild.devimage import DevImages, SessionImages, StaleDevImage, missing_tools
-from vigild.executors.base import ExecOutcome, Executor, SessionSpec
+from vigild.executors.base import ExecOutcome, Executor, Resume, SessionSpec
 from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
 from vigild.github.publish import PublishError, artifact_paths, vigild_paths
 from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
 from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, Place, entry_suite, load_suite, place_for
+from vigild.intake.github import issue_text
 from vigild.intake.spec_gate import test_cmd_problem
 from vigild.jobs.acceptance import NO_HIDDEN, check_worker, escalates
 from vigild.jobs.artifacts import parse_plan, render
 from vigild.jobs.deps import infer_deps, is_lockfile
 from vigild.jobs.fsm import Actor, TransitionError, plan_gaps, transition
-from vigild.jobs.model import JobState, Role, SessionRow
+from vigild.jobs.model import FixDepthExceeded, Job, JobState, Role, SessionRow
 from vigild.jobs.ownernote import author_contract, spec_body, spec_diff
 from vigild.metering.calls import last_call_truncated, session_cost
-from vigild.packets.assemble import assemble_coord, assemble_hidden_test_author, assemble_worker
+from vigild.packets.assemble import (
+    assemble_audit,
+    assemble_coord,
+    assemble_hidden_test_author,
+    assemble_review,
+    assemble_worker,
+)
 from vigild.packets.fence import fence
 from vigild.provenance import Provenance
 from vigild.redact import redact
-from vigild.repos import RepoPolicyError, check_backend, check_hidden_author
+from vigild.repos import (
+    RepoPolicyError,
+    check_backend,
+    check_hidden_author,
+    live_private,
+    repo_rule_errors,
+)
+from vigild.review.ladder import Ladder, LadderChange, classify_shape
 from vigild.router.rules import RoutingError, route
+from vigild.scheduler import wip
+from vigild.scheduler.graph import Slots, run_graph
 from vigild.telemetry.spans import Telemetry
 from vigild.verifier import Verifier, runner_like, runner_overlap
 from vigild.workspace import Workspace, WorkspaceError
@@ -86,9 +112,18 @@ OWNER_REVIEW_TITLE = "Owner review required: runner file changed; hidden tests d
 COORD_DRAFTS = 3
 COORD_MINUTES = 30
 WORKER_MINUTES = 40
+REVIEW_MINUTES = 20
+REVIEW_TURNS = 30
+# A review or an audit answers in a few thousand tokens. Capping each call's
+# output keeps the gateway's worst-case hold inside the session's reservation.
+REVIEW_OUTPUT_TOKENS = 8192
+# a review pass reviews at most this many tasks, each pass reserving for its
+# own (owner, 2026-10-23); as the WIP limit, so a pass is $4.80 at most
+REVIEW_PASS_TASKS = 4
 LIVE_SESSION = ("created", "running")
 DEAD_TASK = ("superseded", "abandoned")  # out of the job: re-planned away or given up
 QUEUE_POLL_SECONDS = 15.0  # how often a queued session looks for room in the day
+PUBLISHED = ("pr_open", "reviewed")  # a task whose draft PR is open (reviewed: clean at its head)
 MIN_RETRY_USD = 0.05  # less than this left of a task's cap: no retry is offered
 
 
@@ -104,7 +139,10 @@ class Publisher(Protocol):
         title: str,
         body: str,
         scope: list[str],
+        existing: str | None = None,
     ) -> str: ...
+
+    def close(self, repo: str, url: str) -> None: ...
 
 
 class Pager(Protocol):
@@ -117,6 +155,15 @@ class Pager(Protocol):
     def hidden_enabled(self, job_id: str) -> bool: ...
     def file_item(self, job_id: str) -> None: ...
     def open_spec_item(self, job_id: str) -> Any: ...
+
+
+SPEC_WAIT = frozenset({JobState.SPEC_PENDING})  # where a coord or an author waits
+BUILD_WAIT = frozenset({JobState.BUILDING})  # where a worker waits
+REVIEW_WAIT = frozenset({JobState.IN_REVIEW})  # where a review reserve waits
+
+
+class QueueCancelled(Exception):
+    """A queued reservation's job moved on while it waited (abandoned, blocked)."""
 
 
 class Refused(Exception):
@@ -150,6 +197,9 @@ class JobRunner:
         session_images: SessionImages | None = None,
         background: bool = True,
         reaper: Callable[[], int] | None = None,
+        breakers: Breakers | None = None,
+        deps: Any = None,
+        pr_state: Callable[[str, str], str] | None = None,
     ) -> None:
         self.cfg = cfg
         self.store = store
@@ -174,14 +224,46 @@ class JobRunner:
         self._running: set[str] = set()
         self._running_lock = threading.Lock()
         self.sleep: Callable[[float], None] = time.sleep  # tests replace it
+        # a resume that arrives while the job's run is going: run it after (B4)
+        self._queued: dict[str, tuple[Callable[[str], None], JobState | None]] = {}
+        # reservations waiting for the day's headroom, oldest first (the budget queue)
+        self._queue: list[tuple[str, str, str]] = []
+        self._wait_cancelled: set[str] = set()  # tasks whose wait ended with their job
+        self._queue_lock = threading.Lock()
+        # the WIP room check and the move to running, for every job at once (B10)
+        self._wip_lock = threading.Lock()
+        # each job's review-stage reservation while its pass runs (owner, 2026-10-23)
+        self._review_stage_ids: dict[str, int] = {}
+        self._stage_lock = threading.Lock()
+        self.closers: list[Callable[[], None]] = []  # e.g. the docker client (item 0)
+        self.ladder = Ladder(store, cfg)
+        self.deps = deps  # the deps executor (item 5); None: deps jobs fail
+        self.pr_state = pr_state  # (repo, pr url) -> open | merged | closed
+        # one set of breakers, shared with the gateway (item 4)
+        self.breakers = breakers or Breakers(store, cfg)
+        self.breakers.pager = self._breaker_page
+        self.breakers.on_close = self._probe_closed  # a probe closed a backend breaker
+        self._sdk_seen: set[tuple[str, str]] = set()
+        self.slots = Slots(cfg.vigild.scheduler.sessions)  # across every job (item 2)
+
+    def close(self) -> None:
+        for close in self.closers:
+            close()
+        self.closers = []
 
     # --- queueing for the day's headroom ---------------------------------------------------
 
     def _queueable(self, e: BudgetExceeded, amount: float) -> bool:
         """Only a full day waits: its money frees up (a reservation settles, or
         the UTC day rolls over). A task's cap, the month, or an amount larger
-        than the whole day never will."""
-        return e.cap == "daily" and amount <= self.cfg.budgets.daily_usd
+        than the whole day never will, and neither does a day whose metered spend
+        has reached the cap (that trips the daily breaker instead)."""
+        b = self.cfg.budgets
+        return (
+            e.cap == "daily"
+            and amount <= b.daily_usd
+            and self.budget.spent_today() < b.daily_usd - 1e-9
+        )
 
     def _queue_event(
         self, kind: str, job_id: str, what: str, task_id: str | None, **data: Any
@@ -189,6 +271,36 @@ class JobRunner:
         self.store.add_event(
             kind, {"for": what, **data}, Provenance.HUMAN, job_id=job_id, task_id=task_id
         )
+
+    # The queue is first in, first out: a waiter takes a ticket when it first finds the
+    # day full, only the oldest ticket may reserve, and a new request queues behind any
+    # ticket rather than taking money a waiter is owed (2a, from the phase 1 run).
+
+    def _queue_key(self, job_id: str, what: str, task_id: str | None) -> tuple[str, str, str]:
+        return (job_id, task_id or "", what)
+
+    def _queue_join(self, key: tuple[str, str, str]) -> None:
+        with self._queue_lock:
+            if key not in self._queue:
+                self._queue.append(key)
+
+    def _queue_leave(self, key: tuple[str, str, str]) -> None:
+        with self._queue_lock:
+            if key in self._queue:
+                self._queue.remove(key)
+
+    def _queue_turn(self, key: tuple[str, str, str]) -> bool:
+        """Whether `key` may reserve now: it is the oldest ticket, or there are none."""
+        with self._queue_lock:
+            return not self._queue or self._queue[0] == key
+
+    def _queue_cancelled(self, job_id: str, expect: frozenset[JobState]) -> bool:
+        """A waiter looks at its job on every poll: one that is no longer where
+        the waiter was queued for (abandoned, blocked, gone) has nothing to wait for."""
+        try:
+            return self.store.get_job(job_id).state not in expect
+        except KeyError:
+            return True
 
     def _reserve_queued(
         self,
@@ -200,28 +312,42 @@ class JobRunner:
         amount: float,
         purpose: str,
         queued: bool = False,
+        expect: frozenset[JobState] = SPEC_WAIT,
     ) -> int:
         """Reserve, waiting while the day is full: the one waiting mechanism.
         Emits `queued` once and `dequeued` when it gets the money; not a
-        failure, no page, no attempt used. Any other refusal raises."""
-        while True:
-            try:
-                rid = self.budget.reserve(
-                    session_id=session_id, task_id=task_id, amount=amount, purpose=purpose
-                )
-            except BudgetExceeded as e:
-                if not self._queueable(e, amount):
-                    raise
+        failure, no page, no attempt used. Waiters are served in arrival order,
+        and each poll re-checks the job: if it left `expect` (abandoned, say) the
+        wait ends with `QueueCancelled`. Any other refusal raises."""
+        key = self._queue_key(job_id, what, task_id)
+        try:
+            while True:
+                if queued and self._queue_cancelled(job_id, expect):
+                    self._queue_event("dequeued", job_id, what, task_id, cancelled=True)
+                    raise QueueCancelled(job_id)
+                detail = "behind an older waiter"
+                if self._queue_turn(key):
+                    try:
+                        rid = self.budget.reserve(
+                            session_id=session_id, task_id=task_id, amount=amount, purpose=purpose
+                        )
+                    except BudgetExceeded as e:
+                        if not self._queueable(e, amount):
+                            raise
+                        detail = e.detail
+                    else:
+                        if queued:
+                            self._queue_event("dequeued", job_id, what, task_id, amount_usd=amount)
+                        return rid
                 if not queued:
                     queued = True
                     self._queue_event(
-                        "queued", job_id, what, task_id, amount_usd=amount, detail=e.detail
+                        "queued", job_id, what, task_id, amount_usd=amount, detail=detail
                     )
+                self._queue_join(key)  # a no-op for a ticket the wave already took
                 self.sleep(QUEUE_POLL_SECONDS)
-                continue
-            if queued:
-                self._queue_event("dequeued", job_id, what, task_id, amount_usd=amount)
-            return rid
+        finally:
+            self._queue_leave(key)
 
     # --- triggers ---------------------------------------------------------------------
 
@@ -229,42 +355,82 @@ class JobRunner:
         with self._running_lock:
             return sorted(self._running)
 
-    def _spawn(self, fn: Callable[[str], None], job_id: str) -> None:
-        # round 3, F7: one run per job at a time, whatever starts it
+    def _spawn(self, fn: Callable[[str], None], job_id: str, expect: JobState | None = None) -> str:
+        """One run per job at a time, whatever starts it (round 3, F7). A run
+        asked for while one is going is queued, not dropped (review B4): it
+        starts when the current one ends, and only if the job is still in
+        the state it was asked for (`expect`); otherwise it is dropped with a
+        `queued_run_dropped` event, and the job's own page stays the owner's
+        way to act (2a round 3). Returns "started" or "queued"."""
         with self._running_lock:
             if job_id in self._running:
-                log.info("%s is already running; not starting it twice", job_id)
-                return
+                self._queued[job_id] = (fn, expect)  # the latest ask wins
+                log.info("%s is running; its next run is queued", job_id)
+                return "queued"
             self._running.add(job_id)
 
+        def next_run(j: str) -> Callable[[str], None] | None:
+            """The queued run, if the job is still where it was asked for.
+            Called with the running lock held."""
+            while (queued := self._queued.pop(j, None)) is not None:
+                queued_fn, want = queued
+                if want is None:
+                    return queued_fn
+                try:
+                    now = self.store.get_job(j).state
+                except KeyError:
+                    return None
+                if now is want:
+                    return queued_fn
+                self.store.add_event(
+                    "queued_run_dropped",
+                    {"expected": want.value, "state": now.value,
+                     "why": "the job moved while the run waited; its page is the way on"},
+                    Provenance.HUMAN, job_id=j,
+                )  # fmt: skip
+            return None
+
         def safe(j: str) -> None:
+            run: Callable[[str], None] | None = fn
             try:
-                fn(j)
-            except Exception as e:  # never die silently: page, and let the owner resume
-                log.exception("runner failed on %s", j)
-                self._block(j, f"vigild error: {type(e).__name__}")
-                self._page(
-                    j, f"vigild error on {j}", {"error": f"{type(e).__name__}: {e}"}, resumable=True
-                )
+                while run is not None:
+                    try:
+                        run(j)
+                    except Exception as e:  # never die silently: page; the owner chooses
+                        log.exception("runner failed on %s", j)
+                        self._block(j, f"vigild error: {type(e).__name__}")
+                        self._page(
+                            j, f"vigild error on {j}",
+                            {"kind": "vigild_error", "error": f"{type(e).__name__}: {e}",
+                             "actions": ["retry", "abandon"]},
+                            resumable=True,
+                        )  # fmt: skip
+                    with self._running_lock:
+                        run = next_run(j)
+                        if run is None:
+                            self._running.discard(j)  # in the same lock: no ask is lost
             finally:
-                with self._running_lock:
-                    self._running.discard(j)
+                if run is not None:  # vigild itself is going down mid-run
+                    with self._running_lock:
+                        self._queued.pop(j, None)
+                        self._running.discard(j)
 
         if self.background:
             threading.Thread(target=safe, args=(job_id,), daemon=True).start()
         else:
             safe(job_id)
+        return "started"
 
     def on_job_created(self, job_id: str, needs_spec: bool) -> None:
         if needs_spec:
-            self._spawn(self.run_coord, job_id)
+            self._spawn(self.run_coord, job_id, JobState.SPEC_PENDING)
         elif self.jobs is not None and self.jobs.needs_hidden(job_id):
             # a submitted task that names a runner file: its hidden tests are
             # written in the background, and then the spec is filed
-            self._spawn(self._finish_spec, job_id)
+            self._spawn(self._finish_spec, job_id, JobState.SPEC_PENDING)
 
     def on_approved(self, job_id: str) -> None:
-        self._spawn(self.build, job_id)
+        self._spawn(self.build, job_id, JobState.APPROVED)
 
     def _author_only(self, job_id: str) -> bool:
         """A spec_pending job that has its spec and needs only the hidden-test
@@ -278,21 +444,22 @@ class JobRunner:
         sessions = self.store.list_sessions(job_id)
         return bool(sessions) and sessions[-1].role is Role.HIDDEN_TEST_AUTHOR
 
-    def on_resume(self, job_id: str, *, replan: bool = False) -> None:
+    def on_resume(self, job_id: str, *, replan: bool = False) -> str | None:
+        """Pick a job's work up where its state says. "started", "queued"
+        (its current run finishes first), or None (nothing to run)."""
         state = self.store.get_job(job_id).state
-        if state is JobState.SPEC_PENDING:
+        fn: Callable[[str], None] | None = {
+            JobState.SPEC_PENDING: self.run_coord,
+            JobState.APPROVED: self.build,
+            JobState.PLANNING: self._plan_and_dispatch,
+            JobState.BUILDING: self.dispatch,
+            JobState.IN_REVIEW: self.review,
+        }.get(state)
+        if state is JobState.SPEC_PENDING and not replan and self._author_only(job_id):
             # a retry never sends a finished draft back to the coord (hotfix 5);
             # only a replan asks it for a new one
-            if not replan and self._author_only(job_id):
-                self._spawn(self._finish_spec, job_id)
-            else:
-                self._spawn(self.run_coord, job_id)
-        elif state is JobState.APPROVED:
-            self._spawn(self.build, job_id)
-        elif state is JobState.PLANNING:
-            self._spawn(self._plan_and_dispatch, job_id)
-        elif state is JobState.BUILDING:
-            self._spawn(self.dispatch, job_id)
+            fn = self._finish_spec
+        return self._spawn(fn, job_id, state) if fn is not None else None
 
     # --- startup reconcile (item 7) ------------------------------------------------------
 
@@ -316,19 +483,36 @@ class JobRunner:
             out["containers"] = self.reaper()
         failed_coord: set[str] = set()
         failed_author: set[str] = set()
-        for s in self.store.list_sessions():
-            if s.status in LIVE_SESSION:
-                self.store.update_session(s.id, status="failed", ended_at=iso())
-                out["sessions"] += 1
-                if s.role is Role.COORD and s.job_id:
-                    failed_coord.add(s.job_id)
-                elif s.role is Role.HIDDEN_TEST_AUTHOR and s.job_id:
-                    failed_author.add(s.job_id)
-        for rid in self.budget.open_reservation_ids():
-            self.budget.settle(rid)
+        live = [s for s in self.store.list_sessions() if s.status in LIVE_SESSION]
+        for r in self.store.q("SELECT * FROM reservations WHERE status='open'"):
+            # first: what's left of each task's cap is known. Nothing of the
+            # last process runs, so only the liveness rule's gateway part can
+            # hold one (2a round 9)
+            if self._reservation_live(r, set(), restarted=True):
+                continue
+            self.budget.settle(int(r["id"]))
             out["reservations"] += 1
+        safe = {s.job_id for s in live if s.job_id and self._safe_to_resume(s)}
+        for s in live:
+            resumable = s.job_id in safe and s.role is Role.WORKER
+            self.store.update_session(
+                s.id, status="crashed" if resumable else "failed", ended_at=iso()
+            )
+            out["sessions"] += 1
+            if s.role is Role.COORD and s.job_id:
+                failed_coord.add(s.job_id)
+            elif s.role is Role.HIDDEN_TEST_AUTHOR and s.job_id:
+                failed_author.add(s.job_id)
+        out["requeued"] = 0
         for job in self.store.list_jobs():
-            if job.state in (JobState.PLANNING, JobState.BUILDING):
+            if job.state is JobState.BUILDING and job.id in safe:
+                # item 3: same image, budget left, under the cap: resume
+                for t in self.store.list_tasks(job.id):
+                    if t.state == "running":
+                        self.store.update_task(t.id, state="queued")
+                self.deferred.append(job.id)
+                out["requeued"] += 1
+            elif job.state in (JobState.PLANNING, JobState.BUILDING):
                 for t in self.store.list_tasks(job.id):
                     if t.state == "running":
                         self.store.update_task(t.id, state="failed")
@@ -367,11 +551,96 @@ class JobRunner:
                 # stuck in review with a plan task that has no PR (finding #4): page it
                 self._hold_without_pr(job.id, gaps, "found at start")
                 out["held"] += 1
+            elif job.state is JobState.IN_REVIEW:
+                # review B3: reviews a restart cut off run again; a review
+                # session is read-only, so nothing of it needs keeping
+                self.deferred.append(job.id)
+                out["requeued"] += 1
             elif job.state is JobState.APPROVED:
                 self.deferred.append(job.id)
                 out["rebuilt"] += 1
         self.store.add_event("reconcile", out, Provenance.HUMAN)
         return out
+
+    def _reservation_live(
+        self, r: sqlite3.Row, stages: set[int], *, restarted: bool = False
+    ) -> bool:
+        """The one rule for whether an open reservation still backs something;
+        the sweep and reconcile both ask it (2a round 9). Live: a call the
+        gateway has in flight against it, or a settle waiting for one (bounded
+        by the upstream read timeout), a session's or vigild's own; then,
+        unless vigild just restarted (nothing of the last process runs), a
+        session still created or running, a review stage whose pass is
+        running, a worker reservation whose task is running."""
+        if self.gateway.holds(r["session_id"], int(r["id"])):
+            return True
+        if restarted:
+            return False
+        if r["session_id"]:
+            try:
+                return self.store.get_session(r["session_id"]).status in LIVE_SESSION
+            except KeyError:
+                return False
+        if r["purpose"] == "review_stage":
+            return int(r["id"]) in stages
+        if r["task_id"]:
+            try:
+                return self.store.get_task(r["task_id"]).state == "running"
+            except KeyError:
+                return False
+        return False
+
+    def sweep_reservations(self, grace_seconds: int = 600) -> list[int]:
+        """Settle every open reservation nothing live holds (2a round 8): a
+        leaked one would otherwise block every later day, since open rows
+        count against today whatever day they began. Live is
+        `_reservation_live`'s rule. Anything younger than the grace period is
+        left alone (it may be about to be used). Returns the ids."""
+        cutoff = utcnow().timestamp() - grace_seconds
+        with self._stage_lock:
+            stages = set(self._review_stage_ids.values())
+        swept: list[int] = []
+        for r in self.store.q("SELECT * FROM reservations WHERE status='open'"):
+            if datetime.fromisoformat(r["created_at"]).timestamp() > cutoff:
+                continue
+            if self._reservation_live(r, stages):
+                continue
+            self.budget.settle(int(r["id"]))
+            swept.append(int(r["id"]))
+        if swept:
+            self.store.add_event("reservation_swept", {"reservations": swept}, Provenance.HUMAN)
+        return swept
+
+    def _safe_to_resume(self, s: SessionRow) -> bool:
+        """A worker a restart cut off may resume (item 3) when its job was
+        building, its image key is unchanged, it has budget left and it's
+        under the resume cap; every live session of the job must be such a
+        worker."""
+        if s.job_id is None:
+            return False
+        try:
+            job = self.store.get_job(s.job_id)
+        except KeyError:
+            return False
+        if job.state is not JobState.BUILDING:
+            return False
+        for other in self.store.list_sessions(job.id):
+            if other.status not in LIVE_SESSION:
+                continue
+            if other.role is not Role.WORKER or not other.task_id:
+                return False
+            try:
+                base = self.workspace.base_sha(other.task_id)
+                same = other.detail.get("image") == self._expected_image(job.repo, base)
+            except Exception:
+                return False
+            crashes = self._crashes(other.task_id) + 1  # this one
+            left = self.remaining(other.task_id)[2]
+            if not same or left < MIN_RETRY_USD:
+                return False
+            if crashes > self.cfg.vigild.scheduler.resume_attempts:
+                return False
+        return True
 
     def dev_image_failed(self, repo: str, title: str, body: dict[str, Any]) -> None:
         """DevImages' pager: one open item per failed image key."""
@@ -418,10 +687,169 @@ class JobRunner:
         itself, building it when the lockfiles changed."""
         started, self.deferred = self.deferred, []
         for job_id in started:
-            self.on_approved(job_id)
+            if self.store.get_job(job_id).state in (JobState.BUILDING, JobState.IN_REVIEW):
+                self.on_resume(job_id)  # workers or reviews a restart cut off (item 3, B3)
+            else:
+                self.on_approved(job_id)
         return len(started)
 
     # --- helpers ------------------------------------------------------------------------
+
+    # --- circuit breakers (item 4) --------------------------------------------------------
+
+    def _breaker_page(self, job_id: str | None, title: str, body: dict[str, Any]) -> Any:
+        assert self.jobs is not None
+        return self.jobs.page(job_id, title, body)
+
+    def _tree_root(self, job: Job) -> str:
+        root = job
+        while root.parent_job_id:
+            root = self.store.get_job(root.parent_job_id)
+        return root.id
+
+    def _paused(
+        self, job: Job, task: str | None = None, *, building: bool = False
+    ) -> Breaker | None:
+        """An open breaker whose scope covers this job (or task): dispatch
+        pauses. The WIP breaker pauses only builds, which open PRs; a coord
+        drafting or a review goes on."""
+        return self.breakers.blocking(
+            repo=job.repo, task=task, tree=self._tree_root(job), wip=building
+        )
+
+    def _refused_by_visibility(self, job: Job) -> bool:
+        """The private-repo rule on the repo's live visibility, read at every
+        dispatch (owner, 2026-10-23). A repo that went private while its
+        backends break the rule is refused and paged: no fallback."""
+        private = live_private(job.repo)
+        errors = repo_rule_errors(self.cfg, job.repo, private)
+        if not errors:
+            return False
+        self._block(job.id, "the private-repo rule: " + "; ".join(errors)[:300])
+        self._page(
+            job.id,
+            f"{job.repo} is private now; its backends break the private-repo rule",
+            {"kind": "repo_policy", "repo": job.repo, "errors": errors,
+             "actions": ["abandon"]},
+        )  # fmt: skip
+        return True
+
+    def _hold_for(self, job_id: str, b: Breaker) -> None:
+        """Pause a job for a breaker: blocked, with no page of its own (the
+        breaker paged once); resetting the breaker resumes it."""
+        self._block(job_id, f"breaker {b.kind.value} ({b.scope})")
+        self.breakers.hold(b, job_id)
+
+    def on_breaker_reset(self, breaker_id: int, item_id: int) -> dict[str, list[str]]:
+        """The owner reset a breaker from the inbox: every job it held goes
+        back to where it was and picks up its work. A job whose last run is
+        still finishing is `queued`, not `resumed` (review B4)."""
+        return self._resume_held(
+            self.breakers.reset(breaker_id), Actor.OWNER,
+            {"inbox_item_id": item_id, "action": "resume", "breaker": breaker_id},
+        )  # fmt: skip
+
+    def _probe_closed(self, held: list[str], item_id: int) -> None:
+        """A backend breaker's probe succeeded (B6): its page is done, and the
+        jobs it held resume."""
+        if item_id:
+            self.store.resolve_inbox_item(item_id, "vigild")
+        self._resume_held(held, Actor.VIGILD, {"action": "probe_closed"})
+
+    def _resume_held(
+        self, job_ids: list[str], actor: Actor, evidence: dict[str, Any]
+    ) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {"resumed": [], "queued": []}
+        for job_id in job_ids:
+            try:
+                job = self.store.get_job(job_id)
+                if job.state is not JobState.BLOCKED or job.blocked_from is None:
+                    continue
+                transition(
+                    self.store, job_id, job.blocked_from, actor,
+                    channel="inbox" if actor is Actor.OWNER else None, evidence=evidence,
+                )  # fmt: skip
+            except TransitionError as e:
+                log.warning("could not resume %s (%s)", job_id, evidence)
+                self._page_if_gaps(job_id, e)
+                continue
+            except KeyError:
+                continue
+            status = self.on_resume(job_id)
+            out["queued" if status == "queued" else "resumed"].append(job_id)
+        return out
+
+    def _refused_budget(
+        self, job_id: str, e: BudgetExceeded, task_id: str | None
+    ) -> Breaker | None:
+        """A reservation refused at a cap (review B1). A task's own cap
+        exhausted trips its per-task breaker; the global daily or monthly
+        breaker trips only when the day's (month's) metered spend has
+        actually reached the cap. Anything else (open reservations fill the
+        day, a wave too big for what's left) is the job's own problem: None,
+        and the caller pages the job."""
+        kind = CAP_KIND.get(e.cap, Kind.DAILY)
+        if kind is Kind.PER_TASK and task_id and self.budget.task_spent(task_id) > 0:
+            return self.breakers.trip(
+                kind, f"task:{task_id}", {"detail": e.detail}, job_id=job_id,
+                actions=("reset", "replan", "abandon"),
+            )  # fmt: skip
+        return self._spend_check()
+
+    def _spend_check(self) -> Breaker | None:
+        """Trip the global daily (monthly) breaker once the day's (month's)
+        metered spend reaches its cap (B14's hard stops; review B1)."""
+        b = self.cfg.budgets
+        for kind, spent, cap in (
+            (Kind.DAILY, self.budget.spent_today(), b.daily_usd),
+            (Kind.MONTHLY, self.budget.spent_month(), b.monthly_usd),
+        ):
+            if spent >= cap - 1e-9:
+                return self.breakers.trip(
+                    kind, GLOBAL, {"spent_usd": round(spent, 4), "cap_usd": cap}
+                )
+        return None
+
+    def _budget_page(self, job_id: str, e: BudgetExceeded, tasks: list[str]) -> None:
+        """A job whose reservation didn't fit gets its own page (review B1):
+        retry (each task on what's left of its cap), re-plan or abandon."""
+        b = self.cfg.budgets
+        self._block(job_id, f"budget: {e}")
+        self._page(
+            job_id, f"{job_id}: the budget can't fit this work now",
+            {"kind": "budget", "cap": e.cap, "detail": e.detail, "tasks": tasks,
+             "day": {"spent_usd": round(self.budget.spent_today(), 4),
+                     "held_usd": round(self.budget.open_today(), 4), "cap_usd": b.daily_usd},
+             "actions": ["retry", "replan", "abandon"],
+             "next": "retry once reservations settle or tomorrow (UTC), re-plan with smaller "
+             "max_cost_usd, or abandon"},
+            resumable=True,
+        )  # fmt: skip
+
+    def _healthy(self, preset: str) -> str | None:
+        """The preset itself, or while its backend breaker is open the first
+        healthy fallback (routing.yaml `fallbacks`); None pauses dispatch."""
+        for p in [preset, *self.cfg.routing.fallbacks.get(preset, [])]:
+            scope = f"backend:{p}"
+            if not self.breakers.is_open(Kind.BACKEND, scope):
+                return p
+            if self.breakers.probe_ready(Kind.BACKEND, scope):
+                return p  # cooled down: its first call is the probe (the gateway claims it)
+        return None
+
+    def child_job(self, parent_id: str, **kw: Any) -> Job | None:
+        """A child job (a deps job now, a fix job in phase 6). Past depth 3 the
+        job tree's fix-depth breaker trips and no job is made."""
+        parent = self.store.get_job(parent_id)
+        try:
+            return self.store.create_job(parent_job_id=parent_id, **kw)
+        except FixDepthExceeded as e:
+            b = self.breakers.trip(
+                Kind.FIX_DEPTH, f"tree:{self._tree_root(parent)}", {"detail": str(e)},
+                job_id=parent_id,
+            )  # fmt: skip
+            self._hold_for(parent_id, b)
+            return None
 
     def _page(
         self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
@@ -429,17 +857,33 @@ class JobRunner:
         assert self.jobs is not None
         self.jobs.page(job_id, title, body, resumable=resumable)
 
-    def _block(self, job_id: str, reason: str, *, state: JobState = JobState.BLOCKED) -> None:
+    def _block(
+        self,
+        job_id: str,
+        reason: str,
+        blocked_on: str | None = None,
+        *,
+        state: JobState = JobState.BLOCKED,
+    ) -> None:
         try:
             job = self.store.get_job(job_id)
             if job.state in (JobState.BLOCKED, JobState.ESCALATED, JobState.DONE):
                 return
-            transition(self.store, job_id, state, Actor.VIGILD, evidence={"reason": reason})
+            evidence: dict[str, Any] = {"reason": reason}
+            if blocked_on is not None:
+                evidence["blocked_on"] = blocked_on
+            transition(self.store, job_id, state, Actor.VIGILD, evidence=evidence)
         except TransitionError, KeyError:
             log.warning("could not block %s", job_id)
 
     def _event_sink(self, s: SessionRow) -> Callable[[dict[str, Any]], None]:
         def sink(e: dict[str, Any]) -> None:
+            if e.get("type") == "transcript":
+                self._transcript(s, e.get("data") or {})
+                return
+            if e.get("type") == "checkpoint":
+                self._checkpoint(s, e.get("data") or {})
+                return
             self.store.add_event(
                 str(e.get("type", "state")),
                 redact(e.get("data") or {}),
@@ -451,61 +895,198 @@ class JobRunner:
 
         return sink
 
+    def _transcript(self, s: SessionRow, data: dict[str, Any]) -> None:
+        """Transcript lines the harness mirrored from the SDK: kept for resume
+        and forks (phase 2a), redacted like every event."""
+        sdk = data.get("session_id")
+        entries = data.get("entries")
+        if not isinstance(sdk, str) or not sdk or not isinstance(entries, list):
+            return
+        sub = data.get("subpath")
+        self.store.add_transcript(
+            s.id, sdk[:100], str(sub)[:200] if sub else None, redact(entries)[:5000]
+        )
+        if not sub and (s.id, sdk) not in self._sdk_seen:
+            self._sdk_seen.add((s.id, sdk))  # every session's SDK id is stored (item 3)
+            self.store.update_session(s.id, detail={"sdk_session_id": sdk[:100]})
+
+    def _checkpoint(self, s: SessionRow, data: dict[str, Any]) -> None:
+        """A running worker's checkpoint (item 3): imported into the vault at
+        once, bound to the commit its line names, and recorded as the
+        session's last bundled commit. One that doesn't match is refused."""
+        head, turns = data.get("head"), data.get("turns")
+        if s.role is not Role.WORKER or not s.task_id or not s.job_id or not isinstance(head, str):
+            return
+        try:
+            job = self.store.get_job(s.job_id)
+            got = self.workspace.import_result(
+                job.repo,
+                s.task_id,
+                self._session_dir(s.id) / "out",
+                str(s.branch),
+                self.workspace.base_sha(s.task_id),
+                head=head,
+                checkpoint=True,
+            )
+        except (WorkspaceError, KeyError, OSError) as e:
+            self.store.add_event(
+                "checkpoint_refused", {"error": str(e)[:500]}, Provenance.HUMAN,
+                job_id=s.job_id, session_id=s.id, task_id=s.task_id,
+            )  # fmt: skip
+            return
+        n = int(turns) if isinstance(turns, int) else 0
+        self.store.update_session(s.id, detail={"checkpoint": got, "turns": n})
+        self.store.add_event(
+            "checkpoint", {"head": got, "turns": n}, Provenance.HUMAN,
+            job_id=s.job_id, session_id=s.id, task_id=s.task_id,
+        )  # fmt: skip
+
+    def _turns_used(self, resume: Resume | None) -> int:
+        """Turns a worker has had, across the sessions its transcript carries:
+        its distinct assistant messages."""
+        if resume is None:
+            return 0
+        ids = {
+            str((e.get("message") or {}).get("id") or e.get("uuid"))
+            for e in resume.entries
+            if isinstance(e, dict) and e.get("type") == "assistant"
+        }
+        return len(ids)
+
+    def _crashes(self, task_id: str) -> int:
+        """Crashed or killed worker sessions in a row, latest first."""
+        rows = self.store.q(
+            "SELECT status FROM sessions WHERE task_id=? AND role='worker' ORDER BY rowid DESC",
+            (task_id,),
+        )
+        n = 0
+        for r in rows:
+            if r["status"] != "crashed":
+                break
+            n += 1
+        return n
+
+    def _resumable(self, task_id: str) -> bool:
+        """Under the resume cap, with budget left (item 3)."""
+        return (
+            self._crashes(task_id) <= self.cfg.vigild.scheduler.resume_attempts
+            and self.remaining(task_id)[2] >= MIN_RETRY_USD
+        )
+
+    def _expected_image(self, repo: str, base_sha: str) -> str:
+        """The image a session for this base would run in now, computed
+        without building anything (reconcile's "image key unchanged")."""
+        dev = self.dev_images.tag(repo, self.dev_images.key(repo, base_sha))
+        if self.session_images is None:
+            return dev
+        return self.session_images.tag(repo, self.session_images.key(dev))
+
+    def _resume_from(self, session_id: str | None, *, fork: bool = True) -> Resume | None:
+        """A Resume of a vigil session's stored transcript, if it has one."""
+        if session_id is None:
+            return None
+        sdk, entries = self.store.transcript(session_id)
+        if sdk is None or not entries:
+            return None
+        return Resume(session_id=sdk, entries=entries, fork=fork, from_session=session_id)
+
+    def _last_worker(self, task_id: str) -> SessionRow | None:
+        rows = self.store.q(
+            "SELECT id FROM sessions WHERE task_id=? AND role='worker' ORDER BY rowid DESC LIMIT 1",
+            (task_id,),
+        )
+        return self.store.get_session(rows[0]["id"]) if rows else None
+
     def _run_session(
-        self, s: SessionRow, spec: SessionSpec, reservation: int, attrs: dict[str, Any]
+        self,
+        s: SessionRow,
+        spec: SessionSpec,
+        reservation: int,
+        attrs: dict[str, Any],
+        *,
+        cap: float | None = None,
     ) -> ExecOutcome:
-        """Token, telemetry, run, revoke, settle. The reservation is already made."""
+        """A session slot, then token, telemetry, run, revoke, settle. The
+        reservation is already made; the token is issued once the slot is
+        taken, so waiting for one doesn't eat its life."""
         if s.role is not spec.role:
             # role separation, enforced at dispatch: a session row never runs as
             # another role, so an author's session is never a worker or a reviewer
             raise SessionRoleError(f"session {s.id} is a {s.role.value}, not a {spec.role.value}")
-        token = self.gateway.issue_token(
-            s.id, spec.repo, spec.preset, ttl_minutes=spec.max_minutes + TOKEN_TTL_MARGIN_MIN
-        )
-        self.store.update_session(
-            s.id, status="running", started_at=iso(), clone_path=str(spec.clone)
-        )
-        out: ExecOutcome | None = None
-        try:
-            with self.telemetry.session(s.id, attrs) as tr:
-                spec.traceparent = tr.traceparent
-                self.store.update_session(s.id, detail={"trace_id": tr.trace_id})
-                with self.telemetry.span(tr, "vigil.spawn", {"vigil.image": spec.image or ""}):
-                    out = self.executor.run(spec, token, self._event_sink(s))
-                tr.set("vigil.status", out.status)
-                if out.status == "done" and last_call_truncated(self.store, s.id):
-                    # never a finished turn: it was cut off at the output cap
-                    out.status = "failed"
-                    out.error = (
-                        "the final turn was truncated at the output cap "
-                        f"({self.cfg.budgets.session_max_output_tokens} tokens per call)"
-                    )
-                    tr.set("vigil.truncated", True)
-                    tr.set("vigil.status", out.status)
-                failed_metering = self.store.q(
-                    "SELECT 1 FROM events WHERE session_id=? AND type='metering_failed'", (s.id,)
+        with self.slots.session():
+            out: ExecOutcome | None = None
+            try:
+                # inside the try: a token refused (the repo went private) still
+                # settles the reservation (2a round 8)
+                token = self.gateway.issue_token(
+                    s.id, spec.repo, spec.preset,
+                    ttl_minutes=spec.max_minutes + TOKEN_TTL_MARGIN_MIN,
+                )  # fmt: skip
+                self.store.update_session(
+                    s.id, status="running", started_at=iso(), clone_path=str(spec.clone)
                 )
-                if failed_metering:  # a call's spend is unbooked: never a finished session
-                    out.status = "failed"
-                    out.error = "metering failed; see the inbox page"
+                with self.telemetry.session(s.id, attrs) as tr:
+                    spec.traceparent = tr.traceparent
+                    self.store.update_session(s.id, detail={"trace_id": tr.trace_id})
+                    with self.telemetry.span(tr, "vigil.spawn", {"vigil.image": spec.image or ""}):
+                        out = self.executor.run(spec, token, self._event_sink(s))
                     tr.set("vigil.status", out.status)
-                if out.status != "done":
-                    refused = self.store.q(
-                        "SELECT data FROM events WHERE session_id=? AND type='gateway_refused'"
-                        " ORDER BY id DESC",
+                    if cap is not None:  # a review or audit: did it go past its cap?
+                        self.gateway.drain(s.id)
+                        over = session_cost(self.store, s.id) - cap
+                        tr.set("vigil.review.over_cap", over > 1e-9)
+                        tr.set("vigil.review.overage_usd", round(max(0.0, over), 6))
+                    if out.status == "done" and last_call_truncated(self.store, s.id):
+                        # never a finished turn: it was cut off at the output cap
+                        out.status = "failed"
+                        out.error = (
+                            "the final turn was truncated at the output cap "
+                            f"({self.cfg.budgets.session_max_output_tokens} tokens per call)"
+                        )
+                        tr.set("vigil.truncated", True)
+                        tr.set("vigil.status", out.status)
+                    failed_metering = self.store.q(
+                        "SELECT 1 FROM events WHERE session_id=? AND type='metering_failed'",
                         (s.id,),
                     )
-                    for row in refused:
-                        reason = str(json.loads(row["data"]).get("reason", ""))
-                        if reason.startswith("budget:"):
-                            # name the cap and the shortfall on the page
-                            out.error = f"{out.error or ''} | {reason}".strip(" |")
-                            break
-            return out
-        finally:
-            self.gateway.revoke(s.id)
-            self._settle_fail_closed(s, spec, reservation, out)
-            self.store.update_session(s.id, ended_at=iso())
+                    if failed_metering:  # a call's spend is unbooked: never a finished session
+                        out.status = "failed"
+                        out.error = "metering failed; see the inbox page"
+                        tr.set("vigil.status", out.status)
+                    if out.status != "done":
+                        refused = self.store.q(
+                            "SELECT data FROM events WHERE session_id=? AND type='gateway_refused'"
+                            " ORDER BY id DESC",
+                            (s.id,),
+                        )
+                        for row in refused:
+                            reason = str(json.loads(row["data"]).get("reason", ""))
+                            if reason.startswith("budget:"):
+                                # name the cap and the shortfall on the page
+                                out.error = f"{out.error or ''} | {reason}".strip(" |")
+                                break
+                return out
+            finally:
+                self.gateway.revoke(s.id)
+                if self.gateway.drain(s.id):  # its last calls booked first
+                    self._settle_checked(s, spec, reservation, out)
+                else:
+                    # a call outlived the wait: the reservation stays open (and
+                    # counted, and live to the sweep) until it is booked, then
+                    # settles (2a rounds 8-9)
+                    log.warning("%s: a call was still in flight at settling", s.id)
+                    self.gateway.after_drain(
+                        s.id, functools.partial(self._settle_checked, s, spec, reservation, out)
+                    )
+                self.store.update_session(s.id, ended_at=iso())
+
+    def _settle_checked(
+        self, s: SessionRow, spec: SessionSpec, reservation: int, out: ExecOutcome | None
+    ) -> None:
+        """Settle a session's reservation (failing closed if that raises), then
+        the spend check: a late settle can fill the day too (2a round 9)."""
+        self._settle_fail_closed(s, spec, reservation, out)
+        self._spend_check()
 
     def _settle_fail_closed(
         self, s: SessionRow, spec: SessionSpec, reservation: int, out: ExecOutcome | None
@@ -518,8 +1099,14 @@ class JobRunner:
         except Exception as e:
             err = redact(f"{type(e).__name__}: {e}")
         log.error("settle failed for session %s: %s", s.id, err)
-        rows = self.store.q("SELECT amount_usd FROM reservations WHERE id=?", (reservation,))
-        reserved = float(rows[0]["amount_usd"]) if rows else 0.0
+        # the session's whole open money (its reservation plus an over-cap extension or a
+        # draw's top-up) is booked at once, so the sweep can't book those rows again
+        rows = self.store.q(
+            "SELECT COALESCE(SUM(amount_usd), 0) n FROM reservations"
+            " WHERE status='open' AND (id=? OR session_id=?)",
+            (reservation, s.id),
+        )
+        reserved = float(rows[0]["n"])
         steps: list[Callable[[], Any]] = [
             lambda: self.budget.settle(reservation, reserved),
             lambda: self.store.update_session(s.id, status="failed"),
@@ -602,14 +1189,23 @@ class JobRunner:
 
     def run_coord(self, job_id: str) -> None:
         job = self.store.get_job(job_id)
-        preset = self.cfg.routing.coord
+        if self._refused_by_visibility(job):
+            return
+        b = self._paused(job)
+        if b is not None:
+            self._hold_for(job_id, b)
+            return
+        preset = self._healthy(self.cfg.routing.coord)
+        if preset is None:
+            self._hold_for(job_id, self._backend_breaker(self.cfg.routing.coord))
+            return
         try:
             # the repo's dev image must be fresh before any work starts on it;
             # a new lockfile builds one here (owner direction, round 2)
             session_image = self._session_image(
                 job.repo, self.workspace.head_sha(job.repo, job.base)
             )
-            check_backend(self.cfg, job.repo, preset)
+            check_backend(self.cfg, job.repo, preset, private=live_private(job.repo))
         except (StaleDevImage, RepoPolicyError) as e:
             why = "dev image not fresh" if isinstance(e, StaleDevImage) else "backend refused"
             self._page(
@@ -636,14 +1232,16 @@ class JobRunner:
                     amount=self.cfg.budgets.coord_session_usd,
                     purpose="coord",
                 )
+            except QueueCancelled:  # abandoned while it waited for the day's room
+                self.store.update_session(coord.id, status="refused")
+                return
             except BudgetExceeded as e:
                 self.store.update_session(coord.id, status="refused")
-                self._page(
-                    job_id,
-                    f"{job_id}: {e.cap} cap reached; coord not started",
-                    {"error": str(e)},
-                    resumable=True,
-                )
+                b = self._refused_budget(job_id, e, None)
+                if b is not None:
+                    self._hold_for(job_id, b)
+                else:
+                    self._budget_page(job_id, e, [])
                 return
             try:
                 draft = self._coord_attempt(
@@ -712,6 +1310,9 @@ class JobRunner:
             **{f"previous_{k}": v for k, v in previous.items()},
         }
         untrusted: dict[str, str] = {}
+        issue = issue_text(self.store, job_id)
+        if issue is not None:
+            untrusted["github issue"] = issue  # label intake: the issue's own text
         if replan:
             # vigild's summary goes in the contract; the failure details carry
             # worker and test output, so they go in the untrusted section
@@ -723,6 +1324,23 @@ class JobRunner:
         packet = assemble_coord(
             clone, request, untrusted=untrusted, gate_errors=gate_errors, amend=amend
         )
+        # Re-plan (item 3): the coord resumes its own last session, its whole
+        # context, with the failures in this packet. Phase 6's fix jobs reuse it.
+        resume = None
+        if replan:
+            prior = [
+                x
+                for x in self.store.list_sessions(job_id)
+                if x.role is Role.COORD and x.id != coord.id
+            ]
+            resume = self._resume_from(prior[-1].id) if prior else None
+            if resume is not None:
+                self.store.add_event(
+                    "fork",
+                    {"from_session": resume.from_session, "sdk_session_id": resume.session_id,
+                     "entries": len(resume.entries), "replan": True},
+                    Provenance.HUMAN, job_id=job_id, session_id=coord.id,
+                )  # fmt: skip
         self.store.add_event(
             "packet",
             {"role": "coord", "attempt": attempt, "dropped": packet.dropped},
@@ -747,6 +1365,7 @@ class JobRunner:
             packet=packet.text,
             image=session_image,  # the executor layer over the repo's dev image
             max_output_tokens=self.cfg.budgets.session_max_output_tokens,
+            resume=resume,
         )
         out = self._run_session(
             coord,
@@ -893,8 +1512,9 @@ class JobRunner:
             # no key, no tag, no hidden test that can count: the task can only escalate
             return {"status": "missing", "reason": "VIGIL_HOST_KEY is not set", "attempts": 0}
         try:
-            check_backend(self.cfg, job.repo, preset)
-            check_hidden_author(self.cfg, job.repo, preset)
+            private = live_private(job.repo)
+            check_backend(self.cfg, job.repo, preset, private=private)
+            check_hidden_author(self.cfg, job.repo, preset, private=private)
         except RepoPolicyError as e:
             return {"status": "missing", "reason": f"backend refused: {e}", "attempts": 0}
         config = [f for f in overlap if runner_like(f)]
@@ -1019,6 +1639,9 @@ class JobRunner:
                 job_id, "hidden_test_author", session_id=s.id, task_id=None,
                 amount=amount, purpose="hidden_tests",
             )  # fmt: skip
+        except QueueCancelled:
+            self.store.update_session(s.id, status="refused")
+            return None, "the job moved on while the author waited for the day's room"
         except BudgetExceeded as e:
             self.store.update_session(s.id, status="refused")
             return None, f"{e.cap} cap reached"
@@ -1152,12 +1775,15 @@ class JobRunner:
 
     def _plan_and_dispatch(self, job_id: str) -> None:
         job = self.store.get_job(job_id)
+        if self.store.get_artifact(job_id, "deps.json") is not None:
+            self._plan_deps(job)
+            return
         art = self.store.get_artifact(job_id, "plan.md")
         assert art is not None
         workers = parse_plan(art.content).workers
         planned = {w.task_id for w in workers}
         for old in self.store.list_tasks(job_id):
-            if old.id not in planned and old.state not in ("pr_open", *DEAD_TASK):
+            if old.id not in planned and old.state not in (*PUBLISHED, *DEAD_TASK):
                 self.store.update_task(old.id, state="superseded")  # re-planned away (N5)
         for w in workers:
             if not w.task_id.startswith(f"{job_id}-w"):
@@ -1169,10 +1795,13 @@ class JobRunner:
                     raise RoutingError(f"the dev image lacks {lacking}")
                 r = route(task, self.cfg)
             except RoutingError as e:
-                self._page(
-                    job_id, f"{job_id}: {w.task_id} can't run", {"error": str(e)}, resumable=True
-                )
                 self._block(job_id, f"routing: {e}")
+                self._page(
+                    job_id, f"{job_id}: {w.task_id} can't run",
+                    {"kind": "cant_run", "error": str(e),
+                     "actions": ["retry", "replan", "abandon"]},
+                    resumable=True,
+                )  # fmt: skip
                 return
             contract = task.model_copy(
                 update={"tier": r.tier, "tier_reason": r.tier_reason, "backend": r.preset}
@@ -1181,7 +1810,7 @@ class JobRunner:
                 existing = self.store.get_task(w.task_id)
                 if existing.job_id != job_id:
                     raise RuntimeError(f"task {w.task_id} belongs to {existing.job_id}")
-                if existing.state == "pr_open":
+                if existing.state in PUBLISHED:
                     continue  # after a re-plan, a published task's PR stands as it is
                 self.store.update_task(w.task_id, contract=contract)
             except KeyError:
@@ -1193,59 +1822,140 @@ class JobRunner:
         self.dispatch(job_id)
 
     def dispatch(self, job_id: str) -> None:
-        """Run every live task not yet published, in dependency waves. After a
-        wave with a failure, the job blocks and the owner chooses (N5)."""
+        """Run every live task not yet published as a dependency graph (plan
+        2a, item 2): each starts once its own dependencies are published, and
+        tasks that become ready together reserve their budgets together. A
+        task that would open a new PR waits while the repo is at its WIP
+        limit. After a failure nothing new starts, and the job blocks once
+        what's running finishes; the owner chooses (N5)."""
+        job = self.store.get_job(job_id)
         tasks = {t.id: t for t in self.store.list_tasks(job_id) if t.state not in DEAD_TASK}
-        done = {t for t, row in tasks.items() if row.state == "pr_open"}
+        done = {t for t, row in tasks.items() if row.state in PUBLISHED}
         # an escalated task is held out of a retry: it would build the same thing
         # (a new plan and new hidden tests are what help), but the job's other
         # failed tasks still retry (hotfix 5)
         escalated = [t for t, row in tasks.items() if row.state == "escalated"]
-        pending = [t for t in tasks if t not in done and t not in escalated]
-        while pending:
-            wave = [t for t in pending if set(tasks[t].contract.get("depends_on", [])) <= done]
-            if not wave and escalated:
-                self._hold_failed(job_id, escalated)  # what's left waits behind them
-                return
-            if not wave:
-                # Nothing can start: a dependency is missing from the plan (item 17).
-                stuck = {t: self.store.get_task(t).state for t in pending}
-                self._page(
-                    job_id,
-                    f"{job_id}: work is stuck behind unfinished dependencies",
-                    {"pending": stuck, "actions": ["replan", "abandon"]},
-                )
-                self._block(job_id, f"stuck: {sorted(stuck)}")
-                return
-            pending = [t for t in pending if t not in wave]
+        deps = {
+            t: list(row.contract.get("depends_on", []))
+            for t, row in tasks.items()
+            if t not in escalated
+        }
+        limit = self.cfg.budgets.wip_per_repo
+        wip_held: set[str] = set()
+
+        def launch(batch: list[str]) -> dict[str, Callable[[], bool]] | None:
+            if self._refused_by_visibility(job):
+                return None
+            for tid in batch:
+                # the WIP breaker holds only work that would open a new PR: a
+                # fix round pushes to its PR and drains the stack (review B5)
+                b = self._paused(job, tid, building=wip.opens_a_pr(self.store, tid))
+                routed = self.store.get_task(tid).backend_preset or self.cfg.routing.fallback
+                if b is None and self._healthy(routed) is None:
+                    b = self._backend_breaker(routed)  # no healthy backend for it
+                if b is not None:
+                    self._hold_for(job_id, b)
+                    return None
+            # the room check, the reservations and the move to running are one
+            # step for every job's dispatch at once (review B10)
+            with self._wip_lock:
+                free = wip.room(self.store, job.repo, limit)
+                admitted: list[str] = []
+                for tid in batch:
+                    if wip.opens_a_pr(self.store, tid):
+                        if free <= 0:
+                            wip_held.add(tid)
+                            continue
+                        free -= 1
+                    admitted.append(tid)
+                if not admitted:
+                    return {}
+                retrying = [t for t in admitted if self.store.get_task(t).state == "failed"]
+                try:
+                    held = self._reserve_wave(job_id, admitted)
+                except Refused:
+                    return None
+                for tid in admitted:
+                    self.store.update_task(tid, state="running")  # its place in the stack
+            routed_before = {tid: self.store.get_task(tid) for tid in retrying}
             try:
-                reservations = self._reserve_wave(job_id, wave)
-            except Refused:
-                return
-            with ThreadPoolExecutor(max_workers=len(wave)) as pool:
-                futures = [
-                    pool.submit(self._run_worker, job_id, t, *reservations[t])
-                    if t in reservations
-                    else pool.submit(self._run_queued_worker, job_id, t)
-                    for t in wave
-                ]
-                results = [f.result() for f in futures]
-            done |= {t for t, ok in zip(wave, results, strict=True) if ok}
-            failed = [t for t, ok in zip(wave, results, strict=True) if not ok]
-            if failed:
-                self._hold_failed(job_id, failed + [t for t in escalated if t not in failed])
-                return
+                for tid in retrying:
+                    # another attempt; the third is routed by rule 5 (escalated)
+                    attempt = int(self.store.get_task(tid).contract.get("attempt") or 1)
+                    self._reroute(job_id, tid, attempt=attempt + 1)
+            except RoutingError as e:
+                # nothing reserved is left behind (2a round 8): release the
+                # wave, put its tasks back as they were (their attempt and
+                # route too, 2a round 9), and page the job
+                for rid, _amt in held.values():
+                    if rid:
+                        self.budget.settle(rid, 0.0)
+                for tid, t in routed_before.items():
+                    self.store.update_task(tid, contract=t.contract)
+                    if t.tier and t.tier_reason and t.backend_preset:  # it ran: it was routed
+                        self.store.route_task(tid, tier=t.tier, tier_reason=t.tier_reason,
+                                              backend_preset=t.backend_preset)  # fmt: skip
+                for tid in admitted:
+                    self.store.update_task(tid, state="failed" if tid in retrying else "waiting")
+                    self._queue_leave(self._queue_key(job_id, "worker", tid))  # no thread will wait
+                self._block(job_id, f"routing: {e}")
+                self._page(
+                    job_id, f"{job_id}: a retry can't be routed",
+                    {"kind": "cant_run", "error": str(e),
+                     "actions": ["retry", "replan", "abandon"]},
+                    resumable=True,
+                )  # fmt: skip
+                return None
+            # a worker the day had no room for waits in its own thread (the budget
+            # queue), so the others run and free the money
+            return {
+                tid: functools.partial(self._run_worker, job_id, tid, *held[tid])
+                if tid in held
+                else functools.partial(self._run_queued_worker, job_id, tid)
+                for tid in admitted
+            }
+
+        result = run_graph(deps, done, launch)
+        if cancelled := [t for t in result.failed if t in self._wait_cancelled]:
+            # a worker was waiting for the day's room when its job moved on (abandoned, or
+            # held by a restart): that move owns the job's page, and nothing failed
+            self._wait_cancelled.difference_update(cancelled)
+            return
+        if result.failed:
+            self._hold_failed(
+                job_id, result.failed + [t for t in escalated if t not in result.failed]
+            )
+            return
+        if result.halted:
+            return  # a budget refusal blocked the job and paged
+        waiting = [t for t in result.waiting if t in wip_held]
+        if waiting:
+            for tid in waiting:
+                self.store.update_task(tid, state="waiting")
+            self._wip_hold(job_id, job.repo, waiting)
+            return
         if escalated:
-            self._hold_failed(job_id, escalated)
+            self._hold_failed(job_id, escalated)  # what's left waits behind them
+            return
+        if result.waiting:
+            # Nothing can start: a dependency is missing from the plan (item 17).
+            stuck = {t: self.store.get_task(t).state for t in result.waiting}
+            self._page(
+                job_id,
+                f"{job_id}: work is stuck behind unfinished dependencies",
+                {"pending": stuck, "actions": ["replan", "abandon"]},
+            )
+            self._block(job_id, f"stuck: {sorted(stuck)}")
             return
         live = [t for t in self.store.list_tasks(job_id) if t.state not in DEAD_TASK]
-        if all(t.state == "pr_open" for t in live):
-            self._enter_review(job_id)
+        if all(t.state in PUBLISHED for t in live) and self._enter_review(job_id):
+            self.review(job_id)
 
-    def _enter_review(self, job_id: str) -> None:
+    def _enter_review(self, job_id: str) -> bool:
         """The one way vigild moves a job to `in_review`. The FSM's guard refuses it
         unless every task in the current plan has an open PR for that plan's work; the
-        job then blocks with a page naming the tasks that have none (finding #4)."""
+        job then blocks with a page naming the tasks that have none (finding #4).
+        True when the job is in review."""
         try:
             transition(self.store, job_id, JobState.IN_REVIEW, Actor.VIGILD)
         except TransitionError as e:
@@ -1253,6 +1963,18 @@ class JobRunner:
             if not gaps:
                 raise
             self._hold_without_pr(job_id, gaps, str(e))
+            return False
+        return True
+
+    def _page_if_gaps(self, job_id: str, why: TransitionError) -> None:
+        """A move the invariant refused (a resume into review, say) must not leave the job
+        blocked with no page: if a plan task has no open PR, page it as reconcile does."""
+        try:
+            gaps = plan_gaps(self.store, job_id)
+        except KeyError:
+            return
+        if gaps:
+            self._hold_without_pr(job_id, gaps, str(why))
 
     def _hold_without_pr(self, job_id: str, gaps: dict[str, str], why: str) -> None:
         self._block(job_id, f"no open PR for plan task(s) {sorted(gaps)}")
@@ -1266,6 +1988,53 @@ class JobRunner:
                 "actions": ["replan", "abandon"],
             },
         )
+
+    def _wip_hold(self, job_id: str, repo: str, waiting: list[str]) -> None:
+        """The repo is at its WIP limit: its WIP breaker trips (one page, with
+        the stack; design "Intake", rule 2) and the job waits on it. Merge or
+        close one, then reset it from the inbox."""
+        limit = self.cfg.budgets.wip_per_repo
+        b = self.breakers.trip(
+            Kind.WIP, f"repo:{repo}",
+            {"limit": limit, "stack": wip.stack(self.store, repo), "waiting": waiting},
+        )  # fmt: skip
+        self._hold_for(job_id, b)
+
+    def _verifier_verdict(self, repo: str, job_id: str, tests: dict[str, Any]) -> None:
+        """M `unknown` verdicts in a row trip the repo's breaker: a broken
+        image or runner, not the worker (item 4). Only runs that couldn't be
+        prepared or run count (exit 125-127, or a signal); a worker whose test
+        is missing or doesn't collect is the worker's failure, not the image's."""
+        runs = [tests.get(r) or {} for r in ("base", "before", "after")]
+        outcomes = [r.get("outcome") for r in runs]
+
+        def broken(r: dict[str, Any]) -> bool:
+            code = r.get("exit")
+            return (
+                r.get("outcome") == "unknown"
+                and isinstance(code, int)
+                and (code in (125, 126, 127) or code >= 128)
+            )
+
+        unknown = any(broken(r) for r in runs if r)
+        if unknown:
+            self.breakers.failure(
+                Kind.VERIFIER_UNKNOWNS, f"repo:{repo}", self.cfg.vigild.breakers.verifier_unknowns,
+                {"job": job_id, "outcomes": outcomes},
+            )  # fmt: skip
+        else:
+            self.breakers.success(Kind.VERIFIER_UNKNOWNS, f"repo:{repo}")
+
+    def _backend_breaker(self, preset: str) -> Breaker:
+        b = self.breakers._row(Kind.BACKEND, f"backend:{preset}")
+        return b or self.breakers.trip(Kind.BACKEND, f"backend:{preset}", {"preset": preset})
+
+    def job_failed(self, job: Job) -> None:
+        """K failed or abandoned jobs in a row trip the repo's breaker (item 4)."""
+        self.breakers.failure(
+            Kind.REPO_FAILURES, f"repo:{job.repo}", self.cfg.vigild.breakers.repo_failures,
+            {"job": job.id},
+        )  # fmt: skip
 
     def remaining(self, task_id: str) -> tuple[float, float, float]:
         """(cap, spent, left) for a task: a retry gets what's left, never a fresh cap."""
@@ -1307,7 +2076,8 @@ class JobRunner:
 
     def _hold_failed(self, job_id: str, task_ids: list[str]) -> None:
         """Block the job with one item: retry (when every failed task has budget
-        left), re-plan, or abandon."""
+        left), re-plan, or abandon. It counts toward the repo's failures. A task
+        that needs a dependency instead gets a child deps job (item 5)."""
         tasks: dict[str, dict[str, Any]] = {}
         lefts: list[float] = []  # budget left of each task a retry would run
         for tid in task_ids:
@@ -1327,36 +2097,41 @@ class JobRunner:
         can_retry = bool(lefts) and all(x >= MIN_RETRY_USD for x in lefts)
         deps = any("needs_deps" in t for t in tasks.values())
         if deps:
-            # retry once the deps PR has merged: the base moves, so the dev image
-            # key changes and vigild builds the new image first
-            actions = (["retry"] if can_retry else []) + ["abandon"]
-            self._block(job_id, "needs_deps")
+            # item 5: a child deps job; this job resumes on its own when it merges
+            wanted = [d for t in tasks.values() for d in t.get("needs_deps", [])]
+            child = self._spawn_deps(
+                job_id, [tid for tid, t in tasks.items() if "needs_deps" in t], wanted
+            )
+            if child is None:
+                return  # the job tree's fix-depth breaker paged and holds it
+            self._block(job_id, "needs_deps", blocked_on=child)
             self._page(
                 job_id,
                 f"{job_id}: needs dependencies: "
-                + ", ".join(
-                    f"{d['package']}@{d['version']}"
-                    for t in tasks.values()
-                    for d in t.get("needs_deps", [])
-                )[:250],
+                + ", ".join(f"{d['package']}@{d['version']}" for d in wanted)[:250],
                 {
                     "kind": "needs_deps",
                     "tasks": tasks,
-                    "actions": actions,
-                    "next": "a deps job changes only the manifest and lockfile, rebuilds the dev "
-                    "image and lands as its own PR (phase 2 builds it; until then, by hand). "
-                    "Retry this job after that PR merges.",
+                    "deps_job": child,
+                    "actions": ["abandon"],
+                    "next": f"deps job {child} waits in Specs to approve. It changes only the "
+                    "manifests and lockfiles and opens its own PR; when that merges, the dev "
+                    "image is rebuilt from it and this job resumes on its own.",
                 },
-                resumable=can_retry,
             )
             return
         escalated = [t for t in task_ids if self.store.get_task(t).state == "escalated"]
+        self.job_failed(self.store.get_job(job_id))
         actions = (["retry"] if can_retry else []) + ["replan", "abandon"]
         self._block(
             job_id,
             f"workers failed: {sorted(task_ids)}",
             state=JobState.ESCALATED if escalated else JobState.BLOCKED,
         )
+        # its own page holds it now: no breaker resumes it behind that page's
+        # back when it closes (2a round 3); a breaker it leaves holding nothing
+        # resolves its page, as abandoning does (2a round 9)
+        self.breakers.unhold(job_id, by=Actor.VIGILD.value)
         titles = "; ".join(str(t.get("title") or tid) for tid, t in tasks.items())
         self._page(
             job_id,
@@ -1381,7 +2156,13 @@ class JobRunner:
                 amount=amount,
                 purpose="worker",
                 queued=True,  # `queued` was emitted when the wave was reserved
+                expect=BUILD_WAIT,
             )
+        except QueueCancelled:  # the job was abandoned (or moved on) while this waited
+            if self.store.get_task(task_id).state == "running":
+                self.store.update_task(task_id, state="waiting")
+            self._wait_cancelled.add(task_id)
+            return False
         except BudgetExceeded as e:  # the month, say: it ran out while this waited
             return self._fail(
                 job_id, None, task_id, f"{task_id}: {e.cap} cap reached", {"error": str(e)}
@@ -1396,12 +2177,23 @@ class JobRunner:
         and page: dispatch halts."""
         held: dict[str, tuple[int, float]] = {}
         for tid in task_ids:
+            if self.store.get_task(tid).contract.get("shape") == "deps":
+                held[tid] = (0, 0.0)  # a deps job runs no model: nothing to reserve
+                continue
             _, _, amount = self.remaining(tid)
+            key = self._queue_key(job_id, "worker", tid)
             try:
                 if amount < MIN_RETRY_USD:
                     raise BudgetExceeded(
                         "per_task", f"task {tid} has ${amount:.2f} of its cap left"
                     )
+                if not self._queue_turn(key):  # an older waiter is owed the day's room first
+                    self._queue_join(key)
+                    self._queue_event(
+                        "queued", job_id, "worker", tid, amount_usd=amount,
+                        detail="behind an older waiter",
+                    )  # fmt: skip
+                    continue
                 held[tid] = (
                     self.budget.reserve(
                         session_id=None, task_id=tid, amount=amount, purpose="worker"
@@ -1410,27 +2202,23 @@ class JobRunner:
                 )
             except BudgetExceeded as e:
                 if self._queueable(e, amount):
+                    self._queue_join(key)
                     self._queue_event(
                         "queued", job_id, "worker", tid, amount_usd=amount, detail=e.detail
                     )
                     continue
                 for rid, _amt in held.values():
-                    self.budget.settle(rid, 0.0)
+                    if rid:
+                        self.budget.settle(rid, 0.0)
+                for t2 in task_ids:
+                    self._queue_leave(self._queue_key(job_id, "worker", t2))
                 for t2 in task_ids:
                     self.store.update_task(t2, state="waiting")
-                per_task = e.cap == "per_task"
-                self._page(
-                    job_id,
-                    f"{job_id}: {e.cap} cap reached; dispatch halted",
-                    {
-                        "cap": e.cap,
-                        "detail": e.detail,
-                        "tasks": task_ids,
-                        "actions": ([] if per_task else ["retry"]) + ["replan", "abandon"],
-                    },
-                    resumable=not per_task,
-                )
-                self._block(job_id, f"budget: {e}")
+                b = self._refused_budget(job_id, e, tid)
+                if b is not None:
+                    self._hold_for(job_id, b)
+                else:
+                    self._budget_page(job_id, e, task_ids)
                 raise Refused(str(e)) from e
         return held
 
@@ -1496,6 +2284,8 @@ class JobRunner:
     def _run_worker(self, job_id: str, task_id: str, reservation: int, amount: float) -> bool:
         held: dict[str, SessionRow] = {}
         try:
+            if self.store.get_task(task_id).contract.get("shape") == "deps":
+                return self._deps_worker(job_id, task_id, held)
             return self._worker(job_id, task_id, reservation, amount, held)
         except Exception as e:  # the reservation never leaks (item 7)
             log.exception("worker %s failed", task_id)
@@ -1519,8 +2309,18 @@ class JobRunner:
         job = self.store.get_job(job_id)
         t = self.store.get_task(task_id)
         contract = t.contract
-        preset = t.backend_preset or self.cfg.routing.fallback
+        routed = t.backend_preset or self.cfg.routing.fallback
+        healthy = self._healthy(routed)
+        if healthy is None:
+            self.budget.settle(reservation, 0.0)
+            self._hold_for(job_id, self._backend_breaker(routed))
+            return self._fail(
+                job_id, None, task_id, f"{task_id}: no healthy backend", {"preset": routed},
+                state="waiting",
+            )  # fmt: skip
+        preset = healthy  # the route falls to the next preset while a backend's breaker is open
         branch = contract["branch"]
+        prev = self._last_worker(task_id)
         s = self.store.create_session(
             job_id,
             Role.WORKER,
@@ -1532,7 +2332,20 @@ class JobRunner:
         held["s"] = s
         # the gateway sees this session's headroom through its reservation
         self.store.x("UPDATE reservations SET session_id=? WHERE id=?", (s.id, reservation))
-        clone = self.workspace.clone(job.repo, task_id, branch=branch, base=job.base)
+        # a published task (a fix round, or a retry after one) goes on from its
+        # PR's head, on its own base (phase 2a, item 1); a crashed or killed
+        # worker from its last checkpoint (item 3)
+        published = self._task_head(task_id)
+        pr_url = self._task_pr(task_id) if published else None
+        crashed = prev is not None and prev.status == "crashed"
+        start = (prev.detail.get("checkpoint") if crashed and prev else None) or published
+        if start:
+            clone = self.workspace.clone(
+                job.repo, task_id, branch=branch, base=job.base, start=start,
+                record_as=self.workspace.base_sha(task_id),
+            )  # fmt: skip
+        else:
+            clone = self.workspace.clone(job.repo, task_id, branch=branch, base=job.base)
         base_sha = self.workspace.base_sha(task_id)
         try:
             image = self.dev_images.ensure_fresh(job.repo, base_sha)  # what the verifier runs
@@ -1556,14 +2369,59 @@ class JobRunner:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(art.content)
                 paths.append(f".vigil/{job_id}/{name}")
-        if paths:
+        if paths and not start:
             session_base = self.workspace.commit_before_session(
                 clone, paths, f"vigil: {job_id} spec and plan"
             )
+        elif start and prev is not None and prev.detail.get("session_base"):
+            # a resume or a fix round goes on from earlier work: changes still count from
+            # vigild's own commit of the spec and plan, made before the first session
+            session_base = str(prev.detail["session_base"])
+        after_deps: list[str] = []
+        if prev is not None and not start and prev.detail.get("needs_deps_head"):
+            # item 5: its dependency has landed; it goes on from the new base, its
+            # earlier changes laid over (manifests and lockfiles as main has them)
+            locks = set(self.cfg.repo(job.repo).dev_lockfiles)
+            after_deps = self.workspace.overlay(
+                clone, job.repo, str(prev.detail.get("base_sha")),
+                str(prev.detail["needs_deps_head"]), skip=locks,
+            )  # fmt: skip
         self.workspace.write_task(clone, {**contract, "base_sha": base_sha})
         approval = self.store.get_artifact(job_id, "approval.json")
         edits = json.loads(approval.content).get("edits") if approval else None
-        packet = assemble_worker(clone, contract, untrusted={}, approval_edits=edits)
+        packet = assemble_worker(
+            clone, contract, untrusted={}, approval_edits=edits, fix_round=self._fix_round(t)
+        )
+        # The same worker goes on: a fix round (or a retry after one) forks its
+        # last session's transcript, and so does an escalated attempt, from
+        # the failed attempt's whole context, not a summary (item 2).
+        # A crashed worker resumes its own transcript, and its turn count
+        # carries on (item 3).
+        escalated = str(t.tier_reason or "").startswith("rule5")
+        resume = (
+            self._resume_from(prev.id)
+            if prev and (published or escalated or crashed or after_deps)
+            else None
+        )
+        if after_deps:
+            packet.parts["contract"] += (
+                "\n**Your dependency has landed on the base.** Your earlier changes are in "
+                "the work tree, uncommitted: "
+                + ", ".join(f"`{p}`" for p in after_deps[:30])
+                + ". Finish the task with the dependency available; don't change manifests "
+                "or lockfiles.\n"
+            )
+        max_turns = int(contract.get("limits", {}).get("max_turns") or 60)
+        if crashed:
+            max_turns = max(1, max_turns - self._turns_used(resume))
+        if resume is not None:
+            self.store.add_event(
+                "fork",
+                {"from_session": resume.from_session, "sdk_session_id": resume.session_id,
+                 "entries": len(resume.entries), "escalated": escalated, "crashed": crashed,
+                 "start": start},
+                Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
+            )  # fmt: skip
         self.store.add_event(
             "packet",
             {"role": "worker", "dropped": packet.dropped},
@@ -1583,13 +2441,14 @@ class JobRunner:
             model=self.cfg.preset(preset).model or "",
             clone=clone,
             session_dir=self._session_dir(s.id),
-            max_turns=60,
+            max_turns=max_turns,
             max_minutes=WORKER_MINUTES,
             max_budget_usd=amount,  # what's left of the task's cap (N5)
             mounts=self.workspace.overlays(clone),
             packet=packet.text,
             image=session_image,  # the verifier runs the plain dev image, `image`
             max_output_tokens=self.cfg.budgets.session_max_output_tokens,
+            resume=resume,
         )
         attrs = {
             "vigil.job_id": job_id,
@@ -1601,7 +2460,37 @@ class JobRunner:
             "vigil.model": spec.model,
             "vigil.attempt": int(contract.get("attempt", 1)),
         }
+        self.store.update_session(
+            s.id, detail={"image": session_image, "session_base": session_base}
+        )
         out = self._run_session(s, spec, reservation, attrs)
+        if out.status in ("failed", "killed") and not out.result.get("status"):
+            # no result line: the container crashed or was killed (item 3)
+            self.store.update_session(s.id, status="crashed")
+            self.store.add_event(
+                "crashed", {"error": (out.error or "")[:500], "exit": out.exit_code},
+                Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
+            )  # fmt: skip
+            if self._resumable(task_id):
+                _, _, left = self.remaining(task_id)
+                try:
+                    rid = self.budget.reserve(
+                        session_id=None, task_id=task_id, amount=left, purpose="worker"
+                    )
+                except BudgetExceeded as e:
+                    return self._fail(
+                        job_id, None, task_id, f"{task_id}: crashed", {"error": str(e)}
+                    )
+                return self._worker(job_id, task_id, rid, left, held)
+            return self._fail(
+                job_id, None, task_id, f"{task_id}: worker crashed",
+                {"error": out.error or "", "resumes": self._crashes(task_id)},
+            )  # fmt: skip
+        hook: dict[str, Any] = {
+            k: out.result[k] for k in ("stop_hook_blocks", "stop_hook_exhausted") if k in out.result
+        }
+        if hook:
+            self.store.update_session(s.id, detail=hook)  # the Stop hook's record (item 6)
         if out.status != "done":
             return self._fail(
                 job_id,
@@ -1665,7 +2554,9 @@ class JobRunner:
             # owner direction, round 3: a dependency change is its own (deps) job;
             # this task waits for it instead of being verified against the base
             if s is not None:
-                self.store.update_session(s.id, status="waiting")
+                self.store.update_session(
+                    s.id, status="waiting", detail={"needs_deps_head": head, "base_sha": base_sha}
+                )
             self.store.update_task(task_id, state="needs_deps")
             with self._why_lock:
                 self._why[task_id] = {"title": f"{task_id} needs dependencies", **needs}
@@ -1721,6 +2612,7 @@ class JobRunner:
             self.store.add_artifact(
                 job_id, "tests.json", json.dumps(redact(tests)), Provenance.HUMAN, task_id=task_id
             )
+            self._verifier_verdict(job.repo, job_id, tests)
         # the report keeps its narrative; its test fields are the verifier's
         report = report.model_copy(
             update={
@@ -1794,10 +2686,11 @@ class JobRunner:
                     *artifact_paths(job_id, task_id),
                     *vigild_paths(job_id),
                 ],
+                existing=pr_url,
             )
         except PublishError as e:
             return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})
-        self.store.update_session(s.id, status="pr_open", pr_url=url)
+        self.store.update_session(s.id, status="pr_open", pr_url=url, detail={"head": head})
         self.store.update_task(task_id, state="pr_open")
         self.store.add_event(
             "pr_open",
@@ -1808,6 +2701,890 @@ class JobRunner:
             task_id=task_id,
         )
         return True
+
+    # --- deps jobs (phase 2a, item 5; B39) ------------------------------------------------
+
+    def _spawn_deps(
+        self, parent_id: str, tasks: list[str], wanted: list[dict[str, Any]]
+    ) -> str | None:
+        """A child deps job for what a job's tasks need, filed for the owner's
+        approval like any spec. Past the fix depth, its breaker trips instead."""
+        from vigild.contract.models import DepRequest
+
+        parent = self.store.get_job(parent_id)
+        reqs: list[DepRequest] = []
+        for d in wanted:
+            try:
+                r = DepRequest.model_validate(d)
+            except ValidationError:
+                continue
+            if all((r.ecosystem, r.package) != (x.ecosystem, x.package) for x in reqs):
+                reqs.append(r)
+        names = ", ".join(f"{r.package}=={r.version}" for r in reqs)[:150]
+        child = self.child_job(
+            parent_id, repo=parent.repo, base=parent.base, title=f"deps: {names}",
+            request=f"Add {names} for {', '.join(tasks)} (from {parent_id}).", notes=[],
+            source="self", provenance=Provenance.CLAUDE,
+        )  # fmt: skip
+        if child is None:
+            return None
+        assert self.jobs is not None
+        self.jobs.file_deps(child.id, reqs, parent_id, tasks)  # type: ignore[attr-defined]
+        self.store.add_event(
+            "deps_job", {"child": child.id, "deps": [r.model_dump() for r in reqs]},
+            Provenance.HUMAN, job_id=parent_id,
+        )  # fmt: skip
+        return child.id
+
+    def _plan_deps(self, job: Job) -> None:
+        """Planning for a deps job: one task, shape deps, no model."""
+        doc = json.loads(self.store.get_artifact(job.id, "deps.json").content)  # type: ignore[union-attr]
+        tid = f"{job.id}-w1"
+        lockfiles = list(self.cfg.repo(job.repo).dev_lockfiles)
+        task = Task(
+            task_id=tid,
+            repo=job.repo,
+            base=job.base,
+            branch=f"vigil/{tid}",
+            why=job.request,
+            value=3,
+            risk=2,
+            job_id=job.id,
+            source="self",  # type: ignore[arg-type]
+            spec=Spec(
+                goal=job.title,
+                files_in_scope=lockfiles,
+                done_when="the manifests and lockfiles hold the requested versions; the dev "
+                "image rebuilds and its suites pass offline",
+            ),
+            limits=Limits(max_cost_usd=0.01),
+            labels=["deps"],
+            shape="deps",  # type: ignore[arg-type]
+            parent_task=",".join(doc.get("parent_tasks") or []) or None,
+        )
+        contract = task.model_dump(mode="json")
+        try:
+            self.store.get_task(tid)
+            self.store.update_task(tid, contract=contract)
+        except KeyError:
+            self.store.create_task(job.id, contract, Provenance.HUMAN)
+        self.store.route_task(
+            tid, tier="deps", tier_reason="shape:deps (no model; B39)", backend_preset="none"
+        )
+        transition(self.store, job.id, JobState.BUILDING, Actor.VIGILD)
+        self.dispatch(job.id)
+
+    def _deps_worker(self, job_id: str, task_id: str, held: dict[str, SessionRow]) -> bool:
+        """The deps executor (B39): no model. The lockfile-only update in a
+        registry-only build container, the checks, vigild's own commit, the
+        dev image rebuilt and validated on the new lockfiles, and the PR."""
+        from vigild.contract.models import DepRequest
+
+        if self.deps is None:
+            return self._fail(job_id, None, task_id, f"{task_id}: no deps executor", {})
+        job = self.store.get_job(job_id)
+        t = self.store.get_task(task_id)
+        doc = json.loads(self.store.get_artifact(job_id, "deps.json").content)  # type: ignore[union-attr]
+        reqs = [DepRequest.model_validate(d) for d in doc["deps"]]
+        branch = str(t.contract["branch"])
+        s = self.store.create_session(
+            job_id, Role.WORKER, task_id=task_id, backend_preset="none", branch=branch,
+            provenance=Provenance.HUMAN,
+        )  # fmt: skip
+        held["s"] = s
+        self.store.update_session(s.id, status="running", started_at=iso(), detail={"deps": True})
+        self.store.update_task(task_id, state="running")
+        clone = self.workspace.clone(job.repo, task_id, branch=branch, base=job.base)
+        base_sha = self.workspace.base_sha(task_id)
+        lockfiles = list(self.cfg.repo(job.repo).dev_lockfiles)
+        try:
+            image = self.dev_images.ensure_fresh(job.repo, base_sha)
+        except StaleDevImage as e:
+            return self._fail(
+                job_id, s, task_id, f"{task_id}: dev image not fresh", {"error": str(e)}
+            )
+        res = self.deps.run(job.repo, base_sha, lockfiles, reqs, image)
+        self.store.add_artifact(
+            job_id, "deps_report.json",
+            json.dumps({"added": res.added, "errors": res.errors, "output": res.output}),
+            Provenance.HUMAN, task_id=task_id,
+        )  # fmt: skip
+        if res.errors:
+            return self._fail(
+                job_id, s, task_id, f"{task_id}: deps job refused",
+                {"errors": res.errors, "added": res.added},
+            )  # fmt: skip
+        names = ", ".join(f"{r.package}=={r.version}" for r in reqs)
+        head = self.workspace.commit_files(clone, task_id, res.files, f"deps: {names}")
+        # No dev image is built from these lockfiles before the owner merges
+        # them (review A5): building one runs the package manager with the
+        # build network. The parent's next session builds it from the merged
+        # base and validates it offline; a failure pages (rebuild or dismiss).
+        report = WorkerReport.model_validate({
+            "task_id": task_id, "job_id": job_id, "files_changed": sorted(res.files),
+            "summary": f"Adds {names}. New in the lockfiles: {', '.join(res.added) or 'none'}.",
+            "self_check": {"test_failed_first": False, "outside_scope": [], "not_done": "nothing",
+                           "reviewer_would_flag": "the new packages", "could_delete": "nothing"},
+            "provenance": "human",
+        })  # fmt: skip
+        self.store.add_artifact(
+            job_id, "worker_report.json", report.model_dump_json(), Provenance.HUMAN,
+            task_id=task_id,
+        )  # fmt: skip
+        body = (
+            f"Deps job `{job_id}` (no model; B39). Adds {names} for `{job.parent_job_id}`.\n\n"
+            f"New in the lockfiles, each at least 14 days old by the newest upload time of "
+            f"the files the lock pins: {', '.join(res.added) or 'none'}. No source builds: "
+            "every package is a prebuilt wheel or tarball.\n\nThe dev image is rebuilt from "
+            "these lockfiles only after you merge, and its suites run offline then. Shape "
+            "`deps`, rung 1: **the owner reviews every deps PR.** Opened by vigild; a human "
+            "merges."
+        )
+        try:
+            url = self.publisher.publish(
+                repo=job.repo, head=head, base_sha=base_sha, branch=branch, base=job.base,
+                title=f"[vigil {job_id}] deps: {names}"[:200], body=body, scope=lockfiles,
+            )  # fmt: skip
+        except PublishError as e:
+            return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})
+        self.store.update_session(
+            s.id, status="pr_open", pr_url=url, ended_at=iso(), detail={"head": head}
+        )
+        self.store.update_task(task_id, state="pr_open")
+        self.store.add_event(
+            "pr_open", {"pr_url": url, "branch": branch, "head": head},
+            Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
+        )  # fmt: skip
+        return True
+
+    def poll_prs(self) -> list[str]:
+        """Merged and closed fleet PRs (vigild's PR poll, item 5): a ready job
+        whose PRs have all merged moves to merged, and every job waiting on it
+        (a deps job's parent) resumes on its own. Returns the jobs merged."""
+        if self.pr_state is None:
+            return []
+        merged_jobs: list[str] = []
+        for job in self.store.list_jobs():
+            if job.state in (JobState.ABANDONED, JobState.DONE, JobState.MERGED):
+                continue
+            states: dict[str, str] = {}
+            closed_tasks: list[str] = []
+            for t in self.store.list_tasks(job.id):
+                url = self._task_pr(t.id)
+                if not url or t.state in ("merged", "closed", *DEAD_TASK):
+                    if t.state == "merged":
+                        states[t.id] = "merged"
+                    continue
+                try:
+                    st = self.pr_state(job.repo, url)
+                except Exception:
+                    log.warning("pr poll: %s failed", url)
+                    continue
+                states[t.id] = st
+                if st in ("merged", "closed"):
+                    self.store.update_task(t.id, state=st)
+                    self.store.add_event(
+                        f"pr_{st}", {"pr_url": url}, Provenance.HUMAN, job_id=job.id, task_id=t.id
+                    )
+                    if st == "closed" and t.contract.get("shape") != "deps":
+                        closed_tasks.append(t.id)
+            if closed_tasks and self.store.get_job(job.id).state in (
+                JobState.BUILDING,
+                JobState.IN_REVIEW,
+                JobState.READY,
+            ):
+                # a live job's PR was closed by hand: replan or abandon, not drift
+                gaps = plan_gaps(self.store, job.id)
+                if gaps:
+                    self._hold_without_pr(job.id, gaps, f"PR closed: {sorted(closed_tasks)}")
+                continue
+            live = [t for t in self.store.list_tasks(job.id) if t.state not in DEAD_TASK]
+            if not live or any(t.state != "merged" for t in live):
+                continue
+            # merged however it happened (review B7): through vigild's review
+            # (ready), by the owner while the review ran (in_review), or by
+            # hand while a page held the job (blocked)
+            evidence: dict[str, Any] = {"merge_commits": [self._task_head(t.id) for t in live]}
+            if job.state in (JobState.BLOCKED, JobState.ESCALATED):
+                evidence["action"] = "prs_merged"
+            elif job.state not in (JobState.READY, JobState.IN_REVIEW):
+                continue
+            try:
+                transition(self.store, job.id, JobState.MERGED, Actor.VIGILD, evidence=evidence)
+            except TransitionError as e:
+                log.warning("pr poll: %s not moved to merged: %s", job.id, e)
+                continue
+            for item in self.store.list_inbox():
+                if item.job_id == job.id:
+                    self.store.resolve_inbox_item(item.id, "vigild")  # nothing left to act on
+            merged_jobs.append(job.id)
+            self._resume_dependents(job.id)
+        return merged_jobs
+
+    def _resume_dependents(self, dep_id: str) -> None:
+        """Every job blocked on this (deps) job goes back to work (B39)."""
+        for job in self.store.list_jobs():
+            if job.state is not JobState.BLOCKED or job.blocked_on != dep_id:
+                continue
+            assert job.blocked_from is not None
+            try:
+                transition(
+                    self.store, job.id, job.blocked_from, Actor.VIGILD,
+                    evidence={"action": "deps_merged", "deps_job": dep_id},
+                )  # fmt: skip
+            except TransitionError as e:
+                log.warning("could not resume %s after %s merged: %s", job.id, dep_id, e)
+                self._page_if_gaps(job.id, e)
+                continue
+            for item in self.store.list_inbox():
+                if item.job_id == job.id and item.body.get("kind") == "needs_deps":
+                    self.store.resolve_inbox_item(item.id, "vigild")
+            self.on_resume(job.id)
+
+    # --- stages 5-6: review and audit (phase 2a, item 1) ---------------------------------
+
+    def _task_head(self, task_id: str) -> str | None:
+        """The head a task's draft PR last published, from vigild's own record."""
+        rows = self.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='pr_open' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+        return str(json.loads(rows[0]["data"])["head"]) if rows else None
+
+    def _task_pr(self, task_id: str) -> str | None:
+        rows = self.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='pr_open' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+        return str(json.loads(rows[0]["data"])["pr_url"]) if rows else None
+
+    def _fix_round(self, t: Any) -> dict[str, Any] | None:
+        """The findings a task's latest review round sent back, if any are open."""
+        rounds = int(t.contract.get("review_rounds") or 0)
+        art = self.store.get_artifact(t.job_id, "findings.json", t.id)
+        if not rounds or art is None:
+            return None
+        doc = json.loads(art.content)
+        if int(doc.get("round", 0)) != rounds:
+            return None
+        return {"round": rounds, "findings": doc.get("findings") or []}
+
+    def review(self, job_id: str) -> None:
+        """Review every published task at its head (a Sonnet reviewer, fresh
+        context, read-only tools), audit where the ladder samples (Opus), and
+        move the job: all clean is `ready`; a finding of medium or higher goes
+        back to the same worker as a fix round; a third round with findings,
+        after rule 5 escalated the second, pages the owner."""
+        job = self.store.get_job(job_id)
+        if job.state is not JobState.IN_REVIEW:
+            return
+        if self._refused_by_visibility(job):
+            return
+        b = self._paused(job)
+        if b is not None:
+            self._hold_for(job_id, b)
+            return
+        # passes of at most REVIEW_PASS_TASKS (owner, 2026-10-23): each reserves
+        # for its own tasks, the next only after the last one's stage went back
+        while True:
+            tasks = [t for t in self.store.list_tasks(job_id) if t.state == "pr_open"]
+            batch = tasks[:REVIEW_PASS_TASKS]
+            result = self._review_stage(job_id, job, batch, more=len(tasks) > len(batch))
+            if result == "dispatch":
+                # the pass is over and its stage released (2a round 6): only now
+                # does the fix round (or the deps job's regeneration) build
+                self.dispatch(job_id)
+            if result != "next":
+                return
+            job = self.store.get_job(job_id)
+
+    def _review_stage(self, job_id: str, job: Job, tasks: list[Any], *, more: bool) -> str:
+        """One pass's review stage: one reservation for its tasks (owner,
+        2026-10-23); each review and audit session draws its cap from it,
+        and what's left goes back when the pass ends, before anything else
+        builds. Returns what `_review_pass` decided."""
+        bud = self.cfg.budgets
+        amount = len(tasks) * (bud.review_session_usd + bud.audit_session_usd)
+        if not tasks:
+            # nothing to review (a restart after the reviews, or only fix
+            # rounds owed): no reserve; straight on to ready or the fix rounds
+            return self._review_pass(job_id, job, tasks, more=False)
+        cap = min(bud.daily_usd, bud.monthly_usd)
+        if amount > cap + 1e-9:
+            # a guard for changed caps: at $0.40 + $0.80 a pass of 4 is $4.80
+            self._block(job_id, f"review stage needs ${amount:.2f}; the daily cap is ${cap:.2f}")
+            self._page(
+                job_id,
+                f"{job_id}: the review stage needs ${amount:.2f}; the daily cap is ${cap:.2f}",
+                {"kind": "budget", "cap": "daily", "needs_usd": round(amount, 2),
+                 "tasks": [t.id for t in tasks], "actions": ["replan", "abandon"],
+                 "next": "re-plan into fewer tasks, or abandon; a retry can't fit"},
+            )  # fmt: skip
+            return "done"
+        try:
+            # the review reserve waits its turn like a worker's: first in, first out
+            stage = self._reserve_queued(
+                job_id, "review_stage", session_id=None, task_id=None, amount=amount,
+                purpose="review_stage", expect=REVIEW_WAIT,
+            )  # fmt: skip
+        except QueueCancelled:
+            return "done"  # the job moved on (abandoned, held) while it waited
+        except BudgetExceeded as e:
+            held = self._refused_budget(job_id, e, None)
+            if held is not None:
+                self._hold_for(job_id, held)
+            else:
+                self._budget_page(job_id, e, [t.id for t in tasks])
+            return "done"
+        try:
+            self.store.add_event(
+                "review_stage_reserved", {"amount_usd": amount, "tasks": [t.id for t in tasks]},
+                Provenance.HUMAN, job_id=job_id,
+            )  # fmt: skip
+            with self._stage_lock:
+                self._review_stage_ids[job_id] = stage
+            return self._review_pass(job_id, job, tasks, more=more)
+        finally:
+            with self._stage_lock:
+                self._review_stage_ids.pop(job_id, None)
+            self.budget.settle(stage, 0.0)  # what no session drew goes back to the day
+
+    def _review_pass(self, job_id: str, job: Job, tasks: list[Any], *, more: bool) -> str:
+        """One review pass: "dispatch" when the job goes back to building
+        (the caller dispatches it once this pass's stage is released),
+        "next" when the pass was clean and tasks are still waiting for the
+        next pass, "done" otherwise."""
+        with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as pool:
+            outcomes = dict(zip(
+                [t.id for t in tasks],
+                [f.result() for f in [pool.submit(self._review_task, job, t) for t in tasks]],
+                strict=True,
+            ))  # fmt: skip
+        if self.store.get_job(job_id).state is not JobState.IN_REVIEW:
+            # the owner merged (or vigild moved) the job while this ran: its
+            # results are moot; nothing more is written (2a round 3)
+            self._drop_review(job_id, {"tasks": sorted(outcomes)})
+            return "done"
+        failed = {tid: why for tid, (kind, why) in outcomes.items() if kind == "failed"}
+        b = self._paused(job)
+        if failed and b is not None:
+            self._hold_for(job_id, b)  # a cap tripped mid-review: wait on its breaker
+            return "done"
+        if failed:
+            self._block(job_id, f"review failed: {sorted(failed)}")
+            self._page(
+                job_id,
+                f"{job_id}: the review stage failed for {', '.join(sorted(failed))}",
+                {"kind": "review_failed", "tasks": failed, "actions": ["retry", "abandon"]},
+                resumable=True,
+            )
+            return "done"
+        flagged = {tid: f for tid, (kind, f) in outcomes.items() if kind == "deps_findings"}
+        if flagged:
+            return "dispatch" if self._deps_review_failed(job_id, flagged) else "done"
+        fixes = sorted(tid for tid, (kind, _) in outcomes.items() if kind == "fix")
+        # a task a previous pass sent to a fix round, while another's review
+        # failed, is still owed its round: it goes with this one (review B2)
+        pending = [
+            t.id for t in self.store.list_tasks(job_id) if t.state == "fix" and t.id not in fixes
+        ]
+        for tid in pending:
+            fix = self._fix_round(self.store.get_task(tid))
+            outcomes[tid] = ("fix", len(fix["findings"]) if fix else 0)
+        fixes = sorted({*fixes, *pending})
+        if fixes:
+            limit = self.cfg.routing.escalate_review_rounds
+            over = [
+                tid
+                for tid in fixes
+                if int(self.store.get_task(tid).contract.get("review_rounds") or 0) > limit
+            ]
+            if over:
+                self._block(job_id, f"review findings after escalation: {over}")
+                self._page(
+                    job_id,
+                    f"{job_id}: findings remain after {limit} review rounds and an escalation",
+                    {
+                        "kind": "review_rounds",
+                        "tasks": {tid: outcomes[tid][1] for tid in over},
+                        "actions": ["replan", "abandon"],
+                    },
+                )
+                return "done"
+            moved = self._move_on(
+                job_id, JobState.BUILDING, sorted(outcomes),
+                evidence={"findings": {tid: outcomes[tid][1] for tid in fixes}},
+            )  # fmt: skip
+            return "dispatch" if moved else "done"
+        if more:
+            return "next"  # clean so far; the next pass reviews the rest
+        if not self._move_on(job_id, JobState.READY, sorted(outcomes)):
+            return "done"
+        self.breakers.success(Kind.REPO_FAILURES, f"repo:{job.repo}")
+        self._ready(job_id)
+        return "done"
+
+    def _move_on(
+        self,
+        job_id: str,
+        to: JobState,
+        tasks: list[str],
+        evidence: dict[str, Any] | None = None,
+    ) -> bool:
+        """The review's move out of `in_review` (to building for a fix round
+        or a regeneration, or to ready). If the PR poll merged the job since
+        the pass's re-check, the move is dropped quietly (`review_dropped`,
+        2a rounds 6-7); a refusal for any other reason still raises."""
+        try:
+            transition(self.store, job_id, to, Actor.VIGILD, evidence=evidence)
+        except TransitionError as e:
+            if self.store.get_job(job_id).state is JobState.IN_REVIEW:
+                gaps = plan_gaps(self.store, job_id) if to is JobState.READY else {}
+                if gaps:  # a PR closed during the pass: replan or abandon (finding #4)
+                    self._hold_without_pr(job_id, gaps, str(e))
+                    return False
+                raise
+            self._drop_review(job_id, {"to": to.value, "tasks": tasks})
+            return False
+        return True
+
+    def _drop_review(self, job_id: str, data: dict[str, Any]) -> None:
+        """A review's results on a job that moved on are dropped
+        (`review_dropped`). On an abandoned job nothing the review set going
+        is left (2a rounds 8-9): a task it sent to a fix round, or queued
+        again, is abandoned."""
+        now = self.store.get_job(job_id).state
+        if now is JobState.ABANDONED:
+            for t in self.store.list_tasks(job_id):
+                if t.state in ("fix", "queued", "running", "waiting"):
+                    self.store.update_task(t.id, state="abandoned")
+        self.store.add_event(
+            "review_dropped", {"state": now.value, **data}, Provenance.HUMAN, job_id=job_id
+        )
+
+    def _deps_review_failed(self, job_id: str, flagged: dict[str, Any]) -> bool:
+        """Owner ruling 3: a deps PR has no worker to fix it. A failed review
+        closes the PR and regenerates the deps job once, on a new branch; a
+        second failed review closes that PR too and pages the owner. The
+        parent job stays blocked on this one throughout."""
+        job = self.store.get_job(job_id)
+        if job.state is not JobState.IN_REVIEW:
+            # the job moved on (abandoned, merged): no PR is closed and no
+            # task queued again (2a round 8)
+            self._drop_review(job_id, {"tasks": sorted(flagged)})
+            return False
+        again: list[str] = []
+        for tid in sorted(flagged):
+            t = self.store.get_task(tid)
+            url = self._task_pr(tid)
+            if url:
+                try:
+                    self.publisher.close(job.repo, url)
+                except PublishError as e:
+                    self._page(
+                        job_id, f"{job_id}: deps PR left open after its review failed",
+                        {"kind": "deps_pr_left_open", "pr_url": url, "error": str(e)[:300],
+                         "actions": ["dismiss"],
+                         "next": "close it by hand; vigild won't build from it"},
+                    )  # fmt: skip
+                # the runner's own close, apart from the PR poll's `pr_closed`
+                # events: only these count as regenerations (2a round 3)
+                self.store.add_event(
+                    "deps_review_closed", {"pr_url": url},
+                    Provenance.HUMAN, job_id=job_id, task_id=tid,
+                )  # fmt: skip
+            closed = self.store.q(
+                "SELECT COUNT(*) n FROM events WHERE task_id=? AND type='deps_review_closed'",
+                (tid,),
+            )[0]["n"]
+            if closed >= 2:  # this was the regenerated PR: the owner decides
+                self.store.update_task(tid, state="closed")
+                continue
+            contract = {**t.contract, "branch": f"vigil/{tid}-r{closed + 1}"}
+            self.store.update_task(tid, contract=contract, state="queued")
+            again.append(tid)
+        if again and len(again) == len(flagged):
+            # the caller dispatches, once the pass's stage is released
+            return self._move_on(
+                job_id, JobState.BUILDING, sorted(flagged),
+                evidence={"findings": flagged, "deps_regenerated": again},
+            )  # fmt: skip
+        self._block(job_id, f"deps review findings, twice: {sorted(flagged)}")
+        self._page(
+            job_id,
+            f"{job_id}: the review flagged the deps PR twice; both PRs are closed",
+            {"kind": "deps_review", "findings": flagged, "actions": ["abandon"],
+             "next": "abandon it (the job waiting on it stays blocked) and add the "
+             "dependency by hand, or re-plan the job that needs it"},
+        )  # fmt: skip
+        return False
+
+    def _ready(self, job_id: str) -> None:
+        """Stage 8's queue: the job's PRs, each with its review and audit."""
+        job = self.store.get_job(job_id)
+        prs = []
+        for t in self.store.list_tasks(job_id):
+            if t.state in DEAD_TASK:
+                continue
+            rv = self.store.get_artifact(job_id, "review.json", t.id)
+            au = self.store.get_artifact(job_id, "audit.json", t.id)
+            review = json.loads(rv.content) if rv else {}
+            audit = Audit.model_validate_json(au.content) if au else None
+            prs.append(
+                {
+                    "task_id": t.id,
+                    "pr_url": self._task_pr(t.id),
+                    "head": self._task_head(t.id),
+                    "shape": review.get("shape"),
+                    "rung": review.get("rung"),
+                    "review_rounds": review.get("round"),
+                    "findings": len(review.get("findings") or []),
+                    "audited": audit is not None,
+                    "match_rate": round(audit.match_rate(), 3) if audit else None,
+                }
+            )
+        self.store.create_inbox_item(
+            "ready", "ready_to_merge", job_id, f"Ready to merge: {job.title}", {"prs": prs}
+        )
+
+    def _review_task(self, job: Any, t: Any) -> tuple[str, Any]:
+        """One task's review (and audit, when sampled): ("clean" | "fix" |
+        "failed", detail). Never raises: a vigild error is a failed review."""
+        try:
+            return self._review_one(job, t)
+        except Exception as e:
+            log.exception("review of %s failed", t.id)
+            return "failed", f"vigild error: {type(e).__name__}: {e}"[:1000]
+
+    def _review_one(self, job: Any, t: Any) -> tuple[str, Any]:
+        head = self._task_head(t.id)
+        if head is None:
+            return "failed", "no published head"
+        task = Task.model_validate(t.contract)
+        shape = classify_shape(task, self.cfg)
+        level = task.spec.verify.level
+        tests = self.store.get_artifact(job.id, "tests.json", t.id)
+        # the verifier's own record says whether the task changes how tests run
+        rf = bool(tests and json.loads(tests.content).get("runner_files"))
+        rung = self.ladder.rung(shape, runner_file=rf)
+        reviewer, auditor = self.ladder.presets(shape, runner_file=rf)
+        rnd = task.review_rounds + 1
+        audit_required = self.ladder.should_audit(shape, level, runner_file=rf)
+        base_sha = self.workspace.base_sha(t.id)
+        diff = self.workspace.full_diff(job.repo, base_sha, head)
+        spec_md = self.store.get_artifact(job.id, "spec.md")
+        report = self.store.get_artifact(job.id, "worker_report.json", t.id)
+        request = {
+            "job_id": job.id,
+            "task_id": t.id,
+            "round": rnd,
+            "head": head,
+            "base_sha": base_sha,
+            "contract": t.contract,
+            "verifier": json.loads(tests.content) if tests else None,  # vigild's own record
+            "spec_md": spec_md.content if spec_md else "",
+        }
+        untrusted = {
+            "the request": job.request,
+            "the worker's report": report.content if report else "(none)",
+        }
+        rules = self.workspace.read_blob(job.repo, base_sha, "CLAUDE.md") or ""  # the base's
+        packet = assemble_review(rules, request, diff=diff, untrusted=untrusted)
+        out, why = self._read_only_session(
+            job, t, Role.REVIEWER, reviewer, head, base_sha, rnd, packet.text, ReviewOutput,
+            self.cfg.budgets.review_session_usd, shape.value,
+        )  # fmt: skip
+        if out is None:
+            return "failed", f"no valid review.json: {why}"
+        assert isinstance(out, ReviewOutput)
+        rv = Review(
+            **out.model_dump(),
+            task_id=t.id,
+            job_id=job.id,
+            head=head,
+            shape=shape,
+            rung=rung,
+            round=rnd,
+            audit_required=audit_required,
+            reviewer=reviewer,
+            provenance=Provenance.CLAUDE,
+        )
+        self.store.add_artifact(
+            job.id, "review.json", rv.model_dump_json(), Provenance.CLAUDE, task_id=t.id
+        )
+        findings = [f.model_dump(mode="json") for f in rv.blocking()]
+        if audit_required:
+            numbered = json.dumps(
+                {i: f.model_dump(mode="json") for i, f in enumerate(rv.findings)}, indent=1
+            )
+            apacket = assemble_audit(
+                rules, request, diff=diff, review=numbered, untrusted=untrusted
+            )
+            aout, why = self._read_only_session(
+                job, t, Role.AUDITOR, auditor, head, base_sha, rnd, apacket.text, AuditOutput,
+                self.cfg.budgets.audit_session_usd, shape.value,
+            )  # fmt: skip
+            if aout is None:
+                return "failed", f"no valid audit.json: {why}"
+            assert isinstance(aout, AuditOutput)
+            audit = Audit(
+                **aout.model_dump(),
+                task_id=t.id,
+                job_id=job.id,
+                head=head,
+                shape=shape,
+                rung=rung,
+                auditor=auditor,
+                provenance=Provenance.CLAUDE,
+            )
+            self.store.add_artifact(
+                job.id, "audit.json", audit.model_dump_json(), Provenance.CLAUDE, task_id=t.id
+            )
+            change = self.ladder.record(audit, verify_level=level, runner_file=rf)
+            if change is not None:
+                self._ladder_page(change)
+            findings += [
+                f.model_dump(mode="json", exclude={"matched"})
+                for f in audit.missed()
+                if f.severity in BLOCKING
+            ]
+        if self._moved_on(job.id, t.id):
+            return "dropped", "the job moved on during its review"
+        if not findings:
+            self.store.update_task(t.id, state="reviewed")
+            return "clean", 0
+        self.store.add_artifact(
+            job.id,
+            "findings.json",
+            json.dumps({"round": rnd, "head": head, "findings": findings}),
+            Provenance.CLAUDE,
+            task_id=t.id,
+        )
+        if task.shape is not None and task.shape.value == "deps":
+            # no model wrote it, so no fix round: the owner decides (B39)
+            return "deps_findings", findings
+        self._reroute_for_round(job.id, t.id, rnd)
+        self.store.update_task(t.id, state="fix")
+        return "fix", len(findings)
+
+    def _moved_on(self, job_id: str, task_id: str) -> bool:
+        """The job left review, or the task's PR merged or closed, while its
+        review ran (2a round 3): its result must not overwrite that."""
+        return (
+            self.store.get_job(job_id).state is not JobState.IN_REVIEW
+            or self.store.get_task(task_id).state != "pr_open"
+        )
+
+    def _reroute_for_round(self, job_id: str, task_id: str, rounds: int) -> None:
+        """A review round with findings is counted on the contract and the task
+        is routed again: the second round trips routing rule 5 (escalation)."""
+        self._reroute(job_id, task_id, review_rounds=rounds)
+        self.store.update_task(task_id, state="fix")
+
+    def _reroute(self, job_id: str, task_id: str, **changes: Any) -> None:
+        """Route a task again after its contract's counters move (a review
+        round, another attempt). Crossing into rule 5 is an escalation."""
+        t = self.store.get_task(task_id)
+        contract = {**t.contract, **changes}
+        r = route(Task.model_validate(contract), self.cfg)
+        contract.update(tier=r.tier, tier_reason=r.tier_reason, backend=r.preset)
+        self.store.update_task(task_id, contract=contract)
+        self.store.route_task(
+            task_id, tier=r.tier, tier_reason=r.tier_reason, backend_preset=r.preset
+        )
+        if r.tier_reason.startswith("rule5") and not str(t.tier_reason or "").startswith("rule5"):
+            self.store.add_event(
+                "escalation",
+                {"task_id": task_id, **changes, "from": t.backend_preset, "to": r.preset,
+                 "tier_reason": r.tier_reason},
+                Provenance.HUMAN, job_id=job_id, task_id=task_id,
+            )  # fmt: skip
+            most = self.cfg.vigild.breakers.max_escalations_per_day
+            if escalations_today(self.store) > most:
+                self.breakers.trip(
+                    Kind.ESCALATIONS, GLOBAL, {"today": escalations_today(self.store), "max": most}
+                )
+
+    def _note_over_cap(
+        self,
+        shape: str,
+        role: Role,
+        job_id: str | None,
+        task_id: str | None,
+        *,
+        cap: float,
+        cost: float,
+    ) -> None:
+        """A review or audit went past its cap (owner, 2026-10-23): it
+        completed, its overage is in the day's spend, and it is an event. The
+        second overage for one shape, counted since the caps last changed,
+        pages once."""
+        b = self.cfg.budgets
+        caps = [b.review_session_usd, b.audit_session_usd]
+        # the event, the count and the page in one transaction: sessions
+        # finishing at once can't page twice, or not at all (2a round 6)
+        with self.store.tx():
+            self.store.add_event(
+                "review_over_cap",
+                {"shape": shape, "role": role.value, "cap_usd": cap,
+                 "cost_usd": round(cost, 6), "overage_usd": round(cost - cap, 6), "caps": caps},
+                Provenance.HUMAN, job_id=job_id, task_id=task_id,
+            )  # fmt: skip
+            n = sum(
+                1
+                for r in self.store.q("SELECT data FROM events WHERE type='review_over_cap'")
+                if (d := json.loads(r["data"])).get("shape") == shape and d.get("caps") == caps
+            )
+            if n == 2:
+                self._page(
+                    None,
+                    f"Review caps too low for shape {shape}: 2 overages; consider re-sizing",
+                    {"kind": "review_caps", "shape": shape, "caps": caps, "actions": ["dismiss"],
+                     "next": "raise review_session_usd or audit_session_usd in "
+                     "configs/budgets.yaml"},
+                )  # fmt: skip
+
+    def _ladder_page(self, change: LadderChange) -> None:
+        """You see every promotion and demotion (design, trust ladder)."""
+        verb = "promoted" if change.to > change.frm else "demoted"
+        self._page(
+            None,
+            f"review ladder: {change.shape.value} {verb} to rung {change.to}",
+            {"kind": "ladder", "shape": change.shape.value, "from": change.frm, "to": change.to,
+             "reason": change.reason, "sample_size": change.sample_size,
+             "match_rate": change.match_rate, "actions": ["dismiss"]},
+        )  # fmt: skip
+
+    def _read_only_session(
+        self,
+        job: Any,
+        t: Any,
+        role: Role,
+        preset: str,
+        head: str,
+        base_sha: str,
+        rnd: int,
+        packet: str,
+        model: type[ReviewOutput] | type[AuditOutput],
+        amount: float,
+        shape: str = "",
+    ) -> tuple[ReviewOutput | AuditOutput | None, str]:
+        """A reviewer or auditor session on a fresh clone of the task's head:
+        read-only tools, its answer as structured output (validated here; an
+        empty or invalid answer fails the stage gate)."""
+        branch = str(t.contract["branch"])
+        parent = [s for s in self.store.list_sessions(job.id) if s.task_id == t.id]
+        s = self.store.create_session(
+            job.id, role, task_id=t.id, parent_session_id=parent[-1].id if parent else None,
+            backend_preset=preset, branch=branch,
+        )  # fmt: skip
+        try:
+            check_backend(self.cfg, job.repo, preset, private=live_private(job.repo))
+            with self._stage_lock:
+                stage = self._review_stage_ids.get(job.id)
+            if stage is not None:  # its cap, drawn from the job's review stage
+                rid = self.budget.draw(stage, session_id=s.id, amount=amount, purpose=role.value)
+            else:
+                rid = self.budget.reserve(
+                    session_id=s.id, task_id=None, amount=amount, purpose=role.value
+                )
+        except (RepoPolicyError, BudgetExceeded) as e:
+            self.store.update_session(s.id, status="refused")
+            if isinstance(e, BudgetExceeded):
+                self._refused_budget(job.id, e, None)  # a cap metered spend reached trips
+            return None, str(e)
+        clone_id = f"{t.id}-{role.value}{rnd}"
+        try:
+            clone = self.workspace.clone(
+                job.repo, clone_id, branch=branch, base=job.base, start=head, record_as=base_sha
+            )
+            self.workspace.write_task(
+                clone, {**t.contract, "base_sha": head, "head": head, "role": role.value}
+            )
+            session_image = self._session_image(job.repo, base_sha)
+        except Exception:
+            self.budget.settle(rid)
+            self.store.update_session(s.id, status="failed")
+            raise
+        try:
+            spec, attrs = self._review_spec(
+                job, t, s, role, preset, clone, rnd, packet, model, session_image
+            )
+        except Exception:
+            self.budget.settle(rid)  # the draw goes back (2a round 8)
+            self.store.update_session(s.id, status="failed")
+            raise
+        out = self._run_session(s, spec, rid, attrs, cap=amount)
+        return self._review_answer(s, job, t, role, shape, amount, out, model)
+
+    def _review_spec(
+        self,
+        job: Any,
+        t: Any,
+        s: SessionRow,
+        role: Role,
+        preset: str,
+        clone: Path,
+        rnd: int,
+        packet: str,
+        model: type[ReviewOutput] | type[AuditOutput],
+        session_image: str | None,
+    ) -> tuple[SessionSpec, dict[str, Any]]:
+        spec = SessionSpec(
+            session_id=s.id,
+            role=role,
+            job_id=job.id,
+            task_id=t.id,
+            repo=job.repo,
+            preset=preset,
+            model=self.cfg.preset(preset).model or "",
+            clone=clone,
+            session_dir=self._session_dir(s.id),
+            max_turns=REVIEW_TURNS,
+            max_minutes=REVIEW_MINUTES,
+            # the cap is checked call by call at the gateway, and a review may
+            # go past it (owner, 2026-10-23): only the day stops the CLI
+            max_budget_usd=self.cfg.budgets.daily_usd,
+            mounts=self.workspace.overlays(clone),
+            packet=packet,
+            image=session_image,
+            output_schema=model.model_json_schema(),
+            max_output_tokens=REVIEW_OUTPUT_TOKENS,
+        )
+        attrs = {
+            "vigil.job_id": job.id,
+            "vigil.task_id": t.id,
+            "vigil.role": role.value,
+            "vigil.repo": job.repo,
+            "vigil.model": spec.model,
+            "vigil.attempt": rnd,
+        }
+        return spec, attrs
+
+    def _review_answer(
+        self,
+        s: SessionRow,
+        job: Any,
+        t: Any,
+        role: Role,
+        shape: str,
+        amount: float,
+        out: ExecOutcome,
+        model: type[ReviewOutput] | type[AuditOutput],
+    ) -> tuple[ReviewOutput | AuditOutput | None, str]:
+        cost = session_cost(self.store, s.id)
+        if cost > amount + 1e-9:
+            self._note_over_cap(shape, role, job.id, t.id, cap=amount, cost=cost)
+        if out.status != "done":
+            self.store.update_session(s.id, status="failed")
+            return None, f"{role.value} session {out.status}: {(out.error or '')[:500]}"
+        try:
+            parsed = model.model_validate(out.result.get("structured_output"))
+        except ValidationError as e:
+            self.store.update_session(s.id, status="failed")
+            return None, str(e)[:1000]
+        self.store.update_session(s.id, status="done")
+        return parsed, ""
 
 
 # --- wiring for the real daemon ------------------------------------------------------------
@@ -1832,6 +3609,7 @@ class GitHubPublisher:
         title: str,
         body: str,
         scope: list[str],
+        existing: str | None = None,
     ) -> str:
         from vigild.github.app import WORKER_PERMISSIONS
         from vigild.github.publish import RestPulls, publish
@@ -1849,7 +3627,36 @@ class GitHubPublisher:
                 pulls=RestPulls(self.http, tok.token),
                 scope=scope,
                 token=tok.token,
+                existing=existing,
             )
+
+    def close(self, repo: str, url: str) -> None:
+        """Close one of vigild's PRs, with a one-repo `pull_requests: write`
+        token, revoked after (a deps PR whose review failed, owner ruling 3)."""
+        from vigild.github.publish import RestPulls
+
+        prefix = f"https://github.com/{repo}/pull/"
+        if not url.startswith(prefix) or not url[len(prefix) :].isdigit():
+            raise PublishError(f"{url} isn't a PR of {repo}")
+        with self.app.lease(repo, {"pull_requests": "write"}) as tok:
+            RestPulls(self.http, tok.token).close(repo, int(url[len(prefix) :]))
+
+
+class GitHubPRs:
+    """vigild's PR poll (item 5): a PR's state, read with a one-repo,
+    `pull_requests: read` token, revoked after."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    def state(self, repo: str, url: str) -> str:
+        from vigild.github.publish import RestPulls
+
+        prefix = f"https://github.com/{repo}/pull/"
+        if not url.startswith(prefix) or not url[len(prefix) :].isdigit():
+            raise PublishError(f"{url} isn't a PR of {repo}")
+        with self.app.lease(repo, {"pull_requests": "read"}) as tok:
+            return RestPulls(self.app.http, tok.token).state(repo, int(url[len(prefix) :]))
 
 
 class NoPublisher:
@@ -1864,5 +3671,9 @@ class NoPublisher:
         title: str,
         body: str,
         scope: list[str],
+        existing: str | None = None,
     ) -> str:
+        raise PublishError("the GitHub App is not configured (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)")
+
+    def close(self, repo: str, url: str) -> None:
         raise PublishError("the GitHub App is not configured (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)")

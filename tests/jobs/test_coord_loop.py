@@ -27,6 +27,7 @@ from tests.test_devimage import FakeDocker, FakeSuites
 from vigild.api.app import create_app
 from vigild.budget import Budget
 from vigild.config import Config, RepoPolicy
+from vigild.contract.models import CHECKLIST
 from vigild.db import Store
 from vigild.devimage import DevImages, SessionImages
 from vigild.executors.base import EventSink, ExecOutcome, SessionSpec
@@ -132,6 +133,28 @@ TESTS = {
 }
 
 
+CLEAN_REVIEW: dict[str, Any] = {
+    "verdict": "clean",
+    "findings": [],
+    "checklist": {c: True for c in CHECKLIST},
+}
+CLEAN_AUDIT: dict[str, Any] = {"findings": [], "false_findings": []}
+
+
+def transcript_lines(spec: SessionSpec) -> dict[str, Any]:
+    """A session's transcript as the harness mirrors it: forked from the one it
+    resumes (history first), then its own turn."""
+    sdk = f"sdk-{spec.session_id}"
+    history = list(spec.resume.entries) if spec.resume else []
+    own = [
+        {"type": "user", "uuid": f"u-{spec.session_id}", "message": {"role": "user",
+         "content": spec.packet[:40]}},
+        {"type": "assistant", "uuid": f"a-{spec.session_id}", "message": {"id": f"m-{spec.session_id}",
+         "role": "assistant", "content": [{"type": "text", "text": "done"}]}},
+    ]  # fmt: skip
+    return {"session_id": sdk, "subpath": None, "entries": history + own}
+
+
 def _work(clone: Path, doc: str, *, honest: bool = True) -> None:
     """A worker's change: its test first, then (if honest) the doc it checks."""
     test, text = TESTS[doc]
@@ -200,6 +223,10 @@ class StandIn:
     on_session: Callable[[SessionSpec], None] | None = None
     authors: list[Author] = field(default_factory=list)  # one per author session; default good
     packets: list[tuple[str, str]] = field(default_factory=list)  # (role, packet)
+    # a reviewer's and an auditor's structured output (phase 2a, item 1)
+    review: Callable[[SessionSpec], Any] = lambda spec: CLEAN_REVIEW
+    audit: Callable[[SessionSpec], Any] = lambda spec: CLEAN_AUDIT
+    specs: list[SessionSpec] = field(default_factory=list)
     calls: list[tuple[str, str]] = field(default_factory=list)
     running: int = 0
     max_running: int = 0
@@ -212,8 +239,14 @@ class StandIn:
         assert spec.packet.startswith("# 1. Role and rules")
         self.calls.append((spec.role.value, spec.task_id or spec.job_id))
         self.packets.append((spec.role.value, spec.packet))
+        self.specs.append(spec)
         if self.on_session:
             self.on_session(spec)
+        if spec.role in (Role.REVIEWER, Role.AUDITOR):
+            answer = (self.review if spec.role is Role.REVIEWER else self.audit)(spec)
+            return ExecOutcome("done", 0, {"status": "done", "structured_output": answer})
+        # what the harness's session store mirrors: the transcript, as it's written
+        on_event({"type": "transcript", "data": transcript_lines(spec)})
         task = json.loads((spec.clone / ".vigil" / "task.json").read_text())
         with self.lock:
             self.running += 1
@@ -294,6 +327,10 @@ class BarePublisher:
 
     ws: Workspace | None = None
     prs: list[dict[str, Any]] = field(default_factory=list)
+    closed: list[str] = field(default_factory=list)
+
+    def close(self, repo: str, url: str) -> None:
+        self.closed.append(url)
 
     def publish(
         self,
@@ -306,6 +343,7 @@ class BarePublisher:
         title: str,
         body: str,
         scope: list[str],
+        existing: str | None = None,
     ) -> str:
         from vigild.github.publish import publish
 
@@ -332,6 +370,7 @@ class BarePublisher:
             body=body,
             pulls=Pulls(),
             scope=scope,
+            existing=existing,
         )
 
 
@@ -354,7 +393,6 @@ def world(
     cfg: Config, tmp_path: Path, fixture_repo: dict[str, Path], tokens: Tokens
 ) -> Iterator[World]:
     cfg.repos.repos[REPO] = RepoPolicy(
-        visibility="public",
         decider=["haiku"],
         backends=["claude-sonnet", "claude-opus", "claude-haiku"],
         dev_dockerfile="images/dev/vigil.Dockerfile",
@@ -447,7 +485,7 @@ def test_end_to_end(world: World) -> None:
     r = w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
     assert r.status_code == 200, r.text
     assert w.standin.max_running == 2
-    assert w.store.get_job(job).state.value == "in_review"
+    assert w.store.get_job(job).state.value == "ready"
 
     # two draft PRs, from the host, each branch with its own worker_report.json
     assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
@@ -460,7 +498,7 @@ def test_end_to_end(world: World) -> None:
 
     # the whole tree from one endpoint
     tree = w.client.get(f"/api/jobs/{job}/tree", headers=auth(w.tokens.read)).json()
-    assert tree["job"]["state"] == "in_review"
+    assert tree["job"]["state"] == "ready"
     (coord,) = tree["sessions"]
     assert coord["role"] == "coord" and coord["status"] == "done"
     workers = coord["children"]
@@ -469,9 +507,22 @@ def test_end_to_end(world: World) -> None:
     names = sorted(a["name"] for a in tree["artifacts"])
     assert names.count("worker_report.json") == 2
     assert {"spec.md", "plan.md", "approval.json", "spec_gate.json"} <= set(names)
-    assert {t["state"] for t in tree["tasks"]} == {"pr_open"}
+    assert {t["state"] for t in tree["tasks"]} == {"reviewed"}
     # every reservation was settled
     assert w.budget.open_today() == 0
+    # stages 5 and 6 (phase 2a): each PR reviewed in a read-only session, then
+    # audited (rung 0 audits all of them); the job waits in "Ready to merge"
+    roles = [c[0] for c in w.standin.calls]
+    assert roles.count("reviewer") == 2 and roles.count("auditor") == 2
+    assert names.count("review.json") == 2 and names.count("audit.json") == 2
+    reviewers = [s for s in w.standin.specs if s.role is Role.REVIEWER]
+    assert all(s.output_schema and "checklist" in s.output_schema["properties"] for s in reviewers)
+    assert all(s.preset == "claude-sonnet" for s in reviewers)
+    auditors = [s for s in w.standin.specs if s.role is Role.AUDITOR]
+    assert all(s.preset == "claude-opus" for s in auditors)
+    (ready,) = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["ready"]
+    assert ready["job_id"] == job and len(ready["body"]["prs"]) == 2
+    assert all(p["audited"] and p["rung"] == 0 for p in ready["body"]["prs"])
 
 
 def test_coord_revises_after_a_gate_failure(world: World) -> None:
@@ -544,7 +595,7 @@ def test_a_reservation_over_the_daily_cap_itself_is_refused_not_queued(world: Wo
     _request(w)
     assert w.standin.calls == []
     pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
-    assert any("daily" in p["title"] for p in pages)
+    assert any(p["body"].get("cap") == "daily" for p in pages)
     assert _events(w, "queued") == []
 
 
@@ -784,7 +835,7 @@ def test_a_full_day_queues_the_workers_and_they_run_when_it_frees(world: World) 
     job = _request(w)
     held = [
         w.budget.reserve(session_id=None, task_id=f"other-{i}", amount=a, purpose="worker")
-        for i, a in enumerate((2.0, 2.0, 0.5))
+        for i, a in enumerate((2.0, 2.0, 0.98))
     ]
 
     def sleep(s: float) -> None:
@@ -794,7 +845,7 @@ def test_a_full_day_queues_the_workers_and_they_run_when_it_frees(world: World) 
     w.runner.sleep = sleep  # type: ignore[method-assign]
     item = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["specs"][0]
     w.client.post(f"/api/inbox/{item['id']}/approve", headers=auth(w.tokens.admin), json={})
-    assert w.store.get_job(job).state.value == "in_review"
+    assert w.store.get_job(job).state.value == "ready"
     assert len(w.publisher.prs) == 2
     assert len(_events(w, "queued")) == 2 and len(_events(w, "dequeued")) == 2
     assert _no_failure_pages(w)
@@ -861,7 +912,7 @@ def test_reconcile_restarts_an_approved_job_that_never_built(world: World) -> No
     # nothing starts until vigild's gateway is up and its images are validated (N11)
     assert w.store.get_job(job).state.value == "approved" and w.standin.calls == [("coord", job)]
     assert w.runner.start_deferred() == 1
-    assert w.store.get_job(job).state.value == "in_review"
+    assert w.store.get_job(job).state.value == "ready"
     assert w.runner.start_deferred() == 0
 
 
@@ -893,7 +944,7 @@ def _spend(w: World, amount_out_tokens: int) -> Callable[[SessionSpec], None]:
     return spend
 
 
-def _failure_item(w: World, job: str, kind: str = "worker_failed") -> dict[str, Any]:
+def _failure_item(w: World, job: str | None, kind: str = "worker_failed") -> dict[str, Any]:
     items = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
     (item,) = [q for q in items if q["job_id"] == job and q["body"].get("kind") == kind]
     return item  # type: ignore[no-any-return]
@@ -943,7 +994,7 @@ def test_fail_blocked_retry_done(world: World) -> None:
 
     r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
     assert r.status_code == 200, r.text
-    assert w.store.get_job(job).state.value == "in_review"
+    assert w.store.get_job(job).state.value == "ready"
     assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w1", f"vigil/{job}-w2"]
     # the retry ran only w1, under what was left of its $2.00, not a fresh cap
     w1 = [b for b in budgets if b[0].endswith("w1")]
@@ -992,7 +1043,7 @@ def test_replan_sends_the_job_back_to_the_coord_with_the_failure(world: World) -
     )
     assert r.status_code == 200, r.text
     qs = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
-    assert w.store.get_job(job).state.value == "in_review", [(q["title"], q["body"]) for q in qs]
+    assert w.store.get_job(job).state.value == "ready", [(q["title"], q["body"]) for q in qs]
     # the re-plan's tasks are new ones (w3, w4); w1 is superseded and w2's PR stands
     assert sorted(p["head"] for p in w.publisher.prs) == [f"vigil/{job}-w{n}" for n in (2, 3, 4)]
     assert w.store.get_task(f"{job}-w1").state == "superseded"
@@ -1205,7 +1256,7 @@ def test_a_runner_file_task_passes_on_its_hidden_tests_and_the_pr_says_so(world:
     _runner_world(w)
     w.standin.worker_edit = _flag_edit()
     job = _approve(w)
-    assert w.store.get_job(job).state.value == "in_review"
+    assert w.store.get_job(job).state.value == "ready"
     pr = next(p for p in w.publisher.prs if p["head"] == f"vigil/{job}-w1")
     assert "Owner review required: runner file changed: `tools/check.py`" in pr["body"]
     assert pr["draft"]
@@ -1472,7 +1523,11 @@ def test_a_worker_that_reports_needs_deps_blocks_its_job(world: World) -> None:
     deps = item["body"]["tasks"][f"{job}-w1"]["needs_deps"]
     assert deps == [{"ecosystem": "pypi", "package": "tomlkit", "version": "0.13.2",
                      "why": "round-trip TOML"}]  # fmt: skip
-    assert item["body"]["actions"] == ["retry", "abandon"]
+    # phase 2a, item 5: a child deps job, waiting for approval; the job resumes on its own
+    assert item["body"]["actions"] == ["abandon"]
+    child = item["body"]["deps_job"]
+    assert w.store.get_job(job).blocked_on == child
+    assert w.store.get_job(child).state.value == "spec_pending"
     assert w.tests.calls == [c for c in w.tests.calls if f"{job}-w1" not in c["source"]]
 
 
@@ -1529,13 +1584,17 @@ def test_a_job_already_running_is_not_started_twice(world: World) -> None:  # ro
 
     w.runner.background = True
     w.runner.run_coord = slow  # type: ignore[method-assign]
-    w.runner.on_resume(job)
-    w.runner.on_resume(job)  # a second resume while the first runs
+    assert w.runner.on_resume(job) == "started"
+    # a second resume while the first runs is queued, never run at once (2a review B4)
+    assert w.runner.on_resume(job) == "queued"
+    assert w.runner.on_resume(job) == "queued"  # and asked twice, it runs once more
+    time.sleep(0.05)
+    assert started == [job]
     gate.set()
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and w.runner.running():
         time.sleep(0.01)
-    assert started == [job]
+    assert started == [job, job]
 
 
 def test_sessions_run_in_the_session_image_and_tests_in_the_dev_image(world: World) -> None:
@@ -1543,8 +1602,8 @@ def test_sessions_run_in_the_session_image_and_tests_in_the_dev_image(world: Wor
     seen: list[tuple[str, str | None]] = []
     w.standin.on_session = lambda spec: seen.append((spec.role.value, spec.image))
     job = _approve(w)
-    assert w.store.get_job(job).state.value == "in_review"
-    assert {r for r, _ in seen} == {"coord", "worker"}
+    assert w.store.get_job(job).state.value == "ready"
+    assert {r for r, _ in seen} == {"coord", "worker", "reviewer", "auditor"}
     assert all(img and img.startswith("vigil-session/fixture:") for _, img in seen), seen
     images = {c["image"] for c in w.tests.calls}
     assert images and all(i.startswith("vigil-dev/fixture:") for i in images), images
@@ -1564,7 +1623,7 @@ def test_build_output_a_worker_leaves_is_not_committed(world: World) -> None:  #
 
     w.standin.worker_edit = edit
     job = _approve(w)
-    assert w.store.get_job(job).state.value == "in_review"
+    assert w.store.get_job(job).state.value == "ready"
     assert len(w.publisher.prs) == 2
 
 
@@ -1597,7 +1656,10 @@ def test_coord_and_worker_sessions_cap_each_calls_output(world: World) -> None:
     cap = 16384  # session_max_output_tokens in configs/budgets.yaml
     roles = {r for r, _ in seen}
     assert {Role.COORD, Role.WORKER} <= roles
-    assert all(n == cap for _, n in seen)
+    assert all(n == cap for r, n in seen if r in (Role.COORD, Role.WORKER))
+    # a reviewer or auditor has its own, smaller cap (2a: REVIEW_OUTPUT_TOKENS, which the
+    # $0.40 and $0.80 session caps were measured at)
+    assert all(n == 8192 for r, n in seen if r in (Role.REVIEWER, Role.AUDITOR))
 
 
 def test_a_mid_run_budget_refusal_names_the_cap_and_the_shortfall_on_the_page(
@@ -1707,17 +1769,31 @@ def _peak_open(w: World) -> list[float]:
 
 
 def test_one_jobs_peak_reservation_fits_the_daily_cap(world: World) -> None:
-    """On main the coord settles before workers start, so a job's peak is
-    max(coord reservation, the first wave's workers). Two independent workers
-    reserve per_task_usd each; the peak must fit under the daily cap."""
+    """A job's peak is max(coord reservation, the first wave's workers, the
+    review stage's reserve): the coord settles before workers start and the
+    workers before the review stage is reserved (2a, from the phase 1 run).
+    Two independent workers reserve per_task_usd each; the peak must fit under
+    the daily cap, and the reviewers and auditors draw from one stage reserve."""
     w = world
     seen = _peak_open(w)
+    in_review: list[float] = []
+    inner = w.standin.on_session
+
+    def on_session(spec: SessionSpec) -> None:
+        if inner is not None:
+            inner(spec)
+        if spec.role in (Role.REVIEWER, Role.AUDITOR):
+            in_review.append(w.budget.open_today())
+
+    w.standin.on_session = on_session
     job = _approve(w)
     cfg = w.runner.cfg.budgets
     wave = len([t for t in w.store.list_tasks(job) if not t.contract.get("depends_on")])
     assert wave == 2
-    assert max(seen) == pytest.approx(max(cfg.coord_session_usd, wave * cfg.per_task_usd))
+    stage = (cfg.review_session_usd + cfg.audit_session_usd) * wave
+    assert max(seen) == pytest.approx(max(cfg.coord_session_usd, wave * cfg.per_task_usd, stage))
     assert max(seen) <= cfg.daily_usd
+    assert in_review and max(in_review) == pytest.approx(stage)  # the first draws from all of it
     assert w.budget.open_today() == 0
 
 
@@ -1759,7 +1835,7 @@ def test_a_third_worker_waits_for_the_day_then_runs(world: World) -> None:
     assert [e["task_id"] for e in queued] == [f"{job}-w3"]
     assert [e["task_id"] for e in _events(w, "dequeued")] == [f"{job}-w3"]
     assert _no_failure_pages(w)
-    assert w.store.get_job(job).state.value == "in_review"
+    assert w.store.get_job(job).state.value == "ready"
     assert w.budget.open_today() == 0
 
 

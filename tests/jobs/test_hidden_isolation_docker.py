@@ -151,7 +151,6 @@ def dworld(
     except Exception as e:
         pytest.fail(f"Docker or the vigil images are not ready (scripts/build-images.py): {e}")
     cfg.repos.repos[REPO] = RepoPolicy(
-        visibility="public",
         decider=["haiku"],
         backends=["claude-sonnet", "claude-opus", "claude-haiku"],
         dev_dockerfile="images/dev/fixture.Dockerfile",
@@ -198,7 +197,7 @@ def test_a_scripted_authors_output_reaches_only_the_vault(
 ) -> None:
     w, scripted = dworld
     job = _approve(w)
-    assert w.store.get_job(job).state.value == "in_review", w.store.get_job(job).state
+    assert w.store.get_job(job).state.value == "ready", w.store.get_job(job).state
 
     # 1. the output is in the vault: a commit that is on no pushed branch
     art = json.loads(w.store.get_artifact(job, "hidden_tests.json").content)

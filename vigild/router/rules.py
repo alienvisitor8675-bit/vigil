@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from vigild.config import Config
 from vigild.contract.models import Size, Task
 from vigild.intake.paths import matches_any
-from vigild.repos import RepoPolicyError, check_backend
+from vigild.repos import RepoPolicyError, check_backend, live_private
 
 LOCAL_OK = "vigil:local-ok"
 
@@ -76,7 +76,7 @@ def route(task: Task, cfg: Config, *, override_tier: str | None = None) -> Route
         reason = f"{reason}; {preset} not live, fallback {fallback}"
         preset = fallback
     try:
-        check_backend(cfg, task.repo, preset)
+        check_backend(cfg, task.repo, preset, private=live_private(task.repo))
     except RepoPolicyError as e:
         raise RoutingError(str(e)) from e
     return Route(tier=tier, tier_reason=reason, preset=preset)

@@ -96,7 +96,14 @@ def _workers_done(c: Ctx) -> list[str]:
     return errs
 
 
-def plan_gaps(store: Store, job_id: str) -> dict[str, str]:
+# A task has an open PR in these states: `pr_open`, `reviewed` (clean at its head) and
+# `fix` (findings sent back; its PR stays open for the next round), all phase 2a's.
+HAS_OPEN_PR = ("pr_open", "reviewed", "fix")
+
+
+def plan_gaps(
+    store: Store, job_id: str, ok_states: tuple[str, ...] = HAS_OPEN_PR
+) -> dict[str, str]:
     """Tasks of the job's current plan that have no open PR for that plan's work, as
     {task id: why} (phase 1 run finding #4). A task has one only if it exists, is
     `pr_open`, and its stored contract is the plan's (an id that names other work, as
@@ -112,7 +119,7 @@ def plan_gaps(store: Store, job_id: str) -> dict[str, str]:
         except KeyError:
             gaps[w.task_id] = "no task was created for it"
             continue
-        if task.state != "pr_open":
+        if task.state not in ok_states:
             gaps[w.task_id] = f"the task is {task.state}, not pr_open"
             continue
         spec = task.contract.get("spec")
@@ -131,28 +138,67 @@ def _plan_has_prs(c: Ctx) -> list[str]:
     ]
 
 
+def _ready_has_prs(c: Ctx) -> list[str]:
+    """No plan task may have lost its PR (closed by hand) by the time the job is ready;
+    one the owner already merged is fine."""
+    return [
+        f"plan task {t} has no open PR: {why}"
+        for t, why in plan_gaps(c.store, c.job.id, (*HAS_OPEN_PR, "merged")).items()
+    ]
+
+
 def _findings(c: Ctx) -> list[str]:
     return [] if c.evidence.get("findings") else ["going back to building needs review findings"]
 
 
 def _reviews_clean(c: Ctx) -> list[str]:
+    """Stage 5 and 6 acceptance: every live task has a valid, clean review.json
+    (an empty or invalid one fails), and where the review was sampled for
+    audit, an audit.json of the same head that missed nothing medium or higher."""
+    from pydantic import ValidationError
+
+    from vigild.contract.models import BLOCKING, Audit, Review
+
     errs: list[str] = []
     for t in c.store.list_tasks(c.job.id):
+        if t.state in ("superseded", "abandoned"):
+            continue
         art = c.store.get_artifact(c.job.id, "review.json", t.id)
         if art is None:
             errs.append(f"worker {t.id} has no review.json")
             continue
-        review = json.loads(art.content)
-        blocking = [
-            f for f in review.get("findings", []) if f.get("severity") in ("medium", "high")
-        ]
-        if review.get("verdict") != "clean" or blocking:
+        try:
+            review = Review.model_validate_json(art.content)
+        except ValidationError:
+            errs.append(f"worker {t.id} review.json is invalid")
+            continue
+        if review.verdict != "clean" or review.blocking():
             errs.append(f"worker {t.id} review is not clean")
+        if review.audit_required:
+            au = c.store.get_artifact(c.job.id, "audit.json", t.id)
+            try:
+                audit = Audit.model_validate_json(au.content) if au else None
+            except ValidationError:
+                audit = None
+            if audit is None or audit.head != review.head:
+                errs.append(f"worker {t.id} has no audit.json for {review.head[:12]}")
+            elif any(f.severity in BLOCKING for f in audit.missed()):
+                errs.append(f"worker {t.id} audit found what the review missed")
     return errs
 
 
 def _merged(c: Ctx) -> list[str]:
     return [] if c.evidence.get("merge_commits") else ["no merge commits recorded"]
+
+
+def _merged_by_hand(c: Ctx) -> list[str]:
+    """Review B7: the owner merged every PR of the job before (or instead of)
+    vigild's review finishing; vigild's PR poll saw each one merged."""
+    errs = _merged(c)
+    live = [t for t in c.store.list_tasks(c.job.id) if t.state not in ("superseded", "abandoned")]
+    if not live or any(t.state != "merged" for t in live):
+        errs.append("not every PR of the job has merged")
+    return errs
 
 
 def _abandon(c: Ctx) -> list[str]:
@@ -174,8 +220,9 @@ EDGES: dict[tuple[JobState, JobState], Guard] = {
     (S.PLANNING, S.BUILDING): _workers_routed,
     (S.BUILDING, S.IN_REVIEW): _workers_done,
     (S.IN_REVIEW, S.BUILDING): _findings,
-    (S.IN_REVIEW, S.READY): _reviews_clean,
+    (S.IN_REVIEW, S.READY): lambda c: [*_reviews_clean(c), *_ready_has_prs(c)],
     (S.READY, S.MERGED): _merged,
+    (S.IN_REVIEW, S.MERGED): _merged_by_hand,
     (S.MERGED, S.VERIFYING): _none,
     (S.VERIFYING, S.DONE): _verified,
     (S.SPEC_PENDING, S.ABANDONED): _abandon,
@@ -184,7 +231,12 @@ HOLDS = (S.BLOCKED, S.ESCALATED)
 TERMINAL = (S.DONE, S.ABANDONED)
 # Out of a hold, besides resuming where it left (review round 2, N5): the
 # owner sends a failed build back to the coord, or abandons the job.
-FROM_HOLD = {S.SPEC_PENDING: "replan", S.ABANDONED: "abandon"}
+FROM_HOLD = {S.SPEC_PENDING: "replan", S.ABANDONED: "abandon", S.MERGED: "prs_merged"}
+# What vigild itself may do to a held job, each with its evidence: resume it
+# once the deps job it waits on merged (round 3) or once a backend breaker's
+# probe closed it (review B6), and record it merged once the owner merged
+# every PR of it by hand (review B7). Everything else is the owner's.
+VIGILD_HOLD_ACTIONS = ("deps_merged", "probe_closed", "prs_merged")
 NEVER_FORCED = {(S.SPEC_PENDING, S.APPROVED)}
 
 
@@ -227,7 +279,16 @@ def transition(
                     f"no transition {frm.value} -> {to.value}; it can only resume "
                     f"{job.blocked_from.value if job.blocked_from else '?'}, re-plan or abandon"
                 )
-            if not owner_inbox:
+            vigild_may = actor is Actor.VIGILD and action in VIGILD_HOLD_ACTIONS
+            if action == "deps_merged":
+                vigild_may = vigild_may and job.blocked_on is not None and to == job.blocked_from
+            elif action == "probe_closed":
+                vigild_may = vigild_may and to == job.blocked_from
+            elif action == "prs_merged":
+                errors = _merged_by_hand(ctx)
+                if errors:
+                    raise TransitionError("; ".join(errors))
+            if not owner_inbox and not vigild_may:
                 raise TransitionError("only the owner, from the inbox, moves a held job")
             # the same invariant on the way back in: a held job resumes into review
             # only if its plan still has a PR for every task

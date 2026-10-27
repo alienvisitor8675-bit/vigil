@@ -27,6 +27,9 @@ from vigild.executors.egress import acl_yaml, allowlist, proxy_config_yaml
 from vigild.verifier import MAX_REPORT, REPORT_DIR, RunResult
 
 LABEL = "dev.vigil.session"
+OUTPUT_SCHEMA = "/vigil/output_schema.json"
+RESUME = "/vigil/resume.jsonl"
+HOOK_DIR = "/run/vigil"  # root-owned tmpfs: the Stop hook's inputs (2a round 2, A6/B12)
 HARNESS_CAPS = ("SETUID", "SETGID", "KILL")
 
 
@@ -66,6 +69,8 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         "VIGIL_MAX_BUDGET_USD": str(spec.max_budget_usd),
         "VIGIL_REQUIRE_PLUGIN": "guard",
         "VIGIL_AGENT_UID": str(uid),
+        "VIGIL_CHECKPOINT_SECONDS": str(cfg.vigild.scheduler.checkpoint_seconds),
+        "VIGIL_HOOK_DIR": HOOK_DIR,
         "PYTHONDONTWRITEBYTECODE": "1",  # no __pycache__ in the worker's tree (round 4)
         "HTTP_PROXY": proxy,
         "HTTPS_PROXY": proxy,
@@ -78,6 +83,8 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         env["TRACEPARENT"] = spec.traceparent
     if spec.max_output_tokens:
         env["VIGIL_MAX_OUTPUT_TOKENS"] = str(spec.max_output_tokens)
+    if spec.hold_first_stop:  # tests only: see SessionSpec
+        env["VIGIL_HOLD_FIRST_STOP"] = "1"
     mounts = [
         _mount(str(spec.clone), "/work", read_only=False),
         _mount(str(spec.session_dir / "packet.md"), "/vigil/packet.md", read_only=True),
@@ -86,6 +93,17 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         _mount(str(spec.session_dir / "out"), "/vigil/out", read_only=False),
         *[_mount(m.host, m.container, m.read_only) for m in spec.mounts],
     ]
+    if spec.resume is not None:
+        # the transcript to resume (phase 2a): read by the harness's session store
+        mounts.append(_mount(str(spec.session_dir / "resume.jsonl"), RESUME, read_only=True))
+        env["VIGIL_RESUME_SESSION"] = spec.resume.session_id
+        env["VIGIL_RESUME_FORK"] = "1" if spec.resume.fork else "0"
+    if spec.output_schema is not None:
+        # a reviewer's or auditor's answer schema (phase 2a): structured output
+        mounts.append(
+            _mount(str(spec.session_dir / "output_schema.json"), OUTPUT_SCHEMA, read_only=True)
+        )
+        env["VIGIL_OUTPUT_SCHEMA"] = OUTPUT_SCHEMA
     return {
         "image": spec.image or cfg.vigild.images.claude_executor,
         "name": f"vigil-{spec.session_id}",
@@ -95,7 +113,11 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         "network": network,
         "environment": env,
         "mounts": mounts,
-        "tmpfs": {"/tmp": f"rw,size=1g,uid={uid},gid={uid},mode=1777"},  # noqa: S108
+        "tmpfs": {
+            "/tmp": f"rw,size=1g,uid={uid},gid={uid},mode=1777",  # noqa: S108
+            # the Stop hook's inputs, the harness's to write (2a round 2, A6/B12)
+            HOOK_DIR: "rw,size=1m,uid=0,gid=0,mode=0755",
+        },
         "stdin_open": True,
         "labels": {LABEL: spec.session_id, "dev.vigil.role": spec.role.value},
         "working_dir": "/work",
@@ -126,33 +148,42 @@ def proxy_kwargs(cfg: Config, spec: SessionSpec) -> dict[str, Any]:
     }
 
 
-# The verifier's first step. The dev image's vigil-prepare copies the checkout
-# into /work with the dependencies it installed, and starts what the suites
-# need (a database on loopback); an image without one gets a plain copy.
-# Exit 125 means the tree couldn't be prepared: the outcome is `unknown`.
-# The verifier's container script (rounds 2-5). The per-run marker arrives on
-# stdin and stdin is closed before anything else runs, so it's in no argv,
-# environment or file. It isn't secret from the test, though: the script runs
-# as the same uid, so a test can read it from /proc/1/mem (the reviewer did).
-# It keeps accidental output from looking like a trailer; like an in-process
-# rewrite of the report, a deliberate forgery stays open (architecture B33),
-# with the draft PR and review as the backstop. The checkout is prepared (exit 125
-# means it couldn't be: `unknown`), test_cmd runs under pipefail and errexit,
-# and then one trailer: BEGIN, each expected report (pytest.xml, vitest-N.xml)
-# in base64, and END with the exit code. vigild accepts reports only from a
-# trailer that ends the stream.
-PREPARE = (
-    "read -r m || exit 125; exec </dev/null; "
-    "if [ -x /usr/local/bin/vigil-prepare ]; then /usr/local/bin/vigil-prepare || exit 125; "
-    "else cp -a /src/. /work/ || exit 125; fi; "
-    f"mkdir -p {REPORT_DIR}; cd /work; "
-    'bash -o pipefail -o errexit -c "$0"; rc=$?; '
-    'printf "\\n%s BEGIN\\n" "$m"; '
-    f"for f in {REPORT_DIR}/pytest.xml {REPORT_DIR}/vitest-*.xml; do "
-    '[ -f "$f" ] || continue; printf "%s %s\\n" "$m" "$(basename "$f")"; '
-    f'head -c {MAX_REPORT} "$f" | base64 -w0; printf "\\n"; done; '
-    'printf "%s END %s\\n" "$m" "$rc"; exit $rc'
-)
+# The verifier's container script (rounds 2-5; phase 2a, item 0). It runs as
+# root with only SETUID and SETGID. The per-run marker arrives on its stdin,
+# which is closed before anything else runs, so the marker is in no argv,
+# environment or file, and only in root's memory: the prepare hook and the
+# test run as the agent uid (setpriv, no capabilities), which can't open
+# /proc/1/mem. The dev image's vigil-prepare copies the checkout into /work
+# with the dependencies it installed and starts what the suites need (a
+# database on loopback); an image without one gets a plain copy. Exit 125
+# means the tree couldn't be prepared: the outcome is `unknown`. test_cmd runs
+# under pipefail and errexit, and then one trailer: BEGIN, each expected report
+# (pytest.xml, vitest-N.xml, regular files only: root never follows a link the
+# test planted) in base64, and END with the exit code. vigild accepts reports
+# only from a trailer that ends the stream. An in-process rewrite of a report
+# stays open (architecture B33), with the draft PR and review as the backstop.
+AGENT = "setpriv --reuid={uid} --regid={uid} --clear-groups --inh-caps=-all --"
+
+
+def prepare_script(uid: int) -> str:
+    a = AGENT.format(uid=uid)
+    return (
+        "read -r m || exit 125; exec </dev/null; "
+        f"{a} mkdir -p {REPORT_DIR} || exit 125; "
+        "if [ -x /usr/local/bin/vigil-prepare ]; "
+        f"then {a} /usr/local/bin/vigil-prepare || exit 125; "
+        f"else {a} cp -a /src/. /work/ || exit 125; fi; "
+        f'cd /work; {a} bash -o pipefail -o errexit -c "$0"; rc=$?; '
+        'printf "\\n%s BEGIN\\n" "$m"; '
+        f"for f in {REPORT_DIR}/pytest.xml {REPORT_DIR}/vitest-*.xml; do "
+        '[ -f "$f" ] && [ ! -L "$f" ] || continue; printf "%s %s\\n" "$m" "$(basename "$f")"; '
+        f'head -c {MAX_REPORT} "$f" | base64 -w0; printf "\\n"; done; '
+        'printf "%s END %s\\n" "$m" "$rc"; exit $rc'
+    )
+
+
+PREPARE = prepare_script(10001)
+VERIFIER_CAPS = ("SETUID", "SETGID")
 # The verifier's script for a hidden run (hotfix 5, round 2). PID 1 is root with
 # only the capabilities below; it starts vigild's subject broker (as root), then
 # runs everything else as the agent uid with no capabilities and no new
@@ -238,8 +269,9 @@ def verifier_kwargs(
     kit: Path | None = None,
 ) -> dict[str, Any]:
     """The verifier's container (owner direction, round 2): the repo's dev
-    image, vigild's checkout read-only at /src, no network at all, the agent
-    uid with no capabilities, and nothing else mounted. The suites write (build
+    image, vigild's checkout read-only at /src, no network at all, the script
+    as root with only SETUID and SETGID, the hook and the test as the agent uid
+    with no capabilities, and nothing else mounted. The suites write (build
     output, caches), so they run on a copy in the container's own tmpfs at
     /work; the checkout itself can't change."""
     uid = cfg.vigild.container.uid
@@ -248,10 +280,10 @@ def verifier_kwargs(
         "image": image,
         "entrypoint": ["sh", "-c"],
         "command": [
-            PREPARE_SUBJECT.format(uid=uid, subj=SUBJECT_UID) if subject else PREPARE,
+            PREPARE_SUBJECT.format(uid=uid, subj=SUBJECT_UID) if subject else prepare_script(uid),
             command,
         ],
-        "user": "0:0" if subject else f"{uid}:{uid}",
+        "user": "0:0",  # the script; the hook and the test run as `uid` (item 0)
         "network_mode": "none",
         "mounts": [
             _mount(str(source), "/src", read_only=True),
@@ -299,7 +331,7 @@ def verifier_kwargs(
         "stdin_open": True,  # the report marker, then closed
         "labels": {LABEL: f"verify-{source.parent.name}", "dev.vigil.role": "verifier"},
         **_hardening(cfg),
-        **({"cap_add": list(SUBJECT_CAPS)} if subject else {}),
+        "cap_add": list(SUBJECT_CAPS if subject else VERIFIER_CAPS),
         "mem_limit": cfg.vigild.container.verifier_memory,
         "pids_limit": max(cfg.vigild.container.pids_limit, 2048),
     }
@@ -316,6 +348,39 @@ def write_kit(dest: Path) -> Path:
         target.chmod(0o644)
     dest.chmod(0o755)
     return dest
+
+
+def deps_kwargs(cfg: Config, image: str, work: Path, *, network: str) -> dict[str, Any]:
+    """A deps job's build container (B39): the repo's dev image, its
+    manifests and lockfiles at /work (nothing else of the repo, no .git), the
+    agent uid with no capabilities, its own internal network whose proxy
+    allows the registries only. No secret, no gateway token, no model."""
+    uid = cfg.vigild.container.uid
+    proxy = f"http://{cfg.egress.proxy.alias}:{cfg.egress.proxy.port}"
+    return {
+        "image": image,
+        "entrypoint": ["sh", "-c"],
+        "user": f"{uid}:{uid}",
+        "network": network,
+        "environment": {
+            "HTTP_PROXY": proxy,
+            "HTTPS_PROXY": proxy,
+            "HOME": "/tmp/home",  # noqa: S108
+            # a dev image installs offline and frozen; this one resolves
+            "UV_OFFLINE": "false",
+            "UV_FROZEN": "false",
+            "UV_NO_CACHE": "false",
+            "UV_CACHE_DIR": "/tmp/uv-cache",  # noqa: S108
+            "UV_PYTHON_DOWNLOADS": "never",
+            "npm_config_cache": "/tmp/npm-cache",  # noqa: S108
+            "pnpm_config_store_dir": "/tmp/pnpm-store",  # noqa: S108
+        },
+        "mounts": [_mount(str(work), "/work", read_only=False)],
+        "tmpfs": {"/tmp": f"rw,exec,size=2g,uid={uid},gid={uid},mode=1777"},  # noqa: S108
+        "working_dir": "/work",
+        "labels": {LABEL: f"deps-{work.name}", "dev.vigil.role": "deps"},
+        **_hardening(cfg),
+    }
 
 
 class DockerTestRunner:
@@ -386,13 +451,16 @@ class DockerTestRunner:
             raw.sendall((marker + "\n").encode())
             with suppress(OSError):
                 raw.shutdown(socket.SHUT_WR)
-            sock.close()
+            _close_attach(sock)
             timer.start()
-            for chunk in c.logs(stream=True, follow=True, stdout=True, stderr=True):
-                seen += len(chunk)
-                buf += chunk
-                if len(buf) > max_output:
-                    del buf[: len(buf) - max_output]  # keep the tail
+            # closed when done: an open stream's response is finalised at exit,
+            # after stderr closes ("I/O operation on closed file", item 0)
+            with _closed(c.logs(stream=True, follow=True, stdout=True, stderr=True)) as stream:
+                for chunk in stream:
+                    seen += len(chunk)
+                    buf += chunk
+                    if len(buf) > max_output:
+                        del buf[: len(buf) - max_output]  # keep the tail
             code = int(c.wait().get("StatusCode", -1))
         finally:
             timer.cancel()
@@ -412,12 +480,43 @@ def write_session_files(cfg: Config, spec: SessionSpec) -> None:
     (sd / "out").mkdir()
     (sd / "out").chmod(0o777)
     (sd / "packet.md").write_text(spec.packet)
+    if spec.output_schema is not None:
+        (sd / "output_schema.json").write_text(json.dumps(spec.output_schema))
+        (sd / "output_schema.json").chmod(0o644)
+    if spec.resume is not None:
+        (sd / "resume.jsonl").write_text("".join(json.dumps(e) + "\n" for e in spec.resume.entries))
+        (sd / "resume.jsonl").chmod(0o644)
     (sd / "proxy" / "acl.yaml").write_text(acl_yaml(allowlist(cfg, spec.role)))
     (sd / "proxy" / "config.yaml").write_text(proxy_config_yaml(cfg))
     for p in (sd, sd / "proxy"):
         p.chmod(0o755)
     for f in (sd / "packet.md", sd / "proxy" / "acl.yaml", sd / "proxy" / "config.yaml"):
         f.chmod(0o644)
+
+
+def _close_attach(sock: Any) -> None:
+    """Close an attach socket and the HTTP response docker-py keeps on it;
+    left to the garbage collector, the response flushes a closed file."""
+    response = getattr(sock, "_response", None)
+    with suppress(Exception):
+        sock.close()
+    if response is not None:
+        with suppress(Exception):
+            response.close()
+
+
+@contextmanager
+def _closed(stream: Any) -> Iterator[Any]:
+    """A docker log stream, closed when done: an open one's response is
+    finalised at exit, after stderr closes, and prints "I/O operation on
+    closed file" (phase 2a, item 0)."""
+    try:
+        yield stream
+    finally:
+        close = getattr(stream, "close", None)
+        if close is not None:
+            with suppress(Exception):
+                close()
 
 
 def _docker_mounts(raw: list[dict[str, Any]]) -> list[Any]:
@@ -483,7 +582,7 @@ class DockerRuntime:
                 raw_sock.sendall((json.dumps({"gateway_token": gateway_token}) + "\n").encode())
                 with suppress(OSError):
                     raw_sock.shutdown(socket.SHUT_WR)
-                sock.close()
+                _close_attach(sock)
                 return self._follow(worker, spec, on_event)
             finally:
                 with suppress(docker.errors.APIError):
@@ -520,6 +619,40 @@ class DockerRuntime:
             with contextlib.suppress(Exception):
                 c.kill()
 
+    def run_deps(
+        self, image: str, work: Path, command: str, timeout_s: int = 900
+    ) -> tuple[int, str]:
+        """A deps job's package-manager run (B39): `deps_kwargs` on its own
+        internal network behind a registry-only proxy. Returns the exit code
+        and the output's tail."""
+        import docker.errors
+
+        from vigild.jobs.model import Role
+
+        sid = f"deps-{secrets.token_hex(5)}"
+        spec = SessionSpec(
+            session_id=sid, role=Role.DEPS, job_id="", task_id=None, repo="", preset="none",
+            model="", clone=work, session_dir=self.cfg.vigild.data_path / "sessions" / sid,
+            max_turns=0, max_minutes=timeout_s // 60, max_budget_usd=0.0,
+        )  # fmt: skip
+        with self._network(spec, lambda e: None) as net_name:
+            kw = deps_kwargs(self.cfg, image, work, network=net_name)
+            kw["mounts"] = _docker_mounts(kw["mounts"])
+            c = self.client.containers.create(command=[command], **kw)
+            try:
+                c.start()
+                try:
+                    code = int(c.wait(timeout=timeout_s).get("StatusCode", -1))
+                except Exception:
+                    with suppress(docker.errors.APIError):
+                        c.kill()
+                    return -1, f"the package manager took over {timeout_s} s"
+                out = c.logs(stdout=True, stderr=True).decode(errors="replace")
+                return code, out[-20000:]
+            finally:
+                with suppress(docker.errors.APIError):
+                    c.remove(force=True)
+
     def reap(self) -> int:
         """At startup: remove every container and network a session left behind."""
         n = 0
@@ -545,18 +678,25 @@ class DockerRuntime:
         result: dict[str, Any] = {}
         buf = b""
         try:
-            for chunk in worker.logs(stream=True, follow=True, stdout=True, stderr=False):
-                buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if "vigil_event" in msg:
-                        on_event(msg["vigil_event"])
-                    elif "vigil_result" in msg:
-                        result = msg["vigil_result"]
+            with _closed(
+                worker.logs(stream=True, follow=True, stdout=True, stderr=False)
+            ) as stream:
+                for chunk in stream:
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        try:
+                            msg = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if "vigil_event" in msg:
+                            on_event(msg["vigil_event"])
+                        elif "vigil_transcript" in msg:
+                            on_event({"type": "transcript", "data": msg["vigil_transcript"]})
+                        elif "vigil_checkpoint" in msg:
+                            on_event({"type": "checkpoint", "data": msg["vigil_checkpoint"]})
+                        elif "vigil_result" in msg:
+                            result = msg["vigil_result"]
             code = int(worker.wait().get("StatusCode", -1))
         finally:
             timer.cancel()

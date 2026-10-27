@@ -22,7 +22,14 @@ class ModelCaller(Protocol):
     """vigild's gateway, called in process (vigild/gateway/service.py)."""
 
     def call(
-        self, *, repo: str, preset: str, body: dict[str, Any], purpose: str, job_id: str | None
+        self,
+        *,
+        repo: str,
+        preset: str,
+        body: dict[str, Any],
+        purpose: str,
+        job_id: str | None,
+        private: bool | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -49,10 +56,23 @@ class HaikuBackend:
             },
         }
 
-    def ask(self, q: Question, state: str, *, repo: str, job_id: str | None) -> Answer:
+    def ask(
+        self,
+        q: Question,
+        state: str,
+        *,
+        repo: str,
+        job_id: str | None,
+        private: bool,
+        purpose: str = "decider",
+    ) -> Answer:
+        """`purpose` is how the call is booked: `decider`, or `decider_fallback`
+        when Jev failed or drifted (owner, 2026-10-23). `private` is the
+        decision's one visibility read (review A10)."""
         reply = self.caller.call(
-            repo=repo, preset=PRESET, body=self.body(q, state), purpose="decider", job_id=job_id
-        )
+            repo=repo, preset=PRESET, body=self.body(q, state), purpose=purpose, job_id=job_id,
+            private=private,
+        )  # fmt: skip
         texts = [b.get("text", "") for b in reply.get("content", []) if b.get("type") == "text"]
         try:
             data = json.loads(texts[-1])

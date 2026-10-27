@@ -113,7 +113,20 @@ class Workspace:
                 )  # fmt: skip
         return path
 
-    def clone(self, repo: str, task_id: str, *, branch: str, base: str) -> Path:
+    def clone(
+        self,
+        repo: str,
+        task_id: str,
+        *,
+        branch: str,
+        base: str,
+        start: str | None = None,
+        record_as: str | None = None,
+    ) -> Path:
+        """A fresh clone for one session. `start` (a commit in the vault) puts
+        the branch there instead of at the base's tip, for a fix round, a
+        resumed worker or a reviewer (phase 2a); the base recorded is still
+        the base's, unless `record_as` names the base commit to record."""
         if not ID.match(task_id):
             raise WorkspaceError(f"bad task id {task_id!r}")
         if not BRANCH.match(branch) or ".." in branch:
@@ -132,7 +145,23 @@ class Workspace:
                 str(mirror), str(dest),
             )  # fmt: skip
         self._git(dest, "checkout", "--quiet", "--detach", base_sha)
-        self._git(dest, "checkout", "--quiet", "-b", branch)
+        if start is not None:
+            if not SHA.match(start):
+                raise WorkspaceError("bad start sha")
+            vault = self.vault(repo)
+            with self._repo_lock(f"vault:{repo}"):
+                self._git(
+                    dest, "-c", "uploadpack.allowAnySHA1InWant=true", "fetch", "--quiet",
+                    "--no-tags", str(vault), start,
+                )  # fmt: skip
+            if record_as is not None:
+                if not SHA.match(record_as):
+                    raise WorkspaceError("bad base sha")
+                base_sha = record_as  # the task's own base, not the branch's tip today
+            self._git(dest, "merge-base", "--is-ancestor", base_sha, start)
+            self._git(dest, "checkout", "--quiet", "-b", branch, start)
+        else:
+            self._git(dest, "checkout", "--quiet", "-b", branch)
         self._git(dest, "remote", "remove", "origin")
         self._git(dest, "config", "user.name", BOT_NAME)
         self._git(dest, "config", "user.email", BOT_EMAIL)
@@ -194,20 +223,33 @@ class Workspace:
         return path
 
     def import_result(
-        self, repo: str, task_id: str, out_dir: Path, branch: str, base_sha: str, *, head: str
+        self,
+        repo: str,
+        task_id: str,
+        out_dir: Path,
+        branch: str,
+        base_sha: str,
+        *,
+        head: str,
+        checkpoint: bool = False,
     ) -> str:
         """Take the session's branch from the bundle the harness wrote; return its head.
 
         `head` is the commit the harness named on its result line (PID 1's
         stdout, out of the agent's reach). The bundle sits in a directory the
         agent uid can write, so a tip that isn't `head` is refused (review round 2, N1).
+        `checkpoint` (phase 2a, item 3) takes a running worker's checkpoint
+        instead: `checkpoint.bundle`'s `refs/vigil/checkpoint`, into
+        `refs/vigil/<task>-ckpt`, bound the same way to the commit named on
+        its checkpoint line.
         """
         if not SHA.match(base_sha):
             raise WorkspaceError("bad base sha")
         if not SHA.match(head or ""):
             raise WorkspaceError("the harness named no head commit")
         try:
-            data = safe_read_bytes(out_dir, out_dir / "result.bundle", MAX_BUNDLE)
+            name = "checkpoint.bundle" if checkpoint else "result.bundle"
+            data = safe_read_bytes(out_dir, out_dir / name, MAX_BUNDLE)
         except (OSError, UnsafeFile) as e:
             raise WorkspaceError(f"no usable result bundle: {e}") from e
         vault = self.vault(repo)
@@ -216,15 +258,14 @@ class Workspace:
             self._git(
                 vault, "fetch", "--quiet", "--no-tags", str(mirror), "+refs/heads/*:refs/mirror/*"
             )
-            tmp = self.data_dir / "vault" / "incoming" / f"{task_id}.bundle"
+            tmp = self.data_dir / "vault" / "incoming" / f"{task_id}-{secrets.token_hex(4)}.bundle"
             tmp.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_bytes(data)
+            src = "refs/vigil/checkpoint" if checkpoint else f"refs/heads/{branch}"
+            ref = f"refs/vigil/{task_id}-ckpt" if checkpoint else f"refs/vigil/{task_id}"
             try:
                 self._git(vault, "bundle", "verify", "--quiet", str(tmp))
-                ref = f"refs/vigil/{task_id}"
-                self._git(
-                    vault, "fetch", "--quiet", "--no-tags", str(tmp), f"+refs/heads/{branch}:{ref}"
-                )
+                self._git(vault, "fetch", "--quiet", "--no-tags", str(tmp), f"+{src}:{ref}")
             finally:
                 tmp.unlink(missing_ok=True)
             tip = self._git(vault, "rev-parse", "--verify", f"{ref}^{{commit}}")
@@ -360,10 +401,17 @@ class Workspace:
         mirror = self.mirror(repo)
         return self._git(mirror, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
 
-    def _tree_entries(self, repo: str, sha: str, paths: list[str]) -> dict[str, tuple[str, str]]:
+    def _origin(self, repo: str, source: str) -> Path:
+        if source not in ("vault", "mirror"):
+            raise WorkspaceError(f"bad source {source!r}")
+        return self.vault(repo) if source == "vault" else self._mirror_path(repo)
+
+    def _tree_entries(
+        self, repo: str, sha: str, paths: list[str], source: str = "mirror"
+    ) -> dict[str, tuple[str, str]]:
         if not SHA.match(sha):
             raise WorkspaceError("bad sha")
-        out = self._git(self._mirror_path(repo), "ls-tree", "-z", sha, "--", *paths)
+        out = self._git(self._origin(repo, source), "ls-tree", "-z", sha, "--", *paths)
         entries: dict[str, tuple[str, str]] = {}
         for entry in filter(None, out.split("\0")):
             meta, _, name = entry.partition("\t")
@@ -372,16 +420,22 @@ class Workspace:
                 entries[name] = (mode, blob)
         return entries
 
-    def blob_ids(self, repo: str, sha: str, paths: list[str]) -> dict[str, str | None]:
-        """Each path's blob id at `sha` in the mirror; None if absent or not a regular file."""
-        entries = self._tree_entries(repo, sha, paths)
+    def blob_ids(
+        self, repo: str, sha: str, paths: list[str], source: str = "mirror"
+    ) -> dict[str, str | None]:
+        """Each path's blob id at `sha` (in the mirror, or the vault for a deps
+        job's head); None if absent or not a regular file."""
+        entries = self._tree_entries(repo, sha, paths, source)
         return {p: (entries[p][1] if p in entries else None) for p in paths}
 
-    def export_files(self, repo: str, sha: str, paths: list[str], dest: Path) -> None:
+    def export_files(
+        self, repo: str, sha: str, paths: list[str], dest: Path, source: str = "mirror"
+    ) -> None:
         """Write the regular files among `paths` at `sha` under `dest` (a dev
-        image's build context: lockfiles only, never the source)."""
-        mirror = self._mirror_path(repo)
-        for path, (mode, blob) in self._tree_entries(repo, sha, paths).items():
+        image's build context, or a deps job's work dir: lockfiles and
+        manifests only, never the source)."""
+        mirror = self._origin(repo, source)
+        for path, (mode, blob) in self._tree_entries(repo, sha, paths, source).items():
             if path.startswith("/") or ".." in Path(path).parts:
                 raise WorkspaceError(f"bad path {path!r}")
             size = int(self._git(mirror, "cat-file", "-s", blob))
@@ -419,6 +473,67 @@ class Workspace:
         return self._git(
             self.vault(repo), "diff", "--no-renames", "--no-ext-diff", "--no-textconv",
             base_sha, head, "--", path,
+        )  # fmt: skip
+
+    def commit_files(self, clone: Path, task_id: str, files: dict[str, bytes], message: str) -> str:
+        """vigild's own commit in a clone no session has touched (a deps job's
+        manifests and lockfiles, plan 2a item 5), taken into the vault as
+        `refs/vigil/<task>`. Returns the head."""
+        for path in files:
+            if path.startswith("/") or ".." in Path(path).parts:
+                raise WorkspaceError(f"bad path {path!r}")
+        for path, data in files.items():
+            target = clone / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        self.commit_before_session(clone, sorted(files), message)
+        branch = self._git(clone, "symbolic-ref", "--short", "HEAD")
+        head = self._git(clone, "rev-parse", "HEAD")
+        repo = json.loads((self.data_dir / "clones" / f"{task_id}.base").read_text())["repo"]
+        vault = self.vault(repo)
+        with self._repo_lock(f"vault:{repo}"):
+            self._git(
+                vault, "fetch", "--quiet", "--no-tags", str(self._mirror_path(repo)),
+                "+refs/heads/*:refs/mirror/*",
+            )  # fmt: skip
+            self._git(
+                vault, "fetch", "--quiet", "--no-tags", str(clone),
+                f"+refs/heads/{branch}:refs/vigil/{task_id}",
+            )  # fmt: skip
+        return head
+
+    def overlay(
+        self, clone: Path, repo: str, base_sha: str, head: str, *, skip: set[str]
+    ) -> list[str]:
+        """Lay a worker's changes from the vault (base to head) over a fresh
+        clone, uncommitted: regular files written, deletions made; paths in
+        `skip` (manifests and lockfiles) and under `.vigil/` left as the clone
+        has them. A
+        committed symlink reads as nothing and isn't laid. Returns the paths."""
+        laid = []
+        for status, path in self.changed(repo, base_sha, head):
+            if path in skip or path.startswith(("/", ".vigil/")) or ".." in Path(path).parts:
+                continue  # vigild's artifacts and the old report aren't the work
+            target = clone / path
+            if status == "D":
+                target.unlink(missing_ok=True)
+                laid.append(path)
+                continue
+            text = self.read_blob(repo, head, path)
+            if text is None:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+            laid.append(path)
+        return laid
+
+    def full_diff(self, repo: str, base_sha: str, head: str) -> str:
+        """The whole change, base to head, from the vault (what a reviewer reads)."""
+        if not SHA.match(base_sha) or not SHA.match(head):
+            raise WorkspaceError("bad sha")
+        return self._git(
+            self.vault(repo), "diff", "--no-renames", "--no-ext-diff", "--no-textconv",
+            base_sha, head,
         )  # fmt: skip
 
     def read_blob(self, repo: str, head: str, path: str, max_bytes: int = MAX_BLOB) -> str | None:

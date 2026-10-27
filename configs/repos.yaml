@@ -1,8 +1,13 @@
 # Which backends and decider routes may see each repo's text (design
-# "Decider"; architecture "Backends"). vigild refuses to start if a private
-# repo lists a hosted entry other than jev-cloudflare. The one exception,
-# `anthropic` for thomasbardhi01/vigil (owner, 2026-10-22, Q2), is hard-coded
-# in vigild/repos.py and can't be extended from this file.
+# "Decider"; architecture "Backends"). There is no visibility field: vigild
+# reads each repo's visibility live from GitHub, at start, at every dispatch
+# and before every Jev call, and treats a repo it can't read as private
+# (owner, 2026-10-23). A private repo may use no hosted entry but Jev on
+# Cloudflare; the one exception, `anthropic` for thomasbardhi01/vigil (owner,
+# 2026-10-22, Q2), is hard-coded in vigild/repos.py. vigild refuses to start,
+# or to dispatch, on a repo whose entries break that rule. `jev` in a decider
+# list is Jev on OpenRouter while the repo is public, on Cloudflare while it's
+# private; Haiku is the escalation.
 #
 # Dev images (owner direction, review round 2; vigild/devimage.py): each repo
 # names its image definition (images/dev/<repo>.Dockerfile) and the lockfiles
@@ -14,8 +19,7 @@
 # refused at the spec gate.
 repos:
   thomasbardhi01/parkagent:
-    visibility: public
-    decider: [haiku, jev-cloudflare]      # jev-openrouter once its key exists
+    decider: [haiku, jev]
     backends: [claude-sonnet, claude-opus, claude-haiku]
     worker_overflow: []
     auto_merge: false
@@ -86,8 +90,7 @@ repos:
       - "**/.npmrc"
       - "**/node_modules/**"
   thomasbardhi01/vigil:
-    visibility: private
-    decider: [haiku, jev-cloudflare]
+    decider: [haiku, jev]
     backends: [claude-sonnet, claude-opus, claude-haiku]
     worker_overflow: []
     auto_merge: false

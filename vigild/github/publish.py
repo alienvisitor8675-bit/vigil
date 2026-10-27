@@ -66,6 +66,39 @@ class RestPulls:
         url: str = r.json()["html_url"]
         return url
 
+    def close(self, repo: str, number: int) -> None:
+        """Close a PR vigild opened (a deps PR its review failed; owner, 2026-10-23)."""
+        r = self.http.patch(
+            f"{self.api}/repos/{repo}/pulls/{number}",
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            json={"state": "closed"},
+            timeout=30.0,
+        )
+        if r.status_code != 200:
+            raise PublishError(f"closing {repo}#{number} failed (HTTP {r.status_code})")
+
+    def state(self, repo: str, number: int) -> str:
+        """A PR's state: open, merged or closed (vigild's PR poll, plan 2a item 5)."""
+        r = self.http.get(
+            f"{self.api}/repos/{repo}/pulls/{number}",
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=30.0,
+        )
+        if r.status_code != 200:
+            raise PublishError(f"reading {repo}#{number} failed (HTTP {r.status_code})")
+        doc = r.json()
+        if doc.get("merged"):
+            return "merged"
+        return "closed" if doc.get("state") == "closed" else "open"
+
 
 def artifact_paths(job_id: str, task_id: str) -> list[str]:
     """The only places under `.vigil/` a worker may write: its own task's
@@ -100,8 +133,11 @@ def publish(
     pulls: Pulls,
     scope: Sequence[str],
     token: str | None = None,
+    existing: str | None = None,
 ) -> str:
-    """Check, push `head` to `branch`, and open a draft PR into `base`."""
+    """Check, push `head` to `branch`, and open a draft PR into `base`. With
+    `existing` (a fix round on a published branch, phase 2a), the same checks
+    and the push, and the PR that's already open stands."""
     from vigild.workspace import WorkspaceError
 
     if branch in PROTECTED or branch == base or not BRANCH.match(branch) or ".." in branch:
@@ -119,4 +155,6 @@ def publish(
         ws.push(repo, head, branch, token)
     except WorkspaceError as e:
         raise PublishError(str(e)) from e
+    if existing:
+        return existing
     return pulls.create_pull(repo, head=branch, base=base, title=title, body=body, draft=True)

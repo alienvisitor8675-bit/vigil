@@ -259,13 +259,11 @@ One repo covers both public and private targets. `vigil` is a single private rep
 
 ```yaml
 repos:
-  thomasbardhi01/parkagent:
-    visibility: public
-    decider: [jev-openrouter, haiku, lfm-tower]
+  thomasbardhi01/parkagent:           # visibility: read live from GitHub (as built, phase 2a)
+    decider: [jev, haiku, lfm-tower]   # jev: OpenRouter while public, Cloudflare while private
     worker_overflow: [runpod]          # hosted eval/overflow allowed
   thomasbardhi01/hearth:               # example only; no repos after ParkAgent yet
-    visibility: private
-    decider: [lfm-tower, jev-cloudflare-zdr]   # drop the second entry to keep it fully local
+    decider: [lfm-tower, jev]          # private: jev-cloudflare; drop it to keep it fully local
     backends: [tower-qwen, tower-fast]
     worker_overflow: []                # tower only
 ```
@@ -281,7 +279,7 @@ The end state is that Claude builds and runs end-to-end tests, and the fleet rev
 | 2 | Local reviewer only | Claude Sonnet audits a 25% sample | sample shows no missed finding of severity ≥ medium over 40 PRs |
 | 3 | Local reviewer only | Claude audits a 10% sample, forever | a missed medium finding or any missed high finding drops the shape back to rung 1 |
 
-Shapes graduate independently: docs and dependency bumps will reach rung 3 in weeks; tests-from-spec may take longer; money, auth and consent paths stay at rung 0 permanently. The ladder state lives in `configs/review.yaml` and `vigild` edits it from the audit data; you see every promotion and demotion in the weekly report.
+Shapes graduate independently: docs may reach rung 3 in weeks; tests-from-spec may take longer; dependency bumps stop at rung 1, so you review every deps PR (owner, 2026-10-23); money, auth and consent paths stay at rung 0 permanently. The ladder state lives in `configs/review.yaml` and `vigild` edits it from the audit data; you see every promotion and demotion in the weekly report. **As built (phase 2a):** `configs/review.yaml` holds each shape's starting rung and the policy, and vigild keeps the live rung in its database, moved only by audits, with a `ladder_changes` row (its evidence) and an inbox page for every move; vigild never rewrites a tracked file in its own checkout. Once a shape has a row in the database, an edit to its starting rung in the YAML is ignored. Rung 0 never graduates, and until a local reviewer passes its eval no shape passes rung 1, so for now audits can only demote.
 
 The review contract is the same for every reviewer: input is the diff, the issue, the spec, and the checklist; output is `findings[] {severity, file, line, claim, fix}` plus a verdict. Claude-as-auditor scores a review by matching its findings against the auditor's own, and that match rate is the number the ladder runs on.
 
@@ -417,8 +415,8 @@ Role prompts are short, imperative, and never change mid-job. Changing a prompt 
 **Dependency changes are their own job** (owner direction, 2026-10-22). A worker never adds a dependency: verification runs the base's runner files on images built from the base's lockfiles, so a dependency change can't pass. Instead:
 1. The worker's task blocks with "needs dep <name>@<version>": it reports `needs_deps: [{ecosystem, package, version, why}]` in `worker_report.json`, or vigild reads it from a manifest or lockfile the worker changed. The inbox item shows the requested deps and the worker's manifest and lockfile diff, fenced as untrusted.
 2. vigild opens a child **deps job** (shape `deps`; the blocked task's `blocked_on`) that changes only the manifest and the lockfile. It runs **no model**: vigild runs the package manager's lockfile-only update (`pnpm add <pkg>@<ver> --lockfile-only`, `uv add …`) in a dedicated build container with registry egress and nothing else: no repo secrets, no gateway token, no model. A diff that touches anything but manifests and lockfiles fails the job.
-3. **Pins:** the requested version must be a release at least 14 days old by the registry's publish time, and so must every other package the lockfile pulls in, or the job fails with the list.
-4. **Gates:** the dev image is rebuilt from the new lockfile, the full suite runs offline on base plus the new lockfile, and vigild opens the PR. `deps` starts at rung 1 and always needs your review, like money paths.
+3. **Pins:** the requested version must be a release at least 14 days old by the registry's publish time, and so must every other package the lockfile pulls in, or the job fails with the list. **As built (2a round 2):** the age is the newest upload of the exact files the lock pins, by hash, and no source builds run (`uv --no-build`, pnpm `--ignore-scripts`); a dependency that needs one pages you.
+4. **Gates:** vigild opens the PR. `deps` starts at rung 1 and always needs your review, like money paths. **As built (2a round 2):** the dev image is rebuilt from the new lockfile, and the full suite runs offline on it, only after you merge (building it runs the package manager with the build network, so it waits for your review); a failed review closes the PR and regenerates the deps job once, then pages you.
 5. After that PR merges, the dev image key changes, and the original task resumes on the new image.
 6. Dependabot-style bumps come in the same way: a scheduled intake, or a Dependabot PR adopted as a deps job.
 
@@ -548,7 +546,7 @@ How Vigil gets better from its own jobs.
 - **What `reward.json` is for.** It is finalised after the audit and is **never an input to any decision about the job itself**. It feeds only the job's learning record and the ladder.
 - **Audit samples.** Top-reward jobs are a **separate audit sample**. The ladder's statistics come from the random sample only. Reward–audit agreement is tracked per component, and a component below its threshold is frozen out of the reward until it is recalibrated.
 
-**Hidden tests.** *Implemented for runner-file tasks only (owner ruling 2026-10-23, hotfix 4): `docs/architecture.md` B40. The learning epic extends it to every task.*
+**Hidden tests.** *Implemented for runner-file tasks only (owner ruling 2026-10-23, hotfix 4), but disabled by host policy (`hidden_tests.enabled` is off) until ADR-0003's work merges: `docs/architecture.md` B40. The learning epic extends it to every task.*
 - **Who writes them:** at spec time, a second, fresh-context session writes acceptance tests from the spec and the product model only. The spec author's session is never the worker's session.
 - **They must fail on base.**
 - **Where they live:** vigild stores them. They are **never on the branch**, which makes them the one stage artifact not committed under `.vigil/`, and they run only in the verifier.
@@ -1373,7 +1371,7 @@ Hard constraints, enforce in code and test them:
 - No Claude-generated text can enter a training export: provenance tags on every stored artifact plus a test that a `claude`-tagged fixture is rejected by the exporter.
 - Budgets and the per-repo WIP limit are hard stops in vigild; tests prove the daily cap and the WIP limit halt dispatch.
 - Intake: no task runs without why/value/risk; self-generated tasks need value ≥ 3 and never touch money/auth/consent paths. Test both.
-- Review ladder: rung state is data in configs/review.yaml, promotions and demotions are computed from audit match rates, and money-path shapes cannot be promoted. Test the demotion path.
+- Review ladder: rung state is data (as built: the starting rungs and the policy in configs/review.yaml, the live rung in vigild's database, every change a `ladder_changes` row), promotions and demotions are computed from audit match rates, and money-path shapes cannot be promoted. Test the demotion path.
 - The task contract JSON is the only interface between vigild and executors; both executors pass the same contract test suite.
 
 Before writing code, ask me these and nothing else: (1) daily Claude cap and per-task cap, (2) repos after parkagent and which are private, (3) whether Hearth shares the GPU, (4) Mac or tower for the CLI. Then write docs/architecture.md and docs/feature-map.md as the first PR with the plan for all phases, and wait for my OK.

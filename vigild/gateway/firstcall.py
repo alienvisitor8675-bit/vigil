@@ -42,8 +42,10 @@ def first_calls(cfg: Config, repo: str | None = None) -> list[FirstCall]:
     roles += [(f"tier:{t}", p, cfg.budgets.per_task_usd) for t, p in rt.tiers.items()]
     roles += [
         ("fallback", rt.fallback, cfg.budgets.per_task_usd),
-        ("reviewer", rt.reviewer, cfg.budgets.per_task_usd),
-        ("auditor", rt.auditor, cfg.budgets.per_task_usd),
+        # reviews sit outside the task's cap and an over-cap review grows against the
+        # day (B14), so the day is the cap a review's first call must fit
+        ("reviewer", rt.reviewer, cfg.budgets.daily_usd),
+        ("auditor", rt.auditor, cfg.budgets.daily_usd),
         # the hidden-test author runs on the reviewer tier, under its own cap
         ("hidden_test_author", rt.reviewer, cfg.budgets.hidden_tests_session_usd),
     ]

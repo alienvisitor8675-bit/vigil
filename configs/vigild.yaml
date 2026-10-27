@@ -25,3 +25,15 @@ container:
   uid: 10001
   verifier_memory: 6g   # checkout + dependencies + a database, in tmpfs
   verifier_concurrency: 1   # one verifier container at a time on this machine
+scheduler:                        # the fleet (plan 2a, items 2-3)
+  sessions: 3                     # coord, worker, reviewer and auditor sessions at once, every job
+  intake_poll_seconds: 300        # issues labelled vigil:ready, in repos with `intake: true`
+  pr_poll_seconds: 120            # merged and closed fleet PRs (a deps job's merge resumes its parent)
+  resume_attempts: 2              # a crashed or killed worker resumes at most this often
+  checkpoint_seconds: 30          # a worker's work is checkpointed at most this often
+breakers:                         # circuit breakers (plan 2a, item 4; vigild/breakers.py)
+  backend_errors: 3               # 5xx or timeouts in a row from one preset's backend
+  backend_cooldown_seconds: 300   # then one half-open probe; a success closes it
+  repo_failures: 3                # failed or abandoned jobs in a row, per repo
+  verifier_unknowns: 3            # `unknown` verdicts in a row, per repo (a broken image or runner)
+  max_escalations_per_day: 5      # rule-5 escalations a day (UTC), across the fleet

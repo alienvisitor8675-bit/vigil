@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -40,6 +41,9 @@ FEATURES: dict[str, tuple[str, ...]] = {
     "jev-cloudflare": ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"),
     "metrics-token": ("VIGIL_METRICS_TOKEN",),
 }
+
+
+RESERVATION_SWEEP_SECONDS = 600  # every 10 minutes (2a round 8)
 
 
 def degraded(secrets: Secrets) -> set[str]:
@@ -95,6 +99,9 @@ def build(
     store = Store.open(data / "vigil.db")
     budget = Budget(store, cfg.budgets)
     gateway = Gateway(cfg, store, budget, secrets, **gateway_kwargs)
+    from vigild.breakers import Breakers
+
+    gateway.breakers = Breakers(store, cfg)  # shared with the runner (item 4)
     off = degraded(secrets)
     telemetry = Telemetry(None if "tracing" in off else cfg.vigild.collector.otlp_http)
     tokens = Tokens(
@@ -164,11 +171,14 @@ def _github_app(v: Vigild) -> Any:
 def build_runner(v: Vigild, app: Any) -> JobRunner:
     """The real executor, workspace and publisher behind the job service."""
     import docker
+    import httpx2
 
+    from vigild.db import utcnow
     from vigild.devimage import DockerImages, SessionImages
     from vigild.executors.runtime import DockerRuntime, DockerTestRunner
     from vigild.github.app import READ_ONLY
-    from vigild.jobs.runner import GitHubPublisher, NoPublisher, Publisher
+    from vigild.jobs.deps import DepsExecutor, HttpRegistry
+    from vigild.jobs.runner import GitHubPRs, GitHubPublisher, NoPublisher, Publisher
     from vigild.verifier import Verifier, host_key
     from vigild.workspace import Workspace
 
@@ -205,7 +215,17 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         Verifier(ws, tests, host_key=host_key(v.secrets.get("VIGIL_HOST_KEY"))),
         reaper=runtime.reap,
         session_images=sessions,
+        breakers=v.gateway.breakers,
+        deps=DepsExecutor(
+            ws,
+            runtime.run_deps,
+            HttpRegistry(httpx2.Client(timeout=30)),
+            utcnow,
+            v.cfg.vigild.data_path / "deps",
+        ),
+        pr_state=GitHubPRs(app).state if app else None,
     )
+    runner.closers.append(client.close)
     images.on_failure = runner.dev_image_failed
     sessions.on_failure = runner.dev_image_failed
     runner.jobs = v.services.jobs
@@ -231,9 +251,42 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
     return runner
 
 
+def start_pollers(v: Vigild, app: Any, runner: JobRunner) -> threading.Event:
+    """vigild's background loops (plan 2a): label intake for repos that turn
+    it on. Each runs in its own daemon thread until the event is set."""
+    from vigild.intake.github import LabelIntake, RestIssues, every
+
+    stop = threading.Event()
+    sched = v.cfg.vigild.scheduler
+    # a reservation nothing live holds would block every later day: settle it
+    # (2a round 8; the startup reconcile settles everything a crash left)
+    threading.Thread(
+        target=every, args=(RESERVATION_SWEEP_SECONDS, runner.sweep_reservations, stop),
+        name="vigil-sweep", daemon=True,
+    ).start()  # fmt: skip
+    if runner.pr_state is not None:
+        # merged and closed fleet PRs: a deps job's merge resumes its parent (item 5)
+        threading.Thread(
+            target=every, args=(sched.pr_poll_seconds, runner.poll_prs, stop),
+            name="vigil-prs", daemon=True,
+        ).start()  # fmt: skip
+    if app is not None and any(p.intake for p in v.cfg.repos.repos.values()):
+        import httpx2
+
+        from vigild.decider.wiring import build_decider
+
+        decider = build_decider(v.cfg, v.store, v.gateway, v.secrets, httpx2.Client(timeout=30))
+        intake = LabelIntake(v.cfg, v.store, v.services.jobs, RestIssues(app), decider)
+        threading.Thread(
+            target=every, args=(sched.intake_poll_seconds, intake.poll, stop),
+            name="vigil-intake", daemon=True,
+        ).start()  # fmt: skip
+    return stop
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    from vigild.repos import RepoPolicyError, verify_visibility
+    from vigild.repos import RepoPolicyError, set_visibility_source, verify_visibility
 
     v = build()
     app = _github_app(v)
@@ -243,9 +296,12 @@ def main() -> None:
             "verified; refusing to start (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)"
         )
     try:
-        verify_visibility(v.cfg, app.is_private)
+        seen = verify_visibility(v.cfg, app.is_private)
     except RepoPolicyError as e:
         raise SystemExit(f"vigild: {e}") from e
+    log.info("visibility (live): %s", {r: "private" if p else "public" for r, p in seen.items()})
+    # every later read (dispatch, each Jev call) asks GitHub again
+    set_visibility_source(app.is_private)
     runner = build_runner(v, app)
     v.services.jobs.runner = runner
     # Hold every job a restart interrupted. Approved builds start only once the
@@ -253,4 +309,9 @@ def main() -> None:
     # repo's dev image first: built and validated when its lockfiles change,
     # never on a timer (the nightly validation is gone).
     log.info("reconcile: %s", runner.reconcile())
-    asyncio.run(serve(v, on_ready=runner.start_deferred))
+
+    def ready() -> None:
+        runner.start_deferred()
+        start_pollers(v, app, runner)
+
+    asyncio.run(serve(v, on_ready=ready))

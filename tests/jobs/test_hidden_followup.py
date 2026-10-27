@@ -436,29 +436,33 @@ def test_a_private_repo_other_than_vigil_is_refused_hosted_authoring(cfg: Config
     sonnet = cfg.routing.reviewer
     assert cfg.backends.presets[sonnet].locality == "hosted"
     any_repo = next(iter(cfg.repos.repos.values()))
-    for name, vis in (
-        ("o/secret", "private"),
-        ("thomasbardhi01/vigil", "private"),
-        ("o/open", "public"),
-    ):
+    for name in ("o/secret", "thomasbardhi01/vigil", "o/open"):
         cfg.repos.repos[name] = any_repo.model_copy(
-            update={"visibility": vis, "backends": [sonnet], "worker_overflow": []}
+            update={"backends": [sonnet], "worker_overflow": []}
         )
     with pytest.raises(RepoPolicyError, match="hidden-test authoring"):
-        check_hidden_author(cfg, "o/secret", sonnet)
-    check_hidden_author(cfg, "thomasbardhi01/vigil", sonnet)  # the waiver, in code
-    check_hidden_author(cfg, "o/open", sonnet)
+        check_hidden_author(cfg, "o/secret", sonnet, private=True)
+    check_hidden_author(cfg, "thomasbardhi01/vigil", sonnet, private=True)  # the waiver, in code
+    check_hidden_author(cfg, "o/open", sonnet, private=False)
 
 
-def test_the_runner_files_a_private_repo_as_missing(world: World) -> None:
+def test_a_private_repo_never_reaches_hosted_hidden_test_authoring(world: World) -> None:
+    """Visibility is GitHub's live answer (2a): a private repo with a hosted backend is
+    refused (a `repo_policy` page) when the job is dispatched, before any author could
+    be, so no hosted author session runs. (`check_hidden_author` stays as the author step's own gate.)"""
+    from vigild.repos import set_visibility_source
+
     w = world
     _runner_world(w)
-    pol = w.runner.cfg.repos.repos[REPO]
-    w.runner.cfg.repos.repos[REPO] = pol.model_copy(update={"visibility": "private"})
-    job = _request(w)
-    entry = json.loads(w.store.get_artifact(job, "hidden_tests.json").content)["tasks"][f"{job}-w1"]
-    assert entry["status"] == "missing" and "hidden-test authoring" in entry["reason"]
-    assert [c[0] for c in w.standin.calls].count("hidden_test_author") == 0
+    set_visibility_source(lambda repo: True)
+    try:
+        job = _request(w)
+    finally:
+        set_visibility_source(lambda repo: False)
+    assert [c[0] for c in w.standin.calls] == []
+    pages = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()["questions"]
+    assert any(p["job_id"] == job and p["body"].get("kind") == "repo_policy" for p in pages)
+    assert w.store.get_artifact(job, "hidden_tests.json") is None
 
 
 def test_a_replan_never_rewrites_a_human_written_spec(world: World) -> None:

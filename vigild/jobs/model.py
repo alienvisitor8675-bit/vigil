@@ -31,6 +31,7 @@ class Role(StrEnum):
     AUDITOR = "auditor"
     SUBAGENT = "subagent"
     HIDDEN_TEST_AUTHOR = "hidden_test_author"  # a fresh session; never a worker or reviewer
+    DEPS = "deps"  # a deps job's build container: no model, registry egress only (B39)
 
 
 class FixDepthExceeded(ValueError):

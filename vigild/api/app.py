@@ -191,24 +191,26 @@ def approve(
 
 @router.post("/api/inbox/{item_id}/resume", dependencies=[ADMIN])
 def resume(request: Request, item_id: int) -> dict[str, Any]:
+    jobs = _svc(request).jobs
     try:
-        job = _svc(request).jobs.resume(item_id)
+        job = jobs.resume(item_id)
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
         raise HTTPException(409, str(e)) from e
-    return {"job_id": job.id, "state": job.state.value}
+    # `queued`: the job's current run finishes first, then this one (2a round 3)
+    return {"job_id": job.id, "state": job.state.value, "run": jobs.last_run.get(job.id)}
 
 
 def _act(request: Request, item_id: int, action: str) -> dict[str, Any]:
     jobs = _svc(request).jobs
     try:
-        job = {"retry": jobs.retry, "abandon": jobs.abandon}[action](item_id)
+        job = {"retry": jobs.retry}[action](item_id)
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except Conflict as e:
         raise HTTPException(409, str(e)) from e
-    return {"job_id": job.id, "state": job.state.value}
+    return {"job_id": job.id, "state": job.state.value, "run": jobs.last_run.get(job.id)}
 
 
 @router.post("/api/inbox/{item_id}/retry", dependencies=[ADMIN])
@@ -228,8 +230,9 @@ def replan(
     note = (body or {}).get("note")
     if note is not None and not isinstance(note, str):
         raise HTTPException(422, "note must be text")
+    jobs = _svc(request).jobs
     try:
-        job = _svc(request).jobs.replan(item_id, note)
+        job = jobs.replan(item_id, note)
     except NotFound as e:
         raise HTTPException(404, "no such inbox item") from e
     except NoteTooLarge as e:
@@ -238,12 +241,23 @@ def replan(
         raise HTTPException(422, str(e)) from e
     except Conflict as e:
         raise HTTPException(409, str(e)) from e
-    return {"job_id": job.id, "state": job.state.value}
+    return {"job_id": job.id, "state": job.state.value, "run": jobs.last_run.get(job.id)}
 
 
 @router.post("/api/inbox/{item_id}/abandon", dependencies=[ADMIN])
-def abandon(request: Request, item_id: int) -> dict[str, Any]:
-    return _act(request, item_id, "abandon")
+def abandon(
+    request: Request, item_id: int, payload: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
+    """Give a job up. On a breaker's page, `{"job_id": ...}` names which of
+    the jobs it holds (2a round 3)."""
+    job_id = (payload or {}).get("job_id")
+    try:
+        job = _svc(request).jobs.abandon(item_id, str(job_id) if job_id else None)
+    except NotFound as e:
+        raise HTTPException(404, "no such inbox item") from e
+    except Conflict as e:
+        raise HTTPException(409, str(e)) from e
+    return {"job_id": job.id, "state": job.state.value}
 
 
 @router.post("/api/inbox/{item_id}/rebuild", dependencies=[ADMIN])
@@ -258,6 +272,19 @@ def rebuild(request: Request, item_id: int) -> dict[str, Any]:
     return {"item_id": item_id, "status": "rebuilding"}
 
 
+@router.post("/api/inbox/{item_id}/reset", dependencies=[ADMIN])
+def reset(request: Request, item_id: int) -> dict[str, Any]:
+    """Reset a tripped circuit breaker; the jobs it paused resume."""
+    try:
+        out = _svc(request).jobs.reset(item_id)
+    except NotFound as e:
+        raise HTTPException(404, "no such inbox item") from e
+    except Conflict as e:
+        raise HTTPException(409, str(e)) from e
+    # `queued`: the job's last run is still finishing; it picks up after (B4)
+    return {"item_id": item_id, "status": "reset", **out}
+
+
 @router.post("/api/inbox/{item_id}/dismiss", dependencies=[ADMIN])
 def dismiss(request: Request, item_id: int) -> dict[str, Any]:
     try:
@@ -267,6 +294,26 @@ def dismiss(request: Request, item_id: int) -> dict[str, Any]:
     except Conflict as e:
         raise HTTPException(409, str(e)) from e
     return {"item_id": item_id, "status": "resolved"}
+
+
+# --- reports ------------------------------------------------------------------------
+
+
+@router.get("/api/decider/report", dependencies=[READ])
+def decider_report(request: Request) -> dict[str, Any]:
+    """Confidence per question type, and escalations to Haiku (owner ruling 6)."""
+    from vigild.kpis import decider_report as report
+
+    return report(_svc(request).store)
+
+
+@router.get("/api/review/ladder", dependencies=[READ])
+def review_ladder(request: Request) -> dict[str, Any]:
+    """Each shape's live rung, its limit and its last change (owner ruling 1)."""
+    from vigild.review.ladder import Ladder
+
+    svc = _svc(request)
+    return Ladder(svc.store, svc.cfg).state()
 
 
 # --- sessions -----------------------------------------------------------------------

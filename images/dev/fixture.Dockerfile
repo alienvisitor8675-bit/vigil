@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.28.0@sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b
 # Dev image for the docker tests' fixture repo (tests/jobs/test_coord_loop_docker.py).
 # Not used for any real repo. The fixture's checks are pytest tests (the
 # verifier needs a test report), so the image is CPython 3.14.8 with pytest,

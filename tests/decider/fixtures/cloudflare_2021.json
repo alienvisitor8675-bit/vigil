@@ -1,0 +1,12 @@
+{
+  "_fixture_note": "The shape of Cloudflare's 2021 'Insufficient balance' (the AI Gateway credit is empty), per the owner's live check 2026-10-23.",
+  "result": null,
+  "success": false,
+  "errors": [
+    {
+      "code": 2021,
+      "message": "Insufficient balance"
+    }
+  ],
+  "messages": []
+}

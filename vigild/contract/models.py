@@ -80,8 +80,9 @@ class Size(StrEnum):
 
 class Shape(StrEnum):
     """The kind of change, for the review ladder (phase 2). `deps` changes
-    only manifests and lockfiles, runs no model, starts at rung 1 and always
-    needs the owner's review (round 3)."""
+    only manifests and lockfiles, runs no model, starts at rung 1, is capped
+    there and always needs the owner's review (round 3; owner 2026-10-23).
+    `money`, `auth` and `consent` stay at rung 0 permanently."""
 
     DOCS = "docs"
     TESTS = "tests"
@@ -89,6 +90,9 @@ class Shape(StrEnum):
     FIX = "fix"
     REFACTOR = "refactor"
     DEPS = "deps"
+    MONEY = "money"
+    AUTH = "auth"
+    CONSENT = "consent"
 
 
 class DepRequest(Strict):
@@ -253,8 +257,123 @@ class CriterionVerify(Strict):
 
 
 class Plan(Strict):
+    """plan.md's workers and how each criterion is verified. More than 4
+    workers means review runs in passes of at most 4, one after another
+    (owner, 2026-10-23): prefer fewer tasks unless the split is truly
+    parallel; the WIP limit is 4 open PRs too."""
+
     workers: list[WorkerContract]
     verify: list[CriterionVerify] = Field(min_length=1)
 
 
 Verdict = Literal["clean", "changes"]
+
+
+class Severity(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+BLOCKING = frozenset({Severity.MEDIUM, Severity.HIGH})
+# The reviewer's checklist (design stage 5: "checklist complete"); every
+# review answers each item.
+CHECKLIST = (
+    "test_fails_first",  # the new test fails before and passes after
+    "no_weakened_tests",  # no test skipped, narrowed or deleted
+    "in_scope",  # every changed file is in the spec's scope
+    "docs_updated",  # docs the spec requires are updated
+    "one_way",  # no second way of doing something the repo already does
+    "nothing_to_delete",  # nothing in the change could be deleted
+)
+
+
+class Finding(Strict):
+    severity: Severity
+    file: str = Field(min_length=1, max_length=500)
+    line: int | None = Field(default=None, ge=0)
+    claim: str = Field(min_length=1, max_length=4000)
+    fix: str = Field(min_length=1, max_length=4000)
+
+
+class Checklist(Strict):
+    """Every item answered (true when it holds); the schema names them, so a
+    model can't answer a checklist of its own."""
+
+    test_fails_first: bool
+    no_weakened_tests: bool
+    in_scope: bool
+    docs_updated: bool
+    one_way: bool
+    nothing_to_delete: bool
+
+
+class ReviewOutput(Strict):
+    """What a reviewer session ends with (its structured output)."""
+
+    verdict: Verdict
+    findings: list[Finding] = Field(max_length=100)
+    checklist: Checklist
+
+    @model_validator(mode="after")
+    def _consistent(self) -> ReviewOutput:
+        if self.verdict == "clean" and any(f.severity in BLOCKING for f in self.findings):
+            raise ValueError("a clean verdict has no finding of severity medium or higher")
+        return self
+
+
+class Review(ReviewOutput):
+    """review.json (stage 5): the reviewer's output, plus what vigild knows."""
+
+    task_id: str
+    job_id: str
+    head: str  # the commit reviewed
+    shape: Shape
+    rung: int = Field(ge=0, le=3)
+    round: int = Field(ge=1)
+    audit_required: bool
+    reviewer: str  # the preset that reviewed
+    provenance: Provenance
+
+    def blocking(self) -> list[Finding]:
+        return [f for f in self.findings if f.severity in BLOCKING]
+
+
+class AuditFinding(Finding):
+    """One finding of the auditor's own review. `matched` is the index of the
+    reviewer's finding that caught it, or None when the reviewer missed it."""
+
+    matched: int | None = Field(default=None, ge=0)
+
+
+class AuditOutput(Strict):
+    """What an auditor session ends with: its own independent findings, each
+    matched (or not) to the reviewer's, and the reviewer's findings it judges
+    wrong."""
+
+    findings: list[AuditFinding] = Field(max_length=100)
+    false_findings: list[int] = Field(default_factory=list, max_length=100)
+
+
+class Audit(AuditOutput):
+    """audit.json (stage 6). vigild computes the match rate from the list;
+    it never takes the auditor's number."""
+
+    task_id: str
+    job_id: str
+    head: str
+    shape: Shape
+    rung: int = Field(ge=0, le=3)
+    auditor: str
+    provenance: Provenance
+
+    def missed(self) -> list[AuditFinding]:
+        return [f for f in self.findings if f.matched is None]
+
+    def match_rate(self) -> float:
+        """Share of the auditor's medium-or-higher findings the reviewer also
+        found (1.0 when the auditor found none)."""
+        counted = [f for f in self.findings if f.severity in BLOCKING]
+        if not counted:
+            return 1.0
+        return sum(1 for f in counted if f.matched is not None) / len(counted)

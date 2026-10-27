@@ -32,10 +32,12 @@ exploring. `AGENTS.md` is a symlink to this file.
   and pushes, and opens draft PRs (P2). Workers never hold a GitHub token.
   vigild mints only for repos in `configs/repos.yaml` (plus claude-mods,
   read-only).
-- **Private repos** see only backends `configs/repos.yaml` lists for them;
-  vigild refuses to start on any hosted entry for a private repo other than
-  `jev-cloudflare`, plus `anthropic` for `thomasbardhi01/vigil` only
-  (hard-coded in `vigild/repos.py`, not configurable).
+- **Private repos** see only backends `configs/repos.yaml` lists for them,
+  and no hosted one but Jev on Cloudflare, plus `anthropic` for
+  `thomasbardhi01/vigil` only (hard-coded in `vigild/repos.py`). Visibility is
+  GitHub's live answer, never a YAML field; unreadable means private. vigild
+  checks the rule at start and at every dispatch, and a decider list's `jev`
+  is OpenRouter while public, Cloudflare while private (`repos.jev_route`).
 - **Provenance.** Every stored artifact and DB row carries
   `provenance: claude | local | human`. The training exporter takes
   `local` only.
@@ -65,6 +67,8 @@ exploring. `AGENTS.md` is a symlink to this file.
   - `intake/`: spec gate, scoring, globs;
   - `jobs/`: model, FSM, tree, artifacts, service, runner, acceptance;
   - `router/`, `decider/`, `gateway/`, `budget.py`, `metering/`, `packets/`;
+  - `review/`: the trust ladder; `scheduler/`: the graph and WIP;
+    `breakers.py`: circuit breakers;
   - `github/`: App tokens, publish;
   - `executors/`: runtime, egress;
   - `workspace.py`, `devimage.py`, `telemetry/`, `doctor.py`, `kpis.py`,

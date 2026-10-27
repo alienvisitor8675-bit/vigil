@@ -14,6 +14,7 @@ import httpx2
 
 from vigild import config
 from vigild.config import Config, Secrets
+from vigild.repos import JEV, live_private, repo_rule_errors
 
 TIMEOUT = 15.0
 
@@ -57,6 +58,8 @@ def run_checks(
     include_claude_mods: bool = True,
 ) -> list[Check]:
     out: list[Check] = []
+    vis: dict[str, bool] = {}  # each repo's live visibility, as read here
+    app: Any = None
     out.append(
         _safe("configs (incl. the private-repo rule)", lambda: (config.load() is not None, ""))
     )
@@ -123,13 +126,13 @@ def run_checks(
             return True, ""
 
         def visibility(repo: str) -> tuple[bool, str]:
-            private = app.is_private(repo)
-            yaml_private = cfg.repo(repo).visibility == "private"
-            if private and not yaml_private:
-                return False, "private on GitHub, public in repos.yaml"
-            if yaml_private and not private:
-                return True, "public on GitHub; repos.yaml keeps it private"
-            return True, "matches"
+            """GitHub's live answer is the only source (owner, 2026-10-23); the
+            private-repo rule is checked against it."""
+            private = live_private(repo, app.is_private)
+            vis[repo] = private
+            errors = repo_rule_errors(cfg, repo, private)
+            word = "private" if private else "public"
+            return (False, "; ".join(errors)) if errors else (True, f"{word}, live")
 
         for repo in repos if repos is not None else list(cfg.repos.repos):
             out.append(_safe(f"visibility: {repo}", lambda r=repo: visibility(r)))
@@ -151,13 +154,68 @@ def run_checks(
     else:
         out.append(Check("GITHUB_APP_ID+GITHUB_APP_KEY_PATH", False, "missing"))
 
-    for name in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN"):
+    # Jev (owner, 2026-10-23): OpenRouter for public repos, Cloudflare only
+    # for private ones, by each repo's live visibility; Haiku the escalation.
+    # Live calls only about the repos asked for (`--repo`); the rest get a
+    # config-only line (review A1).
+    selected = list(repos) if repos is not None else list(cfg.repos.repos)
+    lists_jev = {r for r, pol in cfg.repos.repos.items() if JEV in pol.decider}
+    cloudflare_used = any(vis[r] for r in lists_jev if r in vis)  # of the repos read
+    or_key = secrets.get("OPENROUTER_API_KEY")
+    if or_key:
         out.append(
-            Check(
-                name,
-                bool(secrets.get(name)),
-                "" if secrets.get(name) else "missing: Jev off, Haiku covers",
+            _safe(
+                "OPENROUTER_API_KEY",
+                lambda: (
+                    http.get(
+                        "https://openrouter.ai/api/v1/key",
+                        headers={"Authorization": f"Bearer {or_key}"},
+                        timeout=TIMEOUT,
+                    ).status_code
+                    == 200,
+                    "GET /api/v1/key",
+                ),
             )
+        )
+    else:
+        out.append(Check("OPENROUTER_API_KEY", False, "missing: Jev off for public repos"))
+    account, cf_token = secrets.get("CLOUDFLARE_ACCOUNT_ID"), secrets.get("CLOUDFLARE_API_TOKEN")
+    if account and cf_token:
+        note = "" if cloudflare_used else "unused: no private repo lists jev-cloudflare"
+
+        def cf_verify() -> tuple[bool, str]:
+            """A free token check: the user endpoint, then the account's (an
+            account-owned token answers only there)."""
+            hdr2 = {"Authorization": f"Bearer {cf_token}"}
+            base = "https://api.cloudflare.com/client/v4"
+            for url in (f"{base}/user/tokens/verify", f"{base}/accounts/{account}/tokens/verify"):
+                r = http.get(url, headers=hdr2, timeout=TIMEOUT)
+                if r.status_code == 200 and r.json().get("success"):
+                    return True, note
+            return False, "token verify refused"
+
+        out.append(_safe("CLOUDFLARE_ACCOUNT_ID+CLOUDFLARE_API_TOKEN", cf_verify))
+    elif cloudflare_used:
+        out.append(Check("CLOUDFLARE_ACCOUNT_ID+CLOUDFLARE_API_TOKEN", False,
+                         "missing: Jev off for private repos"))  # fmt: skip
+    else:
+        out.append(Check("CLOUDFLARE_ACCOUNT_ID+CLOUDFLARE_API_TOKEN", None,
+                         "no private repo lists jev-cloudflare"))  # fmt: skip
+    from vigild.decider.policy import decider_routes
+    from vigild.decider.wiring import available_routes
+
+    have = available_routes(secrets)
+    for repo in cfg.repos.repos:
+        if repo not in selected:
+            out.append(Check(f"decider: {repo} (not checked: not selected)", None,
+                             f"configured: {', '.join(cfg.repo(repo).decider)}"))  # fmt: skip
+            continue
+        private = vis.get(repo, True)  # unread: private (fail closed)
+        how = ("private" if private else "public") + (", live" if repo in vis else ", unread")
+        primary, escalation = decider_routes(cfg, repo, have, private=private)
+        tail = f" ({escalation} escalation)" if escalation else ""
+        out.append(
+            Check(f"decider: {repo} ({how}) → {primary or 'none'}{tail}", primary is not None)
         )
 
     if secrets.get("PHOENIX_ADMIN_SECRET"):

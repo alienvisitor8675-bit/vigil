@@ -29,3 +29,9 @@ local_labels: [tests, docs, deps, lint, copy, ui-small]
 xs_labels: [docs, lint]
 escalate_attempt: 3
 escalate_review_rounds: 2
+# While a preset's backend breaker is open, its work goes to the first
+# healthy preset here (plan 2a, item 4). A tier with none pauses dispatch.
+fallbacks:
+  claude-sonnet: [claude-opus]
+  claude-opus: [claude-sonnet]
+  claude-haiku: [claude-sonnet]

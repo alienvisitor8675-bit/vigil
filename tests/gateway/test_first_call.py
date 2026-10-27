@@ -78,3 +78,19 @@ def test_a_hidden_tests_cap_that_no_longer_fits_is_refused_at_submission(cfg: Co
     cfg.budgets.hidden_tests_session_usd = 0.20
     (msg,) = refusals(cfg, REPO)
     assert "hidden_test_author" in msg and "$0.20" in msg
+
+
+def test_reviews_are_checked_against_the_day_not_the_task_cap(cfg: Config) -> None:
+    # 2a: reviews sit outside the task's cap and an over-cap review grows against the
+    # day and the month, so the day is the only cap a review's first call must fit
+    cfg.budgets.per_task_usd = 0.30
+    roles = {r.role: r for r in first_calls(cfg)}
+    for role in ("reviewer", "auditor"):
+        assert roles[role].limit_usd == cfg.budgets.daily_usd
+    assert not [m for m in refusals(cfg, REPO) if m.startswith(("reviewer", "auditor"))]
+
+
+def test_a_review_that_could_never_fit_a_day_is_refused_at_submission(cfg: Config) -> None:
+    cfg.budgets.daily_usd = 0.50
+    msgs = refusals(cfg, REPO)
+    assert any(m.startswith("auditor") and "$0.50" in m for m in msgs)
