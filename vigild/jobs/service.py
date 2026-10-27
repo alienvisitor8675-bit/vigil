@@ -31,6 +31,7 @@ from vigild.intake.paths import matches_any
 from vigild.intake.scoring import IntakeOutcome, score
 from vigild.intake.spec_gate import check_job_spec, check_task, runner_files_named
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec
+from vigild.jobs.fixfindings import MAX_PICKED, pick, selectable
 from vigild.jobs.fsm import Actor, TransitionError, transition
 from vigild.jobs.model import InboxItem, Job, JobState
 from vigild.jobs.ownernote import NOTE_MAX_BYTES
@@ -46,6 +47,10 @@ class Runner(Protocol):
     def on_resume(self, job_id: str, *, replan: bool = False) -> str | None: ...
     def on_rebuild(self, repo: str, base_sha: str) -> None: ...
     def busy(self, job_id: str) -> bool: ...
+    def fix_pr_state(self, job_id: str, task_id: str) -> str | None: ...
+    def fix_check(self, job_id: str, task_id: str) -> str | None: ...
+    def fix_escalation(self, job_id: str, task_id: str) -> str | None: ...
+    def prepare_fix(self, job_id: str, task_id: str) -> int: ...
 
 
 class SubmitError(ValueError):
@@ -194,6 +199,8 @@ class JobService:
         # how each job's last resume, retry or re-plan ran: "started", or
         # "queued" behind its current run (2a round 3), for the API to say
         self.last_run: dict[str, str | None] = {}
+        # the owner's fix round that moves the task to a pricier backend says so
+        self.last_notice: dict[str, str | None] = {}
 
     # --- submissions ----------------------------------------------------------
 
@@ -724,6 +731,125 @@ class JobService:
         self._offered(item_id, "retry")
         return self.resume(item_id)
 
+    @staticmethod
+    def _check_note(note: object) -> None:
+        """An owner note is non-empty text of at most NOTE_MAX_BYTES."""
+        if not isinstance(note, str) or not note.strip():
+            raise BadNote("the note must be non-empty text")
+        try:
+            size = len(note.encode())
+        except UnicodeEncodeError as e:  # a lone surrogate is not text
+            raise BadNote("the note is not valid text") from e
+        if size > NOTE_MAX_BYTES:
+            raise NoteTooLarge(f"the note is over {NOTE_MAX_BYTES} bytes")
+
+    def fix(self, item_id: int, task_id: object, findings: object, note: object = None) -> Job:
+        """ "Fix with findings" (owner, 2026-10-27): a reviewed PR goes back to its worker
+        with findings the owner chose from its review and audit, and a note. It is the
+        2a fix round: the same branch and PR, then the verifier, a re-review and a
+        re-audit, on what is left of the task's cap. The job goes ready -> building ->
+        in_review -> ready, each move an event, and the round counts in `review_rounds`
+        (past the review-round limit the fix is refused, as a review's own is paged).
+        Everything is validated before any side effect, and GitHub's live view of the
+        PR is read before the transaction opens, never inside it. The findings are model
+        text and are fenced for the worker; the note is the owner's,
+        stored verbatim as a human artifact."""
+        if not isinstance(task_id, str) or not task_id:
+            raise BadNote("task_id must be a task's id")
+        if not isinstance(findings, list) or not findings or len(findings) > MAX_PICKED:
+            raise BadNote(f"findings must be a list of 1 to {MAX_PICKED} ids or indexes")
+        if note is not None:
+            self._check_note(note)
+        live: str | None = None
+        try:  # the live PR check is a network call: outside the transaction below
+            peek = self.store.get_inbox_item(item_id)
+            if peek.job_id is not None and task_id in {
+                p.get("task_id") for p in peek.body.get("prs") or []
+            }:
+                live = self.runner.fix_pr_state(peek.job_id, task_id)
+        except KeyError:
+            pass  # the transaction refuses it
+        with self.store.tx():
+            try:
+                item = self.store.get_inbox_item(item_id)
+            except KeyError as e:
+                raise NotFound(item_id) from e
+            if item.queue != "ready" or item.kind != "ready_to_merge" or item.job_id is None:
+                raise Conflict(f"inbox item {item_id} is not a ready-to-merge item")
+            if item.status != "open":
+                raise Conflict(f"inbox item {item_id} is {item.status}")
+            job = self.store.get_job(item.job_id)
+            if self.runner.busy(job.id):
+                raise Conflict(f"{job.id} is being worked on; try again in a moment")
+            if job.state is not JobState.READY:
+                raise Conflict(f"{job.id} is {job.state.value}; only a ready job takes a fix")
+            if task_id not in {p.get("task_id") for p in item.body.get("prs") or []}:
+                raise Conflict(f"{task_id} is not a task of inbox item {item_id}")
+            try:
+                task = self.store.get_task(task_id)
+            except KeyError as e:
+                raise Conflict(f"no task {task_id}") from e
+            if task.job_id != job.id or task.state != "reviewed":
+                raise Conflict(
+                    f"{task_id} is {task.state}, not reviewed with an open PR; "
+                    "a merged or closed PR can't be fixed"
+                )
+            try:
+                chosen = pick(selectable(self.store, job.id, task_id), findings)
+            except ValueError as e:
+                raise Conflict(str(e)) from e
+            if live is not None:
+                raise Conflict(live)
+            if (why := self.runner.fix_check(job.id, task_id)) is not None:
+                raise Conflict(why)
+            notice = self.runner.fix_escalation(job.id, task_id)
+            rnd = self.runner.prepare_fix(job.id, task_id)
+            head = self._task_head(task_id)
+            self.store.add_artifact(
+                job.id,
+                "findings.json",
+                json.dumps({"round": rnd, "head": head, "source": "owner", "findings": chosen}),
+                Provenance.CLAUDE,
+                task_id=task_id,
+            )  # fmt: skip  (the text is the reviewer's and auditor's; the pick is the owner's)
+            data: dict[str, Any] = {
+                "inbox_item_id": item_id, "task_id": task_id, "round": rnd,
+                "findings": [f["id"] for f in chosen],
+            }  # fmt: skip
+            if notice is not None:
+                data["notice"] = notice
+            if note is not None:
+                assert isinstance(note, str)
+                self.store.add_artifact(
+                    job.id, "fix_note.json", json.dumps({"round": rnd, "note": note}),
+                    Provenance.HUMAN, task_id=task_id,
+                )  # fmt: skip
+                data |= {
+                    "note_bytes": len(note.encode()),
+                    "note_sha256": hashlib.sha256(note.encode()).hexdigest(),
+                }
+            try:
+                job = transition(
+                    self.store, job.id, JobState.BUILDING, Actor.OWNER, channel="inbox",
+                    evidence={"inbox_item_id": item_id, "action": "fix",
+                              "findings": {task_id: len(chosen)}},
+                )  # fmt: skip
+            except TransitionError as e:
+                raise Conflict(str(e)) from e
+            self.store.add_event("fix_with_findings", data, Provenance.HUMAN, job_id=job.id,
+                                 task_id=task_id)  # fmt: skip
+            self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+        self.last_notice[job.id] = notice
+        self.last_run[job.id] = self.runner.on_resume(job.id)
+        return job
+
+    def _task_head(self, task_id: str) -> str | None:
+        rows = self.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='pr_open' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        )
+        return str(json.loads(rows[0]["data"])["head"]) if rows else None
+
     def replan(self, item_id: int, note: str | None = None) -> Job:
         """Send a job back to the coord. A held job (a failed build) goes back with
         the failures in the packet; a job waiting on its spec item goes back only
@@ -731,14 +857,7 @@ class JobService:
         stays `spec_pending`). With a note the coord amends the previously approved
         spec instead of redrafting it: the note is the owner's, stored verbatim."""
         if note is not None:
-            if not isinstance(note, str) or not note.strip():
-                raise BadNote("the note must be non-empty text")
-            try:
-                size = len(note.encode())
-            except UnicodeEncodeError as e:  # a lone surrogate is not text
-                raise BadNote("the note is not valid text") from e
-            if size > NOTE_MAX_BYTES:
-                raise NoteTooLarge(f"the note is over {NOTE_MAX_BYTES} bytes")
+            self._check_note(note)
         with self.store.tx():
             try:
                 peek = self.store.get_inbox_item(item_id)
