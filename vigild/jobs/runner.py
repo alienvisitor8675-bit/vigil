@@ -77,6 +77,7 @@ from vigild.intake.spec_gate import test_cmd_problem
 from vigild.jobs.acceptance import NO_HIDDEN, check_worker, escalates
 from vigild.jobs.artifacts import parse_plan, render
 from vigild.jobs.deps import infer_deps, is_lockfile
+from vigild.jobs.fixfindings import selectable
 from vigild.jobs.fsm import HAS_OPEN_PR, Actor, TransitionError, plan_gaps, transition
 from vigild.jobs.model import FixDepthExceeded, Job, JobState, Role, SessionRow
 from vigild.jobs.ownernote import author_contract, spec_body, spec_diff
@@ -2067,7 +2068,11 @@ class JobRunner:
 
     def remaining(self, task_id: str) -> tuple[float, float, float]:
         """(cap, spent, left) for a task: a retry gets what's left, never a fresh cap."""
-        cap = float(self.store.get_task(task_id).contract["limits"]["max_cost_usd"])
+        # the contract's cap, and never more than the task cap in budgets.yaml
+        cap = min(
+            float(self.store.get_task(task_id).contract["limits"]["max_cost_usd"]),
+            self.cfg.budgets.per_task_usd,
+        )
         spent = self.budget.task_spent(task_id)
         return cap, spent, max(0.0, cap - spent)
 
@@ -2720,21 +2725,24 @@ class JobRunner:
         except PublishError as e:
             return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})
         self.store.update_session(s.id, status="pr_open", pr_url=url, detail={"head": head})
-        self.store.update_task(task_id, state="pr_open")
-        self.store.add_event(
-            "pr_open",
-            {
-                "pr_url": url,
-                "branch": branch,
-                "head": head,
-                "runner_file_change": overlap,
-                **self._pub_facts(job.repo, branch, base_sha),
-            },
-            Provenance.HUMAN,
-            job_id=job_id,
-            session_id=s.id,
-            task_id=task_id,
-        )
+        facts = self._pub_facts(job.repo, branch, base_sha)  # vault git: outside the tx
+        # #34: the state and the event with its URL land together, or neither does
+        with self.store.tx():
+            self.store.update_task(task_id, state="pr_open")
+            self.store.add_event(
+                "pr_open",
+                {
+                    "pr_url": url,
+                    "branch": branch,
+                    "head": head,
+                    "runner_file_change": overlap,
+                    **facts,
+                },
+                Provenance.HUMAN,
+                job_id=job_id,
+                session_id=s.id,
+                task_id=task_id,
+            )
         return True
 
     # --- deps jobs (phase 2a, item 5; B39) ------------------------------------------------
@@ -2885,12 +2893,13 @@ class JobRunner:
         self.store.update_session(
             s.id, status="pr_open", pr_url=url, ended_at=iso(), detail={"head": head}
         )
-        self.store.update_task(task_id, state="pr_open")
-        self.store.add_event(
-            "pr_open", {"pr_url": url, "branch": branch, "head": head,
-                        **self._pub_facts(job.repo, branch, base_sha)},
-            Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
-        )  # fmt: skip
+        facts = self._pub_facts(job.repo, branch, base_sha)  # vault git: outside the tx
+        with self.store.tx():  # #34: the state and its event together
+            self.store.update_task(task_id, state="pr_open")
+            self.store.add_event(
+                "pr_open", {"pr_url": url, "branch": branch, "head": head, **facts},
+                Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
+            )  # fmt: skip
         return True
 
     def poll_prs(self) -> list[str]:
@@ -3087,7 +3096,64 @@ class JobRunner:
         doc = json.loads(art.content)
         if int(doc.get("round", 0)) != rounds:
             return None
-        return {"round": rounds, "findings": doc.get("findings") or []}
+        out: dict[str, Any] = {"round": rounds, "findings": doc.get("findings") or []}
+        if doc.get("source") == "owner":  # "fix with findings": the owner's pick and note
+            out["owner"] = True
+            note = self.store.get_artifact(t.job_id, "fix_note.json", t.id)
+            if note is not None and int(json.loads(note.content).get("round", 0)) == rounds:
+                out["note"] = json.loads(note.content)["note"]
+        return out
+
+    def fix_pr_state(self, job_id: str, task_id: str) -> str | None:
+        """Why the owner's fix can't start because of GitHub's live view of the task's
+        PR (merged or closed since vigild's poll), if it can't. This is a network
+        call: the caller makes it outside any DB transaction."""
+        if self.pr_state is not None and (url := self._task_pr(task_id)):
+            try:
+                st = self.pr_state(self.store.get_job(job_id).repo, url)
+            except Exception:
+                st = "open"  # the poll will see it; the fix round's push will fail if not
+            if st in ("merged", "closed"):
+                return f"the PR of {task_id} is {st}"
+        return None
+
+    def fix_check(self, job_id: str, task_id: str) -> str | None:
+        """Why the owner's "fix with findings" can't start for a task, from vigild's
+        recorded state only (no network): it has used its review-round limit (the one
+        a review's own fix rounds hit), or too little of its cap is left."""
+        t = self.store.get_task(task_id)
+        limit = self.cfg.routing.escalate_review_rounds
+        used = int(t.contract.get("review_rounds") or 0)
+        if used >= limit:
+            return (
+                f"{task_id} has used its {limit} review rounds (the limit "
+                f"routing.escalate_review_rounds); replan, or merge as is"
+            )
+        cap, spent, left = self.remaining(task_id)
+        if t.contract.get("shape") != "deps" and left < MIN_RETRY_USD:
+            return (
+                f"task {task_id} has ${left:.2f} of its ${cap:.2f} cap left "
+                f"(${spent:.2f} spent); a fix round needs at least ${MIN_RETRY_USD:.2f}"
+            )
+        return None
+
+    def fix_escalation(self, job_id: str, task_id: str) -> str | None:
+        """The notice for the owner when the next fix round would trip routing rule 5
+        and move the task to a pricier backend, else None."""
+        t = self.store.get_task(task_id)
+        rnd = int(t.contract.get("review_rounds") or 0) + 1
+        r = route(Task.model_validate({**t.contract, "review_rounds": rnd}), self.cfg)
+        if r.tier_reason.startswith("rule5") and not str(t.tier_reason or "").startswith("rule5"):
+            return f"this round runs on {r.preset} (escalated)"
+        return None
+
+    def prepare_fix(self, job_id: str, task_id: str) -> int:
+        """Count the owner's fix as a review round and route the task again, as a
+        review that sent findings back does (rule 5 applies at the second round).
+        Returns the round."""
+        rnd = int(self.store.get_task(task_id).contract.get("review_rounds") or 0) + 1
+        self._reroute_for_round(job_id, task_id, rnd)
+        return rnd
 
     def review(self, job_id: str) -> None:
         """Review every published task at its head (a Sonnet reviewer, fresh
@@ -3416,13 +3482,16 @@ class JobRunner:
                     "rung": review.get("rung"),
                     "review_rounds": review.get("round"),
                     "findings": len(review.get("findings") or []),
+                    # what the owner can send back with "fix with findings"
+                    "selectable": selectable(self.store, job_id, t.id),
                     "audited": audit is not None,
                     "match_rate": round(audit.match_rate(), 3) if audit else None,
                 }
             )
         self.store.create_inbox_item(
-            "ready", "ready_to_merge", job_id, f"Ready to merge: {job.title}", {"prs": prs}
-        )
+            "ready", "ready_to_merge", job_id, f"Ready to merge: {job.title}",
+            {"prs": prs, "actions": ["fix"]},
+        )  # fmt: skip
 
     def _review_task(self, job: Any, t: Any) -> tuple[str, Any]:
         """One task's review (and audit, when sampled): ("clean" | "fix" |

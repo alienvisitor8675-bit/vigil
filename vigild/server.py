@@ -66,6 +66,18 @@ class NullRunner:
     def busy(self, job_id: str) -> bool:
         return False
 
+    def fix_pr_state(self, job_id: str, task_id: str) -> str | None:
+        return None
+
+    def fix_escalation(self, job_id: str, task_id: str) -> str | None:
+        return None
+
+    def fix_check(self, job_id: str, task_id: str) -> str | None:
+        return "no runner is attached; a fix round can't run"
+
+    def prepare_fix(self, job_id: str, task_id: str) -> int:
+        raise RuntimeError("no runner attached")
+
 
 @dataclass
 class Vigild:
