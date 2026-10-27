@@ -19,6 +19,10 @@
 # refused at the spec gate.
 repos:
   thomasbardhi01/parkagent:
+    # owner, 2026-10-27: an open issue labelled vigil:ready becomes a job (a coord
+    # drafts its spec; nothing runs past spec_pending without the owner's approval).
+    # Anyone who can label ParkAgent issues can start that draft.
+    intake: true
     decider: [haiku, jev]
     backends: [claude-sonnet, claude-opus, claude-haiku]
     worker_overflow: []

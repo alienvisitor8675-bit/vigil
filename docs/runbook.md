@@ -534,7 +534,10 @@ uv run python -m vigild
   `configs/repos.yaml`. Then every five minutes vigild turns each open
   issue labelled `vigil:ready` into a job, once; `value:N` and `risk:N`
   labels score it (3 each by default). Anyone who can label issues there
-  can start work, so turn it on only where that's you. An issue that
+  can start work, so turn it on only where you trust everyone with triage
+  access. A labelled issue starts a coord draft (up to `coord_session_usd`,
+  $2, against the day); nothing runs past `spec_pending` until you approve
+  the spec. On today: `thomasbardhi01/parkagent` (owner, 2026-10-27). An issue that
   already has a job is skipped, matched by the job's `issue` field, and so is
   a second `POST /api/jobs` for it (409). Every job not abandoned blocks,
   merged and done included: a merged job's issue is not re-taken by label;

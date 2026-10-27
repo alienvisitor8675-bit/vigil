@@ -37,6 +37,13 @@ ISSUE = {
 }
 
 
+def _intake_on_fixture_only(cfg: Config) -> None:
+    # the fake issue source answers for any repo, so only the fixture repo is polled
+    for pol in cfg.repos.repos.values():
+        pol.intake = False
+    cfg.repos.repos[REPO].intake = True
+
+
 @pytest.fixture
 def intake(cfg: Config, store: Store, runner: RecordingRunner) -> tuple[LabelIntake, FakeIssues]:
     cfg.repos.repos[REPO] = RepoPolicy(
@@ -44,6 +51,7 @@ def intake(cfg: Config, store: Store, runner: RecordingRunner) -> tuple[LabelInt
         dev_dockerfile="images/dev/vigil.Dockerfile", dev_lockfiles=["uv.lock"],
         dev_suites={"smoke": "true"}, dev_image_tools=["pytest"], intake=True,
     )  # fmt: skip
+    _intake_on_fixture_only(cfg)
     issues = FakeIssues([ISSUE, {"number": 8, "title": "a PR", "pull_request": {}}])
     return LabelIntake(cfg, store, JobService(cfg, store, runner), issues), issues
 
@@ -63,7 +71,7 @@ def test_a_labelled_issue_becomes_a_job_exactly_once(
     assert "IGNORE ALL" not in job.request
     issue = json.loads(store.get_artifact(job_id, "issue.json").content)  # type: ignore[union-attr]
     assert issue["number"] == 7 and "IGNORE ALL" in issue["body"]
-    # only repos that take intake are polled (parkagent and vigil don't, by default)
+    # only repos that take intake are polled (here, the fixture repo alone)
     assert {r for r, _ in issues.asked} == {REPO}
 
 
@@ -89,7 +97,7 @@ def test_a_refused_issue_is_claimed_and_not_retried(
 
 def test_the_coord_reads_the_issue_fenced(world: World) -> None:
     w = world
-    w.runner.cfg.repos.repos[REPO].intake = True
+    _intake_on_fixture_only(w.runner.cfg)
     li = LabelIntake(w.runner.cfg, w.store, w.runner.jobs, FakeIssues([ISSUE]))  # type: ignore[arg-type]
     (job_id,) = li.poll()
     (coord,) = [s for s in w.standin.specs if s.job_id == job_id]
@@ -171,6 +179,17 @@ def test_a_failure_after_the_claim_pages_and_never_loses_the_issue(
     li.decider = None  # fixed: the next poll makes the job
     (job_id,) = li.poll()
     assert runner.created == [job_id]
+
+
+def test_the_shipped_config_takes_label_intake_on_parkagent_only() -> None:
+    # owner, 2026-10-27: ParkAgent jobs can start from the vigil:ready label; the
+    # vigil repo itself still starts only through POST /api/jobs
+    from vigild.config import load
+
+    cfg = load()
+    takes = sorted(r for r, pol in cfg.repos.repos.items() if pol.intake)
+    assert takes == ["thomasbardhi01/parkagent"]
+    assert LABEL == "vigil:ready"
 
 
 # --- an issue that already has a job is not taken again (owner, 2026-10-27) ------

@@ -529,7 +529,8 @@ done-when run on ParkAgent completes against `main`.
   - the scheduler (dependency graph, three in parallel);
   - the WIP limit of 4;
   - escalation that forks full context;
-  - `vigil:ready` label intake.
+  - `vigil:ready` label intake (on for ParkAgent only, owner 2026-10-27;
+    `configs/repos.yaml` `intake: true`).
 - **Clients:** the `vigil` CLI (`run`, `batch`, `ls --live`, `trace`,
   `kill`) and `vigil mcp`.
 - **Session proxy:** read and join a live session's transcript; your
