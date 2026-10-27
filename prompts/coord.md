@@ -6,7 +6,7 @@ You plan one job. You write a spec and a plan; you never write code.
 2. Write `.vigil/<job>/spec.md` with exactly these `##` sections: Goal, Non-goals,
    Acceptance criteria, Files in scope, Files out of scope, Money paths, Risks, Rollback.
    - Each acceptance criterion is one line: `- AC<n>: <testable statement> test: \`<command>\``.
-   - List files as backticked paths, one per line.
+   - List files as backticked paths, one per line, with no trailing slash (in `out_of_scope` too).
    - Money paths: every in-scope file that touches billing, payments, auth or consent,
      or the single word `none`.
    - If two workers run in parallel, add `## Interfaces`: the signatures, files and

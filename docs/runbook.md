@@ -477,7 +477,11 @@ uv run python -m vigild
     containers removed, reservations settled, mid-flight jobs blocked with a
     page in the inbox (retry, re-plan or abandon), an `in_review` job whose plan has a
     task with no open PR paged (re-plan or abandon), a draft whose coord died
-    paged (retry or cancel);
+    paged (retry or cancel), and a draft stuck in `spec_pending` with no open
+    inbox item (its coord failed and the page was resolved) paged once with
+    **re-plan** and **abandon** ("pa-NNNN is waiting for a spec that was never
+    drafted"); the same check runs every 10 minutes. A task whose PR has merged
+    is never reviewed;
   - starts approved builds that never began, once the gateway is listening;
   - **resumes** building jobs a restart cut off when that's safe: their
     workers' image is unchanged, each has at least $0.05 of its cap left,
@@ -559,7 +563,10 @@ uv run python -m vigild
   `configs/repos.yaml`. Then every five minutes vigild turns each open
   issue labelled `vigil:ready` into a job, once; `value:N` and `risk:N`
   labels score it (3 each by default). Anyone who can label issues there
-  can start work, so turn it on only where that's you. An issue that
+  can start work, so turn it on only where you trust everyone with triage
+  access. A labelled issue starts a coord draft (up to `coord_session_usd`,
+  $2, against the day); nothing runs past `spec_pending` until you approve
+  the spec. On today: `thomasbardhi01/parkagent` (owner, 2026-10-27). An issue that
   already has a job is skipped, matched by the job's `issue` field, and so is
   a second `POST /api/jobs` for it (409). Every job not abandoned blocks,
   merged and done included: a merged job's issue is not re-taken by label;

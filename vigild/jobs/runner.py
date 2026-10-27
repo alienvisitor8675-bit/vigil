@@ -78,7 +78,7 @@ from vigild.jobs.acceptance import NO_HIDDEN, check_worker, escalates
 from vigild.jobs.artifacts import parse_plan, render
 from vigild.jobs.deps import infer_deps, is_lockfile
 from vigild.jobs.fixfindings import selectable
-from vigild.jobs.fsm import Actor, TransitionError, plan_gaps, transition
+from vigild.jobs.fsm import HAS_OPEN_PR, Actor, TransitionError, plan_gaps, transition
 from vigild.jobs.model import FixDepthExceeded, Job, JobState, Role, SessionRow
 from vigild.jobs.ownernote import author_contract, spec_body, spec_diff
 from vigild.metering.calls import last_call_truncated, session_cost
@@ -548,7 +548,9 @@ class JobRunner:
                     resumable=True,
                 )
                 out["held"] += 1
-            elif job.state is JobState.IN_REVIEW and (gaps := plan_gaps(self.store, job.id)):
+            elif job.state is JobState.IN_REVIEW and (
+                gaps := plan_gaps(self.store, job.id, (*HAS_OPEN_PR, "merged"))
+            ):
                 # stuck in review with a plan task that has no PR (finding #4): page it
                 self._hold_without_pr(job.id, gaps, "found at start")
                 out["held"] += 1
@@ -560,8 +562,34 @@ class JobRunner:
             elif job.state is JobState.APPROVED:
                 self.deferred.append(job.id)
                 out["rebuilt"] += 1
+        out["stranded"] = len(self.page_stranded_drafts())
         self.store.add_event("reconcile", out, Provenance.HUMAN)
         return out
+
+    def page_stranded_drafts(self, grace_seconds: int = 0) -> list[str]:
+        """Page every `spec_pending` job with no open inbox item and no run going: its coord
+        failed before writing a spec and its failure page was resolved, so nothing offers
+        the owner a way out (pa-0001). One page each, with replan (the coord runs again on
+        the original request) and abandon; a job with any open item is not paged again.
+        Runs at start and on the periodic sweep (which leaves a job younger than
+        `grace_seconds` alone: its first coord may be about to start). Returns the jobs."""
+        cutoff = utcnow().timestamp() - grace_seconds
+        paged: list[str] = []
+        for job in self.store.list_jobs():
+            if job.state is not JobState.SPEC_PENDING or self.busy(job.id):
+                continue
+            if datetime.fromisoformat(job.created_at).timestamp() > cutoff:
+                continue
+            if any(i.job_id == job.id for i in self.store.list_inbox()):
+                continue
+            self._page(
+                job.id,
+                f"{job.id} is waiting for a spec that was never drafted",
+                {"kind": "stranded_draft", "state": job.state.value,
+                 "actions": ["replan", "abandon"]},
+            )  # fmt: skip
+            paged.append(job.id)
+        return paged
 
     def _reservation_live(
         self, r: sqlite3.Row, stages: set[int], *, restarted: bool = False
@@ -3141,7 +3169,15 @@ class JobRunner:
         # passes of at most REVIEW_PASS_TASKS (owner, 2026-10-23): each reserves
         # for its own tasks, the next only after the last one's stage went back
         while True:
-            tasks = [t for t in self.store.list_tasks(job_id) if t.state == "pr_open"]
+            tasks = self._reviewable(job_id)
+            if not tasks and self._all_merged(job_id):
+                # nothing to review: every PR has merged. No stage, no session; the PR
+                # poll moves the job to merged
+                self.store.add_event(
+                    "review_skipped", {"why": "every task's PR has merged"},
+                    Provenance.HUMAN, job_id=job_id,
+                )  # fmt: skip
+                return
             batch = tasks[:REVIEW_PASS_TASKS]
             result = self._review_stage(job_id, job, batch, more=len(tasks) > len(batch))
             if result == "dispatch":
@@ -3151,6 +3187,37 @@ class JobRunner:
             if result != "next":
                 return
             job = self.store.get_job(job_id)
+
+    def page_stranded_drafts_sweep(self) -> list[str]:
+        """The periodic form: a draft younger than 10 minutes is left to its first coord."""
+        return self.page_stranded_drafts(grace_seconds=600)
+
+    def _pr_merged(self, t: Any) -> bool:
+        """The task's PR has merged: its row says so, or the poll saw it merged."""
+        if t.state == "merged":
+            return True
+        row = self.store.q(
+            "SELECT 1 FROM events WHERE task_id=? AND type='pr_merged' LIMIT 1", (t.id,)
+        )
+        return bool(row)
+
+    def _reviewable(self, job_id: str) -> list[Any]:
+        """The tasks a review pass may take: open PRs only. A task whose PR has merged is
+        never reviewed (owner's rule); one the poll saw merged but whose row lags is
+        brought up to date here."""
+        out: list[Any] = []
+        for t in self.store.list_tasks(job_id):
+            if t.state != "pr_open":
+                continue
+            if self._pr_merged(t):
+                self.store.update_task(t.id, state="merged")
+                continue
+            out.append(t)
+        return out
+
+    def _all_merged(self, job_id: str) -> bool:
+        live = [t for t in self.store.list_tasks(job_id) if t.state not in DEAD_TASK]
+        return bool(live) and all(t.state == "merged" for t in live)
 
     def _review_stage(self, job_id: str, job: Job, tasks: list[Any], *, more: bool) -> str:
         """One pass's review stage: one reservation for its tasks (owner,
@@ -3426,6 +3493,8 @@ class JobRunner:
         """One task's review (and audit, when sampled): ("clean" | "fix" |
         "failed", detail). Never raises: a vigild error is a failed review."""
         try:
+            if self._pr_merged(self.store.get_task(t.id)):
+                return "clean", "merged"  # its PR merged since the pass was chosen
             return self._review_one(job, t)
         except Exception as e:
             log.exception("review of %s failed", t.id)

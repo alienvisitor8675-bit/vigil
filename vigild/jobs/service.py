@@ -870,13 +870,16 @@ class JobService:
             else:
                 item = self._offered(item_id, "replan")
                 assert item.job_id is not None
-                try:
-                    job = transition(
-                        self.store, item.job_id, JobState.SPEC_PENDING, Actor.OWNER,
-                        channel="inbox", evidence={"inbox_item_id": item_id, "action": "replan"},
-                    )  # fmt: skip
-                except TransitionError as e:
-                    raise Conflict(str(e)) from e
+                job = self.store.get_job(item.job_id)
+                if job.state is not JobState.SPEC_PENDING:  # a stranded draft already is
+                    try:
+                        job = transition(
+                            self.store, item.job_id, JobState.SPEC_PENDING, Actor.OWNER,
+                            channel="inbox",
+                            evidence={"inbox_item_id": item_id, "action": "replan"},
+                        )  # fmt: skip
+                    except TransitionError as e:
+                        raise Conflict(str(e)) from e
                 self._record_replan(job.id, item_id, note, item.body.get("tasks") or {})
                 self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
         self.last_run[job.id] = self.runner.on_resume(job.id, replan=True)
