@@ -452,7 +452,11 @@ uv run python -m vigild
     containers removed, reservations settled, mid-flight jobs blocked with a
     page in the inbox (retry, re-plan or abandon), an `in_review` job whose plan has a
     task with no open PR paged (re-plan or abandon), a draft whose coord died
-    paged (retry or cancel);
+    paged (retry or cancel), and a draft stuck in `spec_pending` with no open
+    inbox item (its coord failed and the page was resolved) paged once with
+    **re-plan** and **abandon** ("pa-NNNN is waiting for a spec that was never
+    drafted"); the same check runs every 10 minutes. A task whose PR has merged
+    is never reviewed;
   - starts approved builds that never began, once the gateway is listening;
   - **resumes** building jobs a restart cut off when that's safe: their
     workers' image is unchanged, each has at least $0.05 of its cap left,
