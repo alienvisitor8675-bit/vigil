@@ -16,7 +16,7 @@ The phase 1 done-when, run end to end on a real repo through vigild only:
 | Fri 2026-10-23 | **w1 (doc fixes) PR merged:** ParkAgent #316. w2 (the checker) failed acceptance: findings #1 and #2. |
 | Fri–Mon | Hotfixes #16, #17, #18, #19, #21, #22 and #25. ADR-0003 (#24) moved hidden-test hardening to its own track. |
 | Mon 2026-10-26 | Replan with an owner note, which hit finding #4 (fixed by #25). Replanned again, and w3 built. |
-| Mon 2026-10-26 | **w3 (the checker) PR merged:** ParkAgent #319, after the owner reviewed it by hand. Hidden tests were disabled. |
+| Tue 2026-10-27 | **w3 (the checker) PR merged:** ParkAgent #319, after the owner reviewed it by hand. Hidden tests were disabled. pa-0002 moved to `merged` on vigild's next PR poll. |
 
 **Cost:**
 - **Metered:** $3.71 for `pa-0002`, across its coord, worker and verifier attempts.
@@ -31,7 +31,7 @@ The phase 1 done-when, run end to end on a real repo through vigild only:
 | 0b | The live DB's schema version was set by another branch, so main skipped a migration, and every call's metering failed silently. | coordination | #16: every idempotent migration runs on start; a metering failure fails closed | fixed |
 | 1 | **Unstable test IDs.** A suite put a generated key in its test titles, so test IDs differed between runs and the executed-tests ⊇ base check could never match. A secondary leak: unredacted PEM key blocks in an inbox body. | verification | #17: two base runs, unstable IDs matched by count; `redact` covers PEM; a scrub migration | fixed |
 | 2 | **Runner-file tasks.** A task whose scope was a pinned runner file was verified against base's copy of that file, so the task's own change was never tested. | verification | #18, #19, #21 and #22: flagged tasks, hidden tests (now **disabled by default**), and an owner-review PR | fixed; hidden tests off until ADR-0003 |
-| 3 | **`depends_on` not honoured.** The checker task depended on the doc task but started from base in parallel. | coordination | 2a scheduler (backlog Tier 1) | open (2a) |
+| 3 | **`depends_on` not honoured.** The checker task depended on the doc task but started from base in parallel. | coordination | #28: 2a's graph scheduler starts a task only once every task it depends on has published (B43) | fixed |
 | 4 | **Reused task ID and a silent `in_review`.** A replan renumbered its task to an existing merged ID. Nothing was dispatched, and the job went to `in_review` with no page. | coordination | #25: the plan gate refuses reused IDs; a job enters `in_review` only if every planned task has an open PR; reconcile pages stuck jobs | fixed |
 | 5 | **A test's network cleanup removed the shared OTel collector.** | coordination | #26: tests remove only resources that carry their own per-run label | open |
 
@@ -39,7 +39,7 @@ The phase 1 done-when, run end to end on a real repo through vigild only:
 - **Hidden-run isolation gaps:** several classes of isolation gap between the subject and the test process were found in review and partly fixed, including a shared writable cache path and a service reachable across uids. The remainder, and the separate-subject-container design, are in **ADR-0003 (#24)**. `hidden_tests.enabled` stays off until that series merges with a clean review.
 - **Stale risks in an amended spec:** the coord amended the note's items but kept three risks that had since been answered: broker support, the count question, and the previous failure's cause, which was finding #2, not the interface. Tracked as **2b backlog item 2.12**.
 - **An inactive author contract:** the hidden-test author contract in the amended spec sits inactive while `hidden_tests.enabled` is off.
-- **Job artifacts in ParkAgent:** #316 and #319 both carried `.vigil/pa-0002/` into ParkAgent, and the owner removed them by hand. **Tier 1, first:** keep job artifacts in the vault and strip them before a PR is marked ready.
+- **Job artifacts in ParkAgent:** #316 and #319 both carried `.vigil/pa-0002/` into ParkAgent, and the owner removed them by hand. **Fixed by #30:** job artifacts stay in the vault, and published branches never carry `.vigil/`.
 
 ## What worked
 - **False passes:** the verifier refused three. It refused w2 twice (findings #1 and #2) rather than accept a result it couldn't trust, and it held the w1 retry until unstable IDs were handled.
