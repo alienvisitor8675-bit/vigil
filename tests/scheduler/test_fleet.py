@@ -177,3 +177,23 @@ def test_a_pr_being_recorded_still_holds_its_place(
     job = _run(w, 5)
     assert w.store.get_job(job).state.value == "blocked"
     assert len(w.publisher.prs) == 4
+
+
+def test_a_task_turns_pr_open_and_records_its_pr_in_one_transaction(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#41 review: the gap #34 found is closed at its source as well. The task's
+    `pr_open` state and the `pr_open` event with its URL are written in one
+    transaction, so no reader sees a task that is `pr_open` without its PR."""
+    w = world
+    seen: list[bool] = []
+    real = w.store.add_event
+
+    def add_event(kind: str, *a: Any, **k: Any) -> Any:
+        if kind == "pr_open":
+            seen.append(w.store.conn.in_transaction)
+        return real(kind, *a, **k)
+
+    monkeypatch.setattr(w.store, "add_event", add_event)
+    _run(w, 2)
+    assert seen and all(seen), seen

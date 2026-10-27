@@ -15,9 +15,9 @@ from typing import Any
 from vigild.db import Store
 
 GONE_TASK = ("merged", "closed", "superseded", "abandoned")
-# A task whose PR is open takes its place by state too: the runner sets `pr_open`
-# a statement before it records the event with the URL, and a dispatch pass in
-# that gap must not see the place as free (#34).
+# A task whose PR is open takes its place by state as well as by URL (#34). The
+# runner writes `pr_open` and the event with the URL in one transaction; counting
+# by state keeps the place held even if a future path writes them apart.
 HOLDS_PLACE = ("running", "pr_open", "reviewed")
 CLOSED_JOB = ("merged", "verifying", "done", "abandoned")
 
