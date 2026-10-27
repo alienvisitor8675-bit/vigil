@@ -22,7 +22,15 @@ from vigild.api.auth import (
     require,
 )
 from vigild.db import Store
-from vigild.jobs.service import BadNote, Conflict, JobRequest, NoteTooLarge, NotFound, SubmitError
+from vigild.jobs.service import (
+    BadNote,
+    Conflict,
+    DuplicateIssue,
+    JobRequest,
+    NoteTooLarge,
+    NotFound,
+    SubmitError,
+)
 from vigild.jobs.tree import job_tree
 from vigild.services import Services
 
@@ -133,6 +141,8 @@ def get_task(request: Request, task_id: str) -> dict[str, Any]:
 def submit_job(request: Request, body: JobRequest) -> dict[str, Any]:
     try:
         job = _svc(request).jobs.submit_request(body)
+    except DuplicateIssue as e:
+        raise HTTPException(409, {"errors": e.reasons, "job_id": e.job_id}) from e
     except SubmitError as e:
         raise HTTPException(422, {"errors": e.reasons}) from e
     return _plain(job)  # type: ignore[no-any-return]

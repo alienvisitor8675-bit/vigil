@@ -9,6 +9,12 @@ exactly once. Polled; a webhook comes later.
   creates the job, in one transaction; a second poll, or a second vigild,
   finds the claim. An issue the intake gate refuses is claimed too, with the
   reason, and not retried.
+- **One job per issue:** an issue a job already carries (`jobs.issue`, set by
+  the API's `issue` field or by intake; a unique index allows one job per
+  (repo, issue) that isn't abandoned, merged and done included) is skipped
+  without a claim and noted once per job, so abandoning that job lets the
+  next poll take it. Jobs from before the link have none: label an issue only
+  if it wasn't submitted through the API.
 - **Token:** `issues: read`, one repo, one hour, revoked after each poll.
 - **Scores:** `value:N` and `risk:N` labels. A score no label gives is asked
   of the decider (Jev on OpenRouter for a public repo, Haiku the escalation;
@@ -28,6 +34,7 @@ from typing import Any, Protocol
 from vigild.config import Config
 from vigild.contract.models import Source
 from vigild.db import Store, iso
+from vigild.jobs.service import DuplicateIssue
 from vigild.provenance import Provenance
 
 log = logging.getLogger("vigild.intake")
@@ -119,6 +126,25 @@ class LabelIntake:
             )
         return True
 
+    def _live_job(self, repo: str, number: int) -> str | None:
+        """The job that holds this issue (any state but abandoned), if any."""
+        return self.store.live_job_for_issue(repo, number)
+
+    def _skip(self, repo: str, number: int, job_id: str) -> None:
+        """The issue already has a live job: not claimed (an abandoned job lets
+        the next poll take it), and recorded once per (repo, issue, job)."""
+        seen = self.store.q(
+            "SELECT 1 FROM events WHERE type='intake' AND job_id=?"
+            " AND json_extract(data,'$.repo')=? AND json_extract(data,'$.issue')=?"
+            " AND json_extract(data,'$.already_a_job') IS NOT NULL",
+            (job_id, repo, number),
+        )
+        if not seen:
+            self.store.add_event(
+                "intake", {"repo": repo, "issue": number, "already_a_job": job_id},
+                Provenance.HUMAN, job_id=job_id,
+            )  # fmt: skip
+
     def poll(self) -> list[str]:
         """One pass over every repo that takes label intake; the new job ids."""
 
@@ -135,10 +161,19 @@ class LabelIntake:
                 if "pull_request" in issue or not isinstance(issue.get("number"), int):
                     continue
                 number = int(issue["number"])
+                if (held := self._live_job(repo, number)) is not None:
+                    self._skip(repo, number, held)
+                    continue
                 if not self._claim(repo, number):
                     continue
                 try:
                     job_id = self._take(repo, number, issue)
+                except DuplicateIssue as e:  # an API job landed first: already a job
+                    self.store.x(
+                        "DELETE FROM intake_seen WHERE repo=? AND number=?", (repo, number)
+                    )
+                    self._skip(repo, number, e.job_id)
+                    continue
                 except Exception as e:  # never lose a claimed issue (review B11)
                     self._failed(repo, number, issue, e)
                     continue
@@ -193,6 +228,7 @@ class LabelIntake:
             risk=scores.get("risk", 3),
             source=Source.HUMAN,
             labels=[lb for lb in labels if lb != LABEL and not SCORE.match(lb)],
+            issue=number,
         )
         detail = {
             "number": number,
@@ -203,6 +239,8 @@ class LabelIntake:
         }
         try:
             job = self.jobs.submit_request(req, issue=detail)
+        except DuplicateIssue:
+            raise  # poll() lets the claim go and skips the issue
         except SubmitError as e:
             self._record(repo, number, None, {"refused": e.reasons})
             return None

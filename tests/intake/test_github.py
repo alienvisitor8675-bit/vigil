@@ -190,3 +190,122 @@ def test_the_shipped_config_takes_label_intake_on_parkagent_only() -> None:
     takes = sorted(r for r, pol in cfg.repos.repos.items() if pol.intake)
     assert takes == ["thomasbardhi01/parkagent"]
     assert LABEL == "vigil:ready"
+
+
+# --- an issue that already has a job is not taken again (owner, 2026-10-27) ------
+
+
+def _api_job(li: LabelIntake, repo: str = REPO, issue: int | None = 7) -> str:
+    from vigild.contract.models import Source
+    from vigild.jobs.service import JobRequest
+
+    req = JobRequest(
+        repo=repo, title="via the API", request="r", why="w", value=3, risk=3,
+        source=Source.HUMAN, issue=issue,
+    )  # fmt: skip
+    return str(li.jobs.submit_request(req).id)
+
+
+def _abandon(store: Store, job_id: str) -> None:
+    from vigild.jobs.fsm import Actor, transition
+    from vigild.jobs.model import JobState
+
+    transition(
+        store, job_id, JobState.ABANDONED, Actor.OWNER, channel="inbox",
+        evidence={"action": "abandon"},
+    )  # fmt: skip
+
+
+def _skips(store: Store) -> list[Any]:
+    return [e for e in store.events() if e.type == "intake" and "already_a_job" in e.data]
+
+
+def test_an_issue_with_an_api_job_is_skipped_unclaimed_and_recorded_once(
+    intake: tuple[LabelIntake, FakeIssues], store: Store, runner: RecordingRunner
+) -> None:
+    li, _ = intake
+    api = _api_job(li)
+    assert li.poll() == [] and li.poll() == [] and li.poll() == []
+    assert runner.created == [api]
+    assert store.q("SELECT * FROM intake_seen WHERE number=7") == []  # never claimed
+    (ev,) = _skips(store)  # once across three polls
+    assert ev.data["issue"] == 7 and ev.data["already_a_job"] == api
+    assert store.list_inbox() == []  # no page
+
+
+def test_abandoning_the_job_after_a_skip_lets_the_label_take_the_issue(
+    intake: tuple[LabelIntake, FakeIssues], store: Store
+) -> None:
+    li, _ = intake
+    api = _api_job(li)
+    assert li.poll() == []
+    _abandon(store, api)
+    (job_id,) = li.poll()
+    assert job_id != api and store.get_job(job_id).issue == 7
+    assert li.poll() == []
+
+
+def test_an_api_insert_racing_intake_leaves_one_live_job_and_no_page(
+    intake: tuple[LabelIntake, FakeIssues], store: Store, runner: RecordingRunner
+) -> None:
+    li, _ = intake
+    real = li._live_job
+    made: list[str] = []
+
+    def racy(repo: str, number: int) -> str | None:
+        found = real(repo, number)
+        if not made:  # the API job lands between intake's lookup and its insert
+            made.append(_api_job(li))
+        return found
+
+    li._live_job = racy  # type: ignore[method-assign]
+    assert li.poll() == []
+    assert [j.id for j in store.jobs_for_issue(REPO, 7)] == made
+    assert store.list_inbox() == [] and runner.created == made
+    assert store.q("SELECT * FROM intake_seen WHERE number=7") == []  # the claim is let go
+    assert li.poll() == []
+    assert len(_skips(store)) == 1
+
+
+def test_an_abandoned_job_does_not_block_a_new_one(
+    intake: tuple[LabelIntake, FakeIssues], store: Store
+) -> None:
+    li, _ = intake
+    api = _api_job(li)
+    _abandon(store, api)
+    (job_id,) = li.poll()
+    assert job_id != api and store.get_job(job_id).issue == 7
+
+
+def test_the_same_number_in_another_repo_is_not_blocked(
+    intake: tuple[LabelIntake, FakeIssues], store: Store, cfg: Config
+) -> None:
+    li, _ = intake
+    other = "o/other"
+    cfg.repos.repos[other] = cfg.repos.repos[REPO]
+    _api_job(li, repo=other)
+    (job_id,) = li.poll()
+    assert store.get_job(job_id).repo == REPO
+
+
+def test_an_intake_job_carries_the_issue_link(
+    intake: tuple[LabelIntake, FakeIssues], store: Store
+) -> None:
+    li, _ = intake
+    (job_id,) = li.poll()
+    assert store.get_job(job_id).issue == 7
+    assert store.jobs_for_issue(REPO, 7)[0].id == job_id
+
+
+def test_the_api_takes_only_a_positive_integer_issue() -> None:
+    from pydantic import ValidationError
+
+    from vigild.jobs.service import JobRequest
+
+    base: dict[str, Any] = {"repo": "o/r", "title": "t", "request": "r", "why": "w",
+                            "value": 3, "risk": 3}  # fmt: skip
+    assert JobRequest(**base).issue is None
+    assert JobRequest(**base, issue=320).issue == 320
+    for bad in (0, -1, "7x", 1.5, True):
+        with pytest.raises(ValidationError):
+            JobRequest(**base, issue=bad)

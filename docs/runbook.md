@@ -537,5 +537,12 @@ uv run python -m vigild
   can start work, so turn it on only where you trust everyone with triage
   access. A labelled issue starts a coord draft (up to `coord_session_usd`,
   $2, against the day); nothing runs past `spec_pending` until you approve
-  the spec. On today: `thomasbardhi01/parkagent` (owner, 2026-10-27).
+  the spec. On today: `thomasbardhi01/parkagent` (owner, 2026-10-27). An issue that
+  already has a job is skipped, matched by the job's `issue` field, and so is
+  a second `POST /api/jobs` for it (409). Every job not abandoned blocks,
+  merged and done included: a merged job's issue is not re-taken by label;
+  submit a new job for follow-up work. Label an issue only if it wasn't
+  submitted through the API, or abandon the API job first (jobs from before
+  the field carry none). An issue intake took itself stays claimed even
+  after its job is abandoned; to redo it, submit a new job through the API.
 - Running it under launchd arrives with phase 2b, together with the CLI.
