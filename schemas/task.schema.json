@@ -135,6 +135,18 @@
           "title": "Must Fail First",
           "type": "boolean"
         },
+        "must_fail_first_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Must Fail First Reason"
+        },
         "out_of_scope": {
           "items": {
             "type": "string"

@@ -141,6 +141,7 @@ def render_plan(task: Task) -> str:
         "files_in_scope": task.spec.files_in_scope,
         "out_of_scope": task.spec.out_of_scope,
         "must_fail_first": task.spec.must_fail_first,
+        "must_fail_first_reason": task.spec.must_fail_first_reason,
         "depends_on": [],
         "labels": task.labels,
         "max_cost_usd": task.limits.max_cost_usd,
@@ -512,6 +513,7 @@ class JobService:
                         "goal": w.goal,
                         "test_cmd": w.test_cmd,
                         "must_fail_first": w.must_fail_first,
+                        "must_fail_first_reason": w.must_fail_first_reason,
                         # round 3, F1: the spec lets this worker change how tests run
                         "changes_how_tests_run": runner_files_named(
                             w.files_in_scope, self.cfg.repo(job.repo).runner_config, w.test_cmd

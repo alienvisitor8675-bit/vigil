@@ -202,6 +202,24 @@ def _untrusted(untrusted: dict[str, str]) -> str:
     return "\n\n".join(fence(label, text) for label, text in untrusted.items())
 
 
+def _test_wording(spec: dict[str, Any]) -> str:
+    """Which test instruction the worker gets, by the contract (#31 item 3)."""
+    if spec.get("must_fail_first", True):
+        return (
+            "\nmust_fail_first is on: your new test must fail at the base by an assertion, "
+            "then pass with your change.\n"
+        )
+    reason = str(spec.get("must_fail_first_reason") or "").strip() or "none given"
+    return (
+        f"\nmust_fail_first is off (reason: {reason}): your tests pin existing behaviour; "
+        "they must run and pass on the unchanged code. vigild refuses a result where none of "
+        "your new tests ran: a new test id the base doesn't have; editing an existing test "
+        "doesn't count. If a stated rule contradicts the code, don't bend the "
+        "test or the code: escalate through ask_coord, starting the question with "
+        "`spec_ambiguous:` and quoting the rule and the code line.\n"
+    )
+
+
 def assemble_worker(
     repo: Path,
     contract: dict[str, Any],
@@ -224,6 +242,7 @@ def assemble_worker(
         f"Done when:\n{_checklist(spec.get('done_when') or '')}\n"
         f"- [ ] `{spec.get('test_cmd')}` exits 0\n"
     )
+    contract_part += _test_wording(spec)
     if approval_edits:
         contract_part += f"\nThe owner's notes on approval (follow them):\n{approval_edits}\n"
     untrusted = dict(untrusted)

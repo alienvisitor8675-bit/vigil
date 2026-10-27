@@ -324,7 +324,7 @@ Start a session. It is one form, not a wizard, with these fields:
 - **Backend:** a preset, or a custom endpoint as `{kind, base_url,
   model, key_ref}`. `key_ref` is a choice among variable names, never a
   value field.
-- **The contract's spec:** goal, `test_cmd`, `must_fail_first`,
+- **The contract's spec:** goal, `test_cmd`, `must_fail_first` (with its reason when false),
   `files_in_scope`, `done_when`, `out_of_scope`.
 - **Why, value and risk.**
 - **Limits:** max turns, minutes and cost, never above the per-task cap.

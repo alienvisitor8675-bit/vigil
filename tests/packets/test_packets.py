@@ -276,3 +276,22 @@ def test_the_git_log_ignores_ambient_git_environment(
     monkeypatch.setenv("GIT_DIR", str(tmp_path / "nowhere"))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "nowhere.gitconfig"))
     assert assemble._git_log(repo, ["a.md"]).endswith("add a")
+
+
+# --- #31 item 3: the worker's wording follows must_fail_first -------------------------------
+
+
+def test_packet_says_the_test_must_fail_when_must_fail_first_is_on(clone: Path) -> None:
+    p = assemble_worker(clone, _contract(), untrusted={})
+    assert "must fail at the base" in p.text
+    assert "must_fail_first is off" not in p.text
+
+
+def test_packet_for_a_tests_only_task_says_to_pin_existing_behaviour(clone: Path) -> None:
+    c = _contract()
+    c["spec"].update(must_fail_first=False, must_fail_first_reason="tests only, code unchanged")
+    p = assemble_worker(clone, c, untrusted={})
+    assert "must_fail_first is off (reason: tests only, code unchanged)" in p.text
+    assert "must run and pass on the unchanged code" in p.text
+    assert "spec_ambiguous:" in p.text
+    assert "must fail at the base" not in p.text

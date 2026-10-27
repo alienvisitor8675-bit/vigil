@@ -59,6 +59,7 @@ class Spec(Strict):
     goal: str
     test_cmd: str | None = None
     must_fail_first: bool = True
+    must_fail_first_reason: str | None = None  # required when it is false (the plan gate)
     files_in_scope: list[str] = Field(default_factory=list)
     done_when: str | None = None
     out_of_scope: list[str] = Field(default_factory=list)
@@ -236,6 +237,7 @@ class WorkerContract(Strict):
     files_in_scope: list[str] = Field(min_length=1)
     out_of_scope: list[str] = Field(default_factory=list)
     must_fail_first: bool = True
+    must_fail_first_reason: str | None = None  # required when it is false (the plan gate)
     depends_on: list[str] = Field(default_factory=list)
     labels: list[str] = Field(default_factory=list)
     max_cost_usd: float | None = Field(default=None, gt=0)

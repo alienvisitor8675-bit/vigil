@@ -27,8 +27,10 @@ Rules:
   the base's runner files (package.json, lockfiles, test configs, the scripts
   it runs). Editing those changes nothing in verification, and the change is
   rejected unless the spec names the file.
-- Your new test must fail at the base by an assertion, not by an import or
-  collection error: import new code inside the test.
+- The packet states, after the contract, how your tests must behave for this
+  contract's `must_fail_first` (on: a new test fails first by an assertion, not
+  an import error; off: tests pin existing behaviour and pass). Follow that
+  wording and no other.
 - Never skip, xfail, narrow or delete an existing test: vigild compares what
   ran at the base with what ran at your head.
 - If the work needs a dependency the repo doesn't have, don't add it. Stop,

@@ -1756,6 +1756,7 @@ class JobRunner:
                 test_cmd=w.test_cmd,
                 done_when=w.done_when,
                 must_fail_first=w.must_fail_first,
+                must_fail_first_reason=w.must_fail_first_reason,
                 files_in_scope=w.files_in_scope,
                 out_of_scope=w.out_of_scope,
                 verify=Verify(level=w.verify_level),

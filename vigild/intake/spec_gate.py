@@ -105,6 +105,12 @@ def runner_files_named(
     return runner_overlap(scope, runner_config, test_cmd)
 
 
+MFF_REASON_RULE = (
+    "must_fail_first is false, so must_fail_first_reason is required: "
+    'say why, for example "tests only, code unchanged"'
+)
+
+
 def check_task(task: Task) -> GateResult:
     errors = [
         f"{key} is required before a task can run"
@@ -113,6 +119,8 @@ def check_task(task: Task) -> GateResult:
     ]
     if (task.spec.test_cmd or "").strip() and (why := test_cmd_problem(task.spec.test_cmd)):
         errors.append(why)
+    if not task.spec.must_fail_first and not (task.spec.must_fail_first_reason or "").strip():
+        errors.append(MFF_REASON_RULE)
     return GateResult(ok=not errors, needs_spec=bool(errors), errors=errors)
 
 
@@ -219,6 +227,8 @@ def check_job_spec(
     for w in plan.workers:
         if why := test_cmd_problem(w.test_cmd, read):
             errors.append(f"worker {w.task_id}: {why}")
+        if not w.must_fail_first and not (w.must_fail_first_reason or "").strip():
+            errors.append(f"worker {w.task_id}: {MFF_REASON_RULE}")
         for dep in w.depends_on:
             if dep not in ids and dep not in taken:
                 errors.append(f"worker {w.task_id} depends on unknown worker {dep}")
