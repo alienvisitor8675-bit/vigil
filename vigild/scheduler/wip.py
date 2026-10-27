@@ -15,6 +15,10 @@ from typing import Any
 from vigild.db import Store
 
 GONE_TASK = ("merged", "closed", "superseded", "abandoned")
+# A task whose PR is open takes its place by state as well as by URL (#34). The
+# runner writes `pr_open` and the event with the URL in one transaction; counting
+# by state keeps the place held even if a future path writes them apart.
+HOLDS_PLACE = ("running", "pr_open", "reviewed")
 CLOSED_JOB = ("merged", "verifying", "done", "abandoned")
 
 
@@ -38,7 +42,7 @@ def stack(store: Store, repo: str) -> list[dict[str, Any]]:
         if r["state"] in GONE_TASK or r["job_state"] in CLOSED_JOB:
             continue
         url = pr_of(store, r["id"])
-        if url or r["state"] == "running":
+        if url or r["state"] in HOLDS_PLACE:
             out.append(
                 {"task_id": r["id"], "job_id": r["job_id"], "state": r["state"], "pr_url": url}
             )

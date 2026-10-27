@@ -2720,21 +2720,24 @@ class JobRunner:
         except PublishError as e:
             return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})
         self.store.update_session(s.id, status="pr_open", pr_url=url, detail={"head": head})
-        self.store.update_task(task_id, state="pr_open")
-        self.store.add_event(
-            "pr_open",
-            {
-                "pr_url": url,
-                "branch": branch,
-                "head": head,
-                "runner_file_change": overlap,
-                **self._pub_facts(job.repo, branch, base_sha),
-            },
-            Provenance.HUMAN,
-            job_id=job_id,
-            session_id=s.id,
-            task_id=task_id,
-        )
+        facts = self._pub_facts(job.repo, branch, base_sha)  # vault git: outside the tx
+        # #34: the state and the event with its URL land together, or neither does
+        with self.store.tx():
+            self.store.update_task(task_id, state="pr_open")
+            self.store.add_event(
+                "pr_open",
+                {
+                    "pr_url": url,
+                    "branch": branch,
+                    "head": head,
+                    "runner_file_change": overlap,
+                    **facts,
+                },
+                Provenance.HUMAN,
+                job_id=job_id,
+                session_id=s.id,
+                task_id=task_id,
+            )
         return True
 
     # --- deps jobs (phase 2a, item 5; B39) ------------------------------------------------
@@ -2885,12 +2888,13 @@ class JobRunner:
         self.store.update_session(
             s.id, status="pr_open", pr_url=url, ended_at=iso(), detail={"head": head}
         )
-        self.store.update_task(task_id, state="pr_open")
-        self.store.add_event(
-            "pr_open", {"pr_url": url, "branch": branch, "head": head,
-                        **self._pub_facts(job.repo, branch, base_sha)},
-            Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
-        )  # fmt: skip
+        facts = self._pub_facts(job.repo, branch, base_sha)  # vault git: outside the tx
+        with self.store.tx():  # #34: the state and its event together
+            self.store.update_task(task_id, state="pr_open")
+            self.store.add_event(
+                "pr_open", {"pr_url": url, "branch": branch, "head": head, **facts},
+                Provenance.HUMAN, job_id=job_id, session_id=s.id, task_id=task_id,
+            )  # fmt: skip
         return True
 
     def poll_prs(self) -> list[str]:
