@@ -257,6 +257,20 @@ def _m11_round2(conn: sqlite3.Connection) -> None:
     _create(conn, LADDER_CHANGES_DDL)
 
 
+def _m12_issue_link(conn: sqlite3.Connection) -> None:
+    """A job's GitHub issue, as a column (owner, 2026-10-27): intake asks "does a
+    live job already carry this issue?" in one indexed query, which an artifact
+    could not answer. Jobs from before carry none (NULL); text is never parsed.
+    The partial unique index is the guard: one job per (repo, issue) that isn't
+    abandoned, enforced by the database, so a race or a second API call cannot
+    make two. (Merged and done jobs count: follow-up work is a new job.)"""
+    _add_columns(conn, "jobs", {"issue": "INTEGER"})
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS jobs_live_issue ON jobs(repo, issue)"
+        " WHERE issue IS NOT NULL AND state != 'abandoned'"
+    )
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
@@ -269,6 +283,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m9_breakers,
     _m10_live_visibility,
     _m11_round2,
+    _m12_issue_link,
 ]
 
 
@@ -353,6 +368,7 @@ class Store:
         source: str = "human",
         parent_job_id: str | None = None,
         provenance: Provenance | str = Provenance.HUMAN,
+        issue: int | None = None,
     ) -> Job:
         depth = 0
         if parent_job_id:
@@ -367,7 +383,7 @@ class Store:
             c.execute(
                 "INSERT INTO jobs (id, repo, base, title, request, notes, source, state,"
                 " blocked_from, parent_job_id, fix_depth, coord_session_id, created_at,"
-                " updated_at, provenance) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " updated_at, provenance, issue) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     job_id,
                     repo,
@@ -384,9 +400,23 @@ class Store:
                     now,
                     now,
                     require(provenance).value,
+                    issue,
                 ),
             )
         return self.get_job(job_id)
+
+    def live_job_for_issue(self, repo: str, issue: int) -> str | None:
+        """The id of the job of `repo` holding GitHub issue `issue` (any state but
+        abandoned), if there is one; the unique index `jobs_live_issue` allows one."""
+        rows = self.q(
+            "SELECT id FROM jobs WHERE repo=? AND issue=? AND state != 'abandoned'", (repo, issue)
+        )
+        return str(rows[0]["id"]) if rows else None
+
+    def jobs_for_issue(self, repo: str, issue: int) -> list[Job]:
+        """Jobs of `repo` that carry GitHub issue `issue`, oldest first."""
+        rows = self.q("SELECT id FROM jobs WHERE repo=? AND issue=? ORDER BY id", (repo, issue))
+        return [self.get_job(r["id"]) for r in rows]
 
     def get_job(self, job_id: str) -> Job:
         rows = self.q("SELECT * FROM jobs WHERE id=?", (job_id,))
@@ -410,6 +440,7 @@ class Store:
             updated_at=r["updated_at"],
             provenance=r["provenance"],
             blocked_on=r["blocked_on"],
+            issue=r["issue"],
         )
 
     def list_jobs(self) -> list[Job]:
