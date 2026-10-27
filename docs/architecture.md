@@ -286,7 +286,12 @@ stateDiagram-v2
   to the task's worker as the same fix round. The job goes `ready` to `building`
   (an FSM edge only that action may take), the task `reviewed` to `fix`, and the
   round counts in `review_rounds`; the verifier, a re-review and a re-audit follow,
-  and `in_review` to `ready` files a new Ready to merge item.
+  and `in_review` to `ready` files a new Ready to merge item. Only a `ready` job
+  takes it; every check (state, task `reviewed`, findings, round limit
+  `routing.escalate_review_rounds`, cap, the PR's live state) runs before any
+  change, and the live GitHub read happens before the DB transaction opens. A task
+  past the round limit is refused (replan, or merge as is); a round that trips
+  rule 5 says "this round runs on <preset> (escalated)" in the response and event.
 
 ```mermaid
 flowchart TD

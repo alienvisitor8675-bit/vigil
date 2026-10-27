@@ -3072,11 +3072,10 @@ class JobRunner:
                 out["note"] = json.loads(note.content)["note"]
         return out
 
-    def fix_check(self, job_id: str, task_id: str) -> str | None:
-        """Why the owner's "fix with findings" can't start for a task, if it can't: its
-        PR is merged or closed (by vigild's poll, or by GitHub since), or too little of
-        its cap is left for a worker."""
-        t = self.store.get_task(task_id)
+    def fix_pr_state(self, job_id: str, task_id: str) -> str | None:
+        """Why the owner's fix can't start because of GitHub's live view of the task's
+        PR (merged or closed since vigild's poll), if it can't. This is a network
+        call: the caller makes it outside any DB transaction."""
         if self.pr_state is not None and (url := self._task_pr(task_id)):
             try:
                 st = self.pr_state(self.store.get_job(job_id).repo, url)
@@ -3084,12 +3083,36 @@ class JobRunner:
                 st = "open"  # the poll will see it; the fix round's push will fail if not
             if st in ("merged", "closed"):
                 return f"the PR of {task_id} is {st}"
+        return None
+
+    def fix_check(self, job_id: str, task_id: str) -> str | None:
+        """Why the owner's "fix with findings" can't start for a task, from vigild's
+        recorded state only (no network): it has used its review-round limit (the one
+        a review's own fix rounds hit), or too little of its cap is left."""
+        t = self.store.get_task(task_id)
+        limit = self.cfg.routing.escalate_review_rounds
+        used = int(t.contract.get("review_rounds") or 0)
+        if used >= limit:
+            return (
+                f"{task_id} has used its {limit} review rounds (the limit "
+                f"routing.escalate_review_rounds); replan, or merge as is"
+            )
         cap, spent, left = self.remaining(task_id)
         if t.contract.get("shape") != "deps" and left < MIN_RETRY_USD:
             return (
                 f"task {task_id} has ${left:.2f} of its ${cap:.2f} cap left "
                 f"(${spent:.2f} spent); a fix round needs at least ${MIN_RETRY_USD:.2f}"
             )
+        return None
+
+    def fix_escalation(self, job_id: str, task_id: str) -> str | None:
+        """The notice for the owner when the next fix round would trip routing rule 5
+        and move the task to a pricier backend, else None."""
+        t = self.store.get_task(task_id)
+        rnd = int(t.contract.get("review_rounds") or 0) + 1
+        r = route(Task.model_validate({**t.contract, "review_rounds": rnd}), self.cfg)
+        if r.tier_reason.startswith("rule5") and not str(t.tier_reason or "").startswith("rule5"):
+            return f"this round runs on {r.preset} (escalated)"
         return None
 
     def prepare_fix(self, job_id: str, task_id: str) -> int:

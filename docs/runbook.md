@@ -432,7 +432,10 @@ round fails. It runs on what is left of the task's cap (`max_cost_usd` or $2, wh
 is less, minus its spend); under $0.05 left the call is refused with a 409 saying so.
 It is also refused (409) for a merged or closed PR, a job that isn't ready, or findings
 that aren't the task's; over 8 KB of note is a 413. Each owner fix counts as a review
-round, so the second trips routing rule 5 as any fix round does.
+round, so the second trips routing rule 5 as any fix round does; the 200 then carries a
+`notice` ("this round runs on <preset> (escalated)") and so does the `fix_with_findings`
+event. A task that has used its `routing.escalate_review_rounds` (2) is refused with a
+409: replan, or merge as is. Only a `ready` job takes a fix (an `in_review` one is refused).
 
 ### Check everything
 

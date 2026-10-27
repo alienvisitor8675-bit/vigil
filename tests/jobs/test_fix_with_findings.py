@@ -275,3 +275,81 @@ def test_only_the_owner_from_the_inbox_moves_ready_to_building(world: World) -> 
         transition(w.store, job, JobState.BUILDING, Actor.OWNER, channel="inbox",
                    evidence={"action": "fix"})  # fmt: skip
     assert w.store.get_job(job).state.value == "ready"
+
+
+def _always_findings(spec: SessionSpec) -> dict[str, Any]:
+    if str(spec.task_id).endswith("w1"):
+        return {"findings": [{**LOW_A, "matched": None}], "false_findings": []}
+    return CLEAN_AUDIT
+
+
+def test_the_owners_fix_stops_at_the_review_round_limit(world: World) -> None:
+    w = world
+    job, item = _ready(w)
+    w.standin.audit = _always_findings
+    task = f"{job}-w1"
+    limit = w.runner.cfg.routing.escalate_review_rounds
+    for _ in range(limit):
+        r = _fix(w, item["id"], task_id=task, findings=[0])
+        assert r.status_code == 200, r.text
+        item = _item(w, job)
+    workers = len(_workers(w, "w1"))
+    r = _fix(w, item["id"], task_id=task, findings=["audit:0"])
+    assert r.status_code == 409, r.text
+    assert str(limit) in r.json()["detail"] and "replan" in r.json()["detail"]
+    assert w.store.get_job(job).state.value == "ready"
+    assert w.store.get_inbox_item(item["id"]).status == "open"
+    assert len(_workers(w, "w1")) == workers
+
+
+def test_the_round_that_escalates_the_backend_says_so(world: World) -> None:
+    w = world
+    job, item = _ready(w)
+    w.standin.audit = _always_findings
+    task = f"{job}-w1"
+    first = _fix(w, item["id"], task_id=task, findings=[0])
+    assert first.status_code == 200, first.text
+    assert "escalated" not in first.text
+    second = _fix(w, _item(w, job)["id"], task_id=task, findings=[0])
+    assert second.status_code == 200, second.text
+    preset = w.store.get_task(task).backend_preset
+    assert f"this round runs on {preset} (escalated)" in second.json()["notice"]
+    (ev,) = [e for e in w.store.events(job_id=job) if e.type == "fix_with_findings"][-1:]
+    assert f"this round runs on {preset} (escalated)" in ev.data["notice"]
+
+
+def test_the_pr_state_is_checked_outside_the_transaction(world: World) -> None:
+    w = world
+    job, item = _ready(w)
+    inside: list[bool] = []
+
+    def slow(repo: str, url: str) -> str:
+        inside.append(w.store.conn.in_transaction)
+        return "open"
+
+    w.runner.pr_state = slow
+    assert _fix(w, item["id"], task_id=f"{job}-w1", findings=["audit:0"]).status_code == 200
+    assert inside and not any(inside)
+
+    def boom(repo: str, url: str) -> str:
+        inside.append(w.store.conn.in_transaction)
+        raise TimeoutError("github is slow")
+
+    w.runner.pr_state = boom
+    _fix(w, _item(w, job)["id"], task_id=f"{job}-w1", findings=[0])
+    assert not any(inside)
+    assert not w.store.conn.in_transaction
+
+
+def test_an_in_review_job_is_refused_with_no_side_effect(world: World) -> None:
+    w = world
+    job, item = _ready(w)
+    task = f"{job}-w1"
+    w.store._write_state(job, JobState.IN_REVIEW, None)
+    before = (len(w.store.events(job_id=job)), w.store.get_task(task).contract)
+    r = _fix(w, item["id"], task_id=task, findings=["audit:0"])
+    assert r.status_code == 409, r.text
+    assert "ready" in r.json()["detail"]
+    assert (len(w.store.events(job_id=job)), w.store.get_task(task).contract) == before
+    assert w.store.get_job(job).state is JobState.IN_REVIEW
+    assert w.store.get_inbox_item(item["id"]).status == "open"

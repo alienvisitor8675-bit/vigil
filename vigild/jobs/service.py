@@ -47,7 +47,9 @@ class Runner(Protocol):
     def on_resume(self, job_id: str, *, replan: bool = False) -> str | None: ...
     def on_rebuild(self, repo: str, base_sha: str) -> None: ...
     def busy(self, job_id: str) -> bool: ...
+    def fix_pr_state(self, job_id: str, task_id: str) -> str | None: ...
     def fix_check(self, job_id: str, task_id: str) -> str | None: ...
+    def fix_escalation(self, job_id: str, task_id: str) -> str | None: ...
     def prepare_fix(self, job_id: str, task_id: str) -> int: ...
 
 
@@ -197,6 +199,8 @@ class JobService:
         # how each job's last resume, retry or re-plan ran: "started", or
         # "queued" behind its current run (2a round 3), for the API to say
         self.last_run: dict[str, str | None] = {}
+        # the owner's fix round that moves the task to a pricier backend says so
+        self.last_notice: dict[str, str | None] = {}
 
     # --- submissions ----------------------------------------------------------
 
@@ -743,16 +747,28 @@ class JobService:
         """ "Fix with findings" (owner, 2026-10-27): a reviewed PR goes back to its worker
         with findings the owner chose from its review and audit, and a note. It is the
         2a fix round: the same branch and PR, then the verifier, a re-review and a
-        re-audit, on what is left of the task's cap. The job goes ready (or in_review)
-        -> building -> in_review -> ready, each move an event, and the round counts in
-        `review_rounds`. The findings are model text and are fenced for the worker; the
-        note is the owner's, stored verbatim as a human artifact."""
+        re-audit, on what is left of the task's cap. The job goes ready -> building ->
+        in_review -> ready, each move an event, and the round counts in `review_rounds`
+        (past the review-round limit the fix is refused, as a review's own is paged).
+        Everything is validated before any side effect, and GitHub's live view of the
+        PR is read before the transaction opens, never inside it. The findings are model
+        text and are fenced for the worker; the note is the owner's,
+        stored verbatim as a human artifact."""
         if not isinstance(task_id, str) or not task_id:
             raise BadNote("task_id must be a task's id")
         if not isinstance(findings, list) or not findings or len(findings) > MAX_PICKED:
             raise BadNote(f"findings must be a list of 1 to {MAX_PICKED} ids or indexes")
         if note is not None:
             self._check_note(note)
+        live: str | None = None
+        try:  # the live PR check is a network call: outside the transaction below
+            peek = self.store.get_inbox_item(item_id)
+            if peek.job_id is not None and task_id in {
+                p.get("task_id") for p in peek.body.get("prs") or []
+            }:
+                live = self.runner.fix_pr_state(peek.job_id, task_id)
+        except KeyError:
+            pass  # the transaction refuses it
         with self.store.tx():
             try:
                 item = self.store.get_inbox_item(item_id)
@@ -765,7 +781,7 @@ class JobService:
             job = self.store.get_job(item.job_id)
             if self.runner.busy(job.id):
                 raise Conflict(f"{job.id} is being worked on; try again in a moment")
-            if job.state not in (JobState.READY, JobState.IN_REVIEW):
+            if job.state is not JobState.READY:
                 raise Conflict(f"{job.id} is {job.state.value}; only a ready job takes a fix")
             if task_id not in {p.get("task_id") for p in item.body.get("prs") or []}:
                 raise Conflict(f"{task_id} is not a task of inbox item {item_id}")
@@ -782,8 +798,11 @@ class JobService:
                 chosen = pick(selectable(self.store, job.id, task_id), findings)
             except ValueError as e:
                 raise Conflict(str(e)) from e
+            if live is not None:
+                raise Conflict(live)
             if (why := self.runner.fix_check(job.id, task_id)) is not None:
                 raise Conflict(why)
+            notice = self.runner.fix_escalation(job.id, task_id)
             rnd = self.runner.prepare_fix(job.id, task_id)
             head = self._task_head(task_id)
             self.store.add_artifact(
@@ -797,6 +816,8 @@ class JobService:
                 "inbox_item_id": item_id, "task_id": task_id, "round": rnd,
                 "findings": [f["id"] for f in chosen],
             }  # fmt: skip
+            if notice is not None:
+                data["notice"] = notice
             if note is not None:
                 assert isinstance(note, str)
                 self.store.add_artifact(
@@ -818,6 +839,7 @@ class JobService:
             self.store.add_event("fix_with_findings", data, Provenance.HUMAN, job_id=job.id,
                                  task_id=task_id)  # fmt: skip
             self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
+        self.last_notice[job.id] = notice
         self.last_run[job.id] = self.runner.on_resume(job.id)
         return job
 

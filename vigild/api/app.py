@@ -262,7 +262,9 @@ def fix(
     indexes from the item's `selectable`], "note": "..."} (the note optional, 8 KB at
     most). The task's worker fixes them in the standard fix round, on the same branch and
     PR and on what is left of its cap; 409 if the job isn't ready, the PR is merged or
-    closed, the findings aren't the task's, or too little of the cap is left."""
+    closed, the findings aren't the task's, the task has used its review-round limit,
+    or too little of the cap is left. The answer carries a `notice` when the round
+    runs on an escalated (pricier) backend."""
     body = body or {}
     jobs = _svc(request).jobs
     try:
@@ -275,7 +277,10 @@ def fix(
         raise HTTPException(422, str(e)) from e
     except Conflict as e:
         raise HTTPException(409, str(e)) from e
-    return {"job_id": job.id, "state": job.state.value, "run": jobs.last_run.get(job.id)}
+    out = {"job_id": job.id, "state": job.state.value, "run": jobs.last_run.get(job.id)}
+    if notice := jobs.last_notice.get(job.id):
+        out["notice"] = notice
+    return out
 
 
 @router.post("/api/inbox/{item_id}/abandon", dependencies=[ADMIN])
