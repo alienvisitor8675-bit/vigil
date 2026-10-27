@@ -61,7 +61,7 @@ These eight choices are where fleets fail or pay off. Each is a design constrain
 
 ## Architecture
 
-Everything runs on the **Mac mini** (Apple Silicon, Docker Desktop, images built for linux/arm64) except model inference. The **Linux tower** (RTX 5070 Ti 16 GB, 32 GB DDR5) serves models only: `llama-server` plus a small metrics exporter, nothing else. The two reach each other over Tailscale.
+Everything runs on the **Mac mini** (Apple Silicon, Docker Desktop, images built for linux/arm64) except model inference. The **Linux tower** (2× RTX 5070 Ti, 32 GB VRAM in total, 32 GB DDR5) serves models: `llama-server` plus a small metrics exporter. It may also be an amd64 sandbox host for bench (ADR-0004). The two reach each other over Tailscale.
 
 | Component | Runs where | Job |
 | --- | --- | --- |
@@ -511,7 +511,7 @@ How Vigil gets better from its own jobs.
   - **Rung locks:** the rung-0 lock for money, auth and consent, and the cap at rung 1 for `deps`, are enforced in `configs/review.yaml`. Phase 2a implements that.
 - **Tower, later and optional: a rejection-sampling fine-tune.**
   - An 8B-class local model, trained with QLoRA.
-  - GRPO is out of scope on a 16 GB card.
+  - GRPO is out of scope on the tower (2× 16 GB cards).
   - Not scheduled until a few hundred eligible trajectories exist.
   - **Eligible means all three:**
     - the run passes the repo's own suite;
@@ -663,49 +663,64 @@ Also decided:
 
 ## Tower: local model serving
 
-Hardware: Linux, RTX 5070 Ti (16 GB GDDR7), 32 GB DDR5. The right shape is a mixture-of-experts model with experts offloaded to system RAM, served by llama.cpp, which has `--n-cpu-moe` and `--cpu-moe` for exactly this ([llama-server manual](https://manpages.debian.org/unstable/llama.cpp-tools/llama-server.1.en.html)). vLLM needs the whole model in VRAM, so it is not used here.
+**Hardware (owner, 2026-10-27):** Linux, **2× RTX 5070 Ti (16 GB GDDR7 each, 32 GB of VRAM in total)**, 32 GB DDR5.
 
-| Model | Fit | Role | Serve on |
+With 32 GB of VRAM the candidates fit **entirely in VRAM**, so no experts are offloaded to system RAM. That leaves the tower's RAM free for sandboxes when the tower is also a sandbox host (ADR-0004).
+
+The server is llama.cpp `llama-server`, splitting layers across both GPUs (`--split-mode layer`).
+
+**vLLM tensor parallelism** on sm\_120 (Blackwell) is a later trial for concurrent sessions. It's worth it only if Smoke shows a local model is good enough to run several sessions at once.
+
+| Model | Size | Fit | Role |
 | --- | --- | --- | --- |
-| Qwen3.6-35B-A3B, UD-Q4\_K\_M GGUF (\~22.1 GB) | attention + KV on GPU, experts in DDR5 | main `local` worker | 2 slots × 64k ctx (1 slot when under 10 GB VRAM is free) |
-| gpt-oss-20b, MXFP4 GGUF (\~12.1 GB) | fully on GPU | `local-fast` for XS tasks | 1 slot × 32k ctx, loaded only when no `local` task is running |
-| LFM2.5-1.2B-Instruct, Q4\_K\_M (\~0.7 GB) | on GPU | local decider (`lfm-tower`) | loaded on demand |
-| Qwen3.8-27B, Q3 (\~12–13 GB) | on GPU, short ctx | eval candidate only | not resident |
+| Qwen3.8-27B (dense), Q6 GGUF | \~22 GB | layers split across both GPUs, KV in VRAM | first measurement candidate |
+| Qwen3.6-35B-A3B (MoE), Q4 GGUF | \~22 GB | fully in VRAM | first measurement candidate |
+| gpt-oss-20b, MXFP4 GGUF | \~12 GB | fully in VRAM | `local-fast` for XS tasks (later) |
+| LFM2.5-1.2B-Instruct, Q4\_K\_M | \~0.7 GB | in VRAM | local decider, `lfm-tower` (later) |
 
-Both workers cannot be resident at once in 16 GB. `vigild` owns model lifecycle: it keeps Qwen resident, and asks for gpt-oss-20b only when the queue holds XS tasks and no `local` task is running.
-- **The open question is the mechanism.** vigild now runs on the Mac and nothing extra may be installed on the tower, so the design's swap script and timer have no control channel.
-- **Proposal P6** in `docs/architecture.md` is llama-server's router mode (`--models-dir`, `--models-max 1`, `--sleep-idle-seconds 1800`), which loads on demand and sleeps when idle.
-- **Without P6**, vigild swaps over SSH with a forced-command key.
-- **Sharing with Hearth.** Before any load, `vigild` reads free VRAM from the tower exporter, and runs one slot when under 10 GB is free. You have the whole tower for now, but the design is ready for sharing it with Hearth.
+**First use is measurement only** (#11). Smoke (#8) runs the worker on Sonnet and then on each candidate, over the same 10 tasks, with everything else unchanged. **No real job routes to a local model until the owner has seen that result.**
 
-Swap cost is 10–20 s of load, cheaper than the quality loss of running XS tasks on nothing.
+**Measured first,** from the Mac over Tailscale:
+- tokens per second at 32k and 64k context, for each candidate (prompt processing and generation);
+- that `/v1/chat/completions` tool calling works;
+- whether `/v1/messages` (the Anthropic API) works, which decides the executor path in #11.
 
-Starting command (tune `--n-cpu-moe` upward until `nvidia-smi` shows \~15 GB used; prefix caching stays on by default and is what makes agent turns fast):
+Starting command, with values tuned on the machine. KV for two 64k slots must fit beside about 22 GB of weights:
 
 ```bash
-llama-server -m /models/Qwen3.6-35B-A3B-Q4_K_M.gguf \
-  --n-gpu-layers 999 --n-cpu-moe 28 \
+llama-server -m /models/<candidate>.gguf \
+  --n-gpu-layers 999 --split-mode layer \
   -c 131072 --parallel 2 --jinja \
-  --host 100.x.y.z --port 8080 --api-key "$LLAMA_KEY" \
+  --host <tailscale-address> --port 8080 --api-key "$LLAMA_KEY" \
   --metrics --slots
 ```
 
 Flag notes:
-- `-c 131072 --parallel 2` gives two 64k slots.
-- `--jinja` and `--slots` are on by default in current llama.cpp, so the flags are harmless but redundant.
-- `--metrics` exposes server-wide Prometheus counters. That gives queue depth and throughput, but **not** GPU time per task: the counters have no per-request labels. Per-session GPU attribution comes from the tower exporter (next paragraph).
-- Bind to the Tailscale IP, not `0.0.0.0`, and allow only the Mac in the Tailscale ACL.
+- `-c 131072 --parallel 2` gives two 64k slots. If KV doesn't fit, quantize KV (`-ctk q8_0 -ctv q8_0`) or drop to one slot.
+- `--metrics` exposes server-wide Prometheus counters, with no per-request labels. Per-session GPU attribution comes from llama-server's per-response `timings` at the gateway (B12) and from the tower exporter.
+- **Bind to the Tailscale address only, never `0.0.0.0`**, and allow only the Mac mini in the Tailscale ACL. The API key lives in the Mac mini's `~/.config/vigil/env` as `LLAMA_API_KEY`.
 
-Run it as a systemd unit on the host (no Docker on the tower). The prebuilt CUDA 12.8 and 13.4 release binaries already include Blackwell (sm\_120). Pin the llama.cpp release tag and the GGUF file hashes in `models.lock`. Worker containers on the Mac reach it through their egress proxy over Tailscale.
+**Pinning and running.** Pin the llama.cpp release and each GGUF file's sha256 in `models.lock`. Run the server as a systemd unit on the host. The prebuilt CUDA 12.8 and 13.x release binaries include Blackwell (sm\_120).
 
-**Tower exporter.** A second small systemd service on the tower, the only other thing installed there besides Tailscale and the NVIDIA driver:
+**Sessions never reach the tower directly.** A session on the Mac (or on any sandbox host) reaches a local model **only through vigild's gateway**. The gateway meters tokens, from `usage`, and GPU-seconds, from `timings`. The egress proxy allows the gateway and nothing else.
+
+**The tower as a sandbox host (ADR-0004).** The tower may also be configured as an amd64 sandbox host for bench. The model lives entirely in VRAM, so the tower's sandbox slice is sized at **about 24 GiB of RAM while a model is loaded**. That figure is confirmed by measuring free RAM with each candidate loaded and serving at 64k.
+
+ADR-0004's rules also apply there: sandbox containers can't reach the model port, there's no GPU passthrough, and caps sit in a dedicated slice. The owner's setup steps go in a separate deployment note (`docs/deploy/`), not here.
+
+**Tower exporter.** A small systemd service on the tower:
 - It reads NVML (`nvidia-ml-py`) and `psutil`, pinned.
-- Each second it samples GPU utilization, VRAM, CPU, RAM and watts, plus the cumulative energy counter.
+- Each second it samples GPU utilization, VRAM and watts for each GPU, plus CPU, RAM and the cumulative energy counter.
 - It serves the samples as Prometheus `/metrics` and as JSON.
 
-`vigild` pulls the samples and attributes each second to the sessions with a request in flight on llama-server. It summarizes per session as joules per token and GPU-seconds per token (`docs/architecture.md` B11, B12).
+`vigild` pulls the samples and attributes each second to the sessions with a request in flight. It summarizes per session as joules per token and GPU-seconds per token (`docs/architecture.md` B11, B12).
 
-Expect 1–2 concurrent sessions and measure tokens/s on your machine in the first week; the eval section uses those numbers. If the eval shows Qwen3.6-35B-A3B is not good enough for the `local` task shapes, RunPod H100 overflow runs the same OpenCode container against a vLLM endpoint, nothing else changes.
+**Model lifecycle.** This is unchanged in principle:
+- One worker model is resident.
+- vigild asks for another only when the queue needs it. Proposal P6 is llama-server's router mode, `--models-dir` and `--models-max 1`.
+- With 32 GB, gpt-oss-20b can't sit beside a 22 GB candidate, so a swap still applies. Swap cost is 10–20 s of load.
+
+**Overflow.** If a local model isn't good enough for a task shape, RunPod H100 overflow runs the same executor against a vLLM endpoint, and nothing else changes.
 
 ## OpenCode executor
 
