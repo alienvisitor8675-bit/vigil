@@ -8,6 +8,8 @@ import threading
 import time
 from typing import Any
 
+import pytest
+
 from tests.conftest import auth
 from tests.jobs.test_coord_loop import World, _failure_item, _request
 from tests.jobs.test_coord_loop import world as world
@@ -135,3 +137,43 @@ def test_a_fifth_pr_waits(world: World) -> None:
     r = w.client.post(f"/api/inbox/{item['id']}/reset", headers=auth(w.tokens.admin))
     assert r.status_code == 200, r.text
     assert len(w.publisher.prs) == 5
+
+
+def test_a_pr_being_recorded_still_holds_its_place(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#34. A worker marks its task `pr_open` and, a statement later, records the
+    `pr_open` event with the URL. In that gap the task has no URL and is no longer
+    `running`; the stack must still count it, or a dispatch pass that runs then sees
+    room and starts the fifth task. Forced: w2 stops in the gap, and the pass that
+    follows w1's finish checks the room only once w2 is there."""
+    from vigild.scheduler import wip
+
+    w = world
+    in_gap, checked = threading.Event(), threading.Event()
+    real_room = wip.room
+    calls = 0
+
+    def room(store: Any, repo: str, limit: int) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 2:  # the pass that follows the first worker's finish
+            assert in_gap.wait(30)
+        n = real_room(store, repo, limit)
+        if calls == 2:
+            checked.set()
+        return n
+
+    monkeypatch.setattr(wip, "room", room)
+    real_add = w.store.add_event
+
+    def add_event(type: str, data: Any, provenance: Any, **kw: Any) -> int:
+        if type == "pr_open" and (kw.get("task_id") or "").endswith("-w2"):
+            in_gap.set()
+            assert checked.wait(30)
+        return real_add(type, data, provenance, **kw)
+
+    monkeypatch.setattr(w.store, "add_event", add_event)
+    job = _run(w, 5)
+    assert w.store.get_job(job).state.value == "blocked"
+    assert len(w.publisher.prs) == 4
