@@ -54,6 +54,15 @@ class SubmitError(ValueError):
         self.reasons = reasons
 
 
+class DuplicateIssue(SubmitError):
+    """The issue already has a job that isn't abandoned (the database's unique
+    index said so); `job_id` is that job."""
+
+    def __init__(self, repo: str, issue: int, job_id: str) -> None:
+        super().__init__([f"{repo}#{issue} already has a job: {job_id}"])
+        self.job_id = job_id
+
+
 class NotFound(KeyError):
     pass
 
@@ -91,6 +100,8 @@ class JobRequest(BaseModel):
     risk: Score
     source: Source = Source.HUMAN
     labels: list[str] = Field(default_factory=list)
+    # The issue in `repo` this answers: label intake skips an issue a live job carries.
+    issue: int | None = Field(default=None, gt=0, strict=True)
 
 
 def render_spec(task: Task, money_globs: list[str]) -> str:
@@ -306,14 +317,21 @@ class JobService:
         except ConfigError as e:
             raise SubmitError([str(e)]) from e
         self._intake(req.model_dump(mode="json"), [])
-        job = self.store.create_job(
-            repo=req.repo,
-            base=req.base,
-            title=req.title,
-            request=req.request,
-            notes=req.notes,
-            source=req.source.value,
-        )
+        try:
+            job = self.store.create_job(
+                repo=req.repo,
+                base=req.base,
+                title=req.title,
+                request=req.request,
+                notes=req.notes,
+                source=req.source.value,
+                issue=req.issue,
+            )
+        except sqlite3.IntegrityError:  # jobs_live_issue: the database is the check
+            held = None if req.issue is None else self.store.live_job_for_issue(req.repo, req.issue)
+            if req.issue is None or held is None:
+                raise
+            raise DuplicateIssue(req.repo, req.issue, held) from None
         self.store.add_artifact(job.id, "intake.json", req.model_dump_json(), Provenance.HUMAN)
         if issue is not None:
             self.store.add_artifact(job.id, "issue.json", json.dumps(issue), Provenance.HUMAN)
@@ -733,13 +751,16 @@ class JobService:
             else:
                 item = self._offered(item_id, "replan")
                 assert item.job_id is not None
-                try:
-                    job = transition(
-                        self.store, item.job_id, JobState.SPEC_PENDING, Actor.OWNER,
-                        channel="inbox", evidence={"inbox_item_id": item_id, "action": "replan"},
-                    )  # fmt: skip
-                except TransitionError as e:
-                    raise Conflict(str(e)) from e
+                job = self.store.get_job(item.job_id)
+                if job.state is not JobState.SPEC_PENDING:  # a stranded draft already is
+                    try:
+                        job = transition(
+                            self.store, item.job_id, JobState.SPEC_PENDING, Actor.OWNER,
+                            channel="inbox",
+                            evidence={"inbox_item_id": item_id, "action": "replan"},
+                        )  # fmt: skip
+                    except TransitionError as e:
+                        raise Conflict(str(e)) from e
                 self._record_replan(job.id, item_id, note, item.body.get("tasks") or {})
                 self.store.resolve_inbox_item(item_id, Actor.OWNER.value)
         self.last_run[job.id] = self.runner.on_resume(job.id, replan=True)

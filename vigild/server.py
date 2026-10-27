@@ -264,6 +264,11 @@ def start_pollers(v: Vigild, app: Any, runner: JobRunner) -> threading.Event:
         target=every, args=(RESERVATION_SWEEP_SECONDS, runner.sweep_reservations, stop),
         name="vigil-sweep", daemon=True,
     ).start()  # fmt: skip
+    # a draft whose coord failed and whose page is resolved has no way out (pa-0001)
+    threading.Thread(
+        target=every, args=(RESERVATION_SWEEP_SECONDS, runner.page_stranded_drafts_sweep, stop),
+        name="vigil-stranded", daemon=True,
+    ).start()  # fmt: skip
     if runner.pr_state is not None:
         # merged and closed fleet PRs: a deps job's merge resumes its parent (item 5)
         threading.Thread(
