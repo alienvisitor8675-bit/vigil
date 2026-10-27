@@ -204,6 +204,38 @@ def test_approving_a_page_is_409(client: TestClient, tokens: Tokens, store: Stor
     assert r.status_code == 409
 
 
+def _issue_job(**over: Any) -> dict[str, Any]:
+    body: dict[str, Any] = {"repo": PA, "title": "Document limits", "request": "r",
+                            "why": "w", "value": 3, "risk": 1, "issue": 320}  # fmt: skip
+    return body | over
+
+
+def test_a_second_live_job_for_the_same_issue_is_409_naming_the_first(
+    client: TestClient, tokens: Tokens, store: Store
+) -> None:
+    from vigild.jobs.fsm import Actor, transition
+    from vigild.jobs.model import JobState
+
+    h = auth(tokens.admin)
+    first = client.post("/api/jobs", json=_issue_job(), headers=h)
+    assert first.status_code == 202
+    again = client.post("/api/jobs", json=_issue_job(title="again"), headers=h)
+    assert again.status_code == 409
+    assert first.json()["id"] in str(again.json())
+    assert len(store.list_jobs()) == 1
+    other = client.post("/api/jobs", json=_issue_job(issue=321), headers=h)
+    assert other.status_code == 202
+    transition(store, first.json()["id"], JobState.ABANDONED, Actor.OWNER, channel="inbox",
+               evidence={"action": "abandon"})  # fmt: skip
+    assert client.post("/api/jobs", json=_issue_job(), headers=h).status_code == 202
+
+
+def test_the_jobs_list_returns_the_issue(client: TestClient, tokens: Tokens) -> None:
+    client.post("/api/jobs", json=_issue_job(), headers=auth(tokens.admin))
+    (job,) = client.get("/api/jobs", headers=auth(tokens.read)).json()
+    assert job["issue"] == 320
+
+
 def test_approve_unknown_is_404(client: TestClient, tokens: Tokens) -> None:
     assert client.post("/api/inbox/999/approve", headers=auth(tokens.admin)).status_code == 404
 
