@@ -5,13 +5,17 @@ runs natively on the Mac mini; sessions run in linux/arm64 containers under
 Docker Desktop; model inference (phase 5) is on the Linux tower. The spec
 is `docs/design.md`; how it is built is `docs/architecture.md`; every
 feature's code, tests and status is `docs/feature-map.md`; decisions after
-phase 1 are ADRs in `docs/decisions/`. Read the feature map before
-exploring. `AGENTS.md` is a symlink to this file.
+phase 1 are ADRs in `docs/decisions/`; the owner's rulings are indexed in
+`docs/owner-rulings.md`. Read the feature map before exploring.
+`AGENTS.md` is a symlink to this file.
 
 ## Rules
 - **A human merges.** A Claude session never merges, approves, pushes to
   `main`, runs `gh workflow run`, or calls a write endpoint of `gh api`.
-  Work on a `feat/*` branch and open a draft PR.
+  Work on a `feat/*` branch and open a draft PR. Merge tiers: docs- or
+  tests-only with green CI, the owner enables auto-merge on sight; code,
+  after a read; pinned paths, the owner reads the diff. One feature slice
+  per PR, under about 600 lines. Rulings: `docs/owner-rulings.md`.
 - **Tests first.** Write the failing test, run it red, then the code.
 - **Docs in the same PR.** A change to a flow updates
   `docs/architecture.md` (CI checks it: `scripts/check-docs-same-pr.py`);

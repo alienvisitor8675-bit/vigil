@@ -4,7 +4,8 @@ One row per Vigil feature: the phase that builds it, how you reach it,
 where its code lives, which guardrail binds it, what tests it, and whether
 it is live. Read this before exploring the repo. When you change a
 feature, update its row in the same PR, and update `docs/architecture.md`
-if the change moves a flow shown there.
+if the change moves a flow shown there. The owner's decisions are indexed in
+`docs/owner-rulings.md`.
 
 `scripts/check-feature-map.py` runs in CI. It fails when:
 - a path in a `shipped` row doesn't exist;
