@@ -87,6 +87,9 @@ class NullRunner:
     def replay_set(self, prompt_version: str) -> dict[str, Any]:
         raise RuntimeError("no runner attached")
 
+    def replay_spec(self, job_id: str, packet_variant: str) -> dict[str, Any]:
+        raise RuntimeError("no runner attached")
+
 
 @dataclass
 class Vigild:

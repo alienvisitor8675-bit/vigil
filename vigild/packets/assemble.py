@@ -17,6 +17,7 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -514,6 +515,11 @@ def assemble_coord(
         },
         dropped,
     )
+
+
+# Coord packet variants by name: the one place a variant is registered (a spec replay picks
+# one by name; PR #87 adds "lean"). Every assembler takes assemble_coord's arguments.
+COORD_PACKETS: dict[str, Callable[..., Packet]] = {"classic": assemble_coord}
 
 
 def hidden_dir(job_id: str, task_id: str) -> str:

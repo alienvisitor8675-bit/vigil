@@ -73,7 +73,8 @@ REPLAY_DDL = f"""CREATE TABLE IF NOT EXISTS replays (
   prompt_version TEXT NOT NULL, prompt_sha256 TEXT NOT NULL, session_id TEXT,
   status TEXT NOT NULL CHECK (status IN ('running','done','failed','refused')),
   verdict TEXT, findings TEXT NOT NULL DEFAULT '[]', cost_usd REAL NOT NULL DEFAULT 0,
-  error TEXT, created_at TEXT NOT NULL, finished_at TEXT, {PROV})"""
+  error TEXT, created_at TEXT NOT NULL, finished_at TEXT,
+  kind TEXT NOT NULL DEFAULT 'review', result TEXT NOT NULL DEFAULT '{{}}', {PROV})"""
 
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS jobs (
@@ -475,6 +476,16 @@ def _m16_batches(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS jobs_batch ON jobs(batch_id)")
 
 
+def _m17_replay_kind(conn: sqlite3.Connection) -> None:
+    """Spec replay (ADR-0005 part 7): a replay is a `review` one (the rows from before) or a
+    `spec` one, whose gate result, AC coverage, packet size and tokens are in `result`."""
+    _add_columns(
+        conn,
+        "replays",
+        {"kind": "TEXT NOT NULL DEFAULT 'review'", "result": "TEXT NOT NULL DEFAULT '{}'"},
+    )
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
@@ -492,6 +503,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m14_experiment_pool,
     _m15_replays,
     _m16_batches,
+    _m17_replay_kind,
 ]
 
 
@@ -637,14 +649,20 @@ class Store:
         return bool(self.q("SELECT 1 FROM replays WHERE session_id=?", (session_id,)))
 
     def create_replay(
-        self, job_id: str, task_id: str, head: str, prompt_version: str, prompt_sha256: str
+        self,
+        job_id: str,
+        task_id: str,
+        head: str,
+        prompt_version: str,
+        prompt_sha256: str,
+        kind: str = "review",
     ) -> str:
         rid = "rp-" + uuid.uuid4().hex[:10]
         self.x(
             "INSERT INTO replays (id, job_id, task_id, head, prompt_version, prompt_sha256,"
-            " status, created_at, provenance) VALUES (?,?,?,?,?,?,?,?,?)",
+            " status, created_at, provenance, kind) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (rid, job_id, task_id, head, prompt_version, prompt_sha256, "running", iso(),
-             Provenance.EVAL_ONLY.value),
+             Provenance.EVAL_ONLY.value, kind),
         )  # fmt: skip
         return rid
 
@@ -667,12 +685,14 @@ class Store:
         findings: list[Any] | None = None,
         cost_usd: float = 0.0,
         error: str | None = None,
+        result: dict[str, Any] | None = None,
     ) -> None:
         self.x(
             "UPDATE replays SET status=?, verdict=?, findings=?, cost_usd=?, error=?,"
-            " finished_at=? WHERE id=?",
-            (status, verdict, _j(findings or []), cost_usd, error, iso(), replay_id),
-        )
+            " finished_at=?, result=? WHERE id=?",
+            (status, verdict, _j(findings or []), cost_usd, error, iso(), _j(result or {}),
+             replay_id),
+        )  # fmt: skip
 
     def get_replay(self, replay_id: str) -> dict[str, Any]:
         rows = self.q("SELECT * FROM replays WHERE id=?", (replay_id,))

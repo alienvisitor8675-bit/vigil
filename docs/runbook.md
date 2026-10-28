@@ -942,6 +942,32 @@ Run by hand only when the launchd agent isn't installed or is booted out
   after its job is abandoned; to redo it, submit a new job through the API.
 - Running it under launchd arrives with phase 2b, together with the CLI.
 
+## Replaying a spec
+
+A spec replay asks "what would the coord have drafted with this packet?" for a job whose
+spec the owner approved, without touching the job. It needs vigild running, the job's
+vault and clone record on disk, and no open breaker.
+
+- **Run it:** `uv run python cli/vigil spec replay <job> --packet classic` (or
+  `POST /api/spec/replay` with the admin credential and `{"job_id", "packet"}`). `packet`
+  is a variant registered in `COORD_PACKETS` in `vigild/packets/assemble.py`; an unknown
+  name is a 422. A job with no approved spec is a 422. A private repo reaches only the
+  backends its real coord may (403 otherwise). **Replaying ParkAgent's pa-0003 runs only
+  after the owner confirms.**
+- **What it prints:** the replay's id (`rp-...`) and status; the **gate** (ok, or the
+  errors; it runs once, with no re-draft); **AC coverage** (the approved spec's ACs found
+  in the redraft with the same id and the same test command, whitespace collapsed, and
+  the missing ones); the packet's size in characters; the session's tokens (in, cache
+  read, cache write 5m and 1h, out) and its cost. The same row is in `replays`
+  (`kind='spec'`, the report in `result`).
+- **What it costs and where it books:** one coord session, at most `coord_session_usd`
+  (a hard cap), on the experiment line (`experiment_monthly_usd`), never the day, and
+  counted in the month. A full line, or any open breaker, refuses it (409).
+- **What it never does:** publish, push, import into the job, file an inbox item, or change
+  the job, its artifacts or its tasks. Every row it writes is `eval-only`.
+- **To compare packets:** replay the same job once per variant and compare the gate, the
+  coverage, the characters and the cost; the bar is no drop in the gate pass rate.
+
 ## Review replays and the regression set
 
 A replay asks "what would this reviewer prompt have said about that PR?" without

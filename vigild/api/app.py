@@ -501,6 +501,24 @@ def review_replay_set(request: Request, body: ReplaySetBody) -> dict[str, Any]:
     return _replayed(lambda: runner.replay_set(body.prompt_version))
 
 
+class SpecReplayBody(BaseModel):
+    """`POST /api/spec/replay`. No visibility field: the repo's privacy comes from vigild."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1, max_length=64)
+    packet: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/api/spec/replay", dependencies=[ADMIN])
+def spec_replay(request: Request, body: SpecReplayBody) -> dict[str, Any]:
+    """Re-draft a job's approved spec in one coord session with a chosen packet variant, on
+    the experiment line and `eval-only`; one gate run, no publish, no inbox item, the job
+    unchanged (ADR-0005 part 7)."""
+    runner = _svc(request).jobs.runner
+    return _replayed(lambda: runner.replay_spec(body.job_id, body.packet))
+
+
 # --- sessions -----------------------------------------------------------------------
 
 

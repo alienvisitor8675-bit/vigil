@@ -59,6 +59,7 @@ class Runner(Protocol):
         self, job_id: str, task_id: str, prompt_version: str, head: str | None = None
     ) -> dict[str, Any]: ...
     def replay_set(self, prompt_version: str) -> dict[str, Any]: ...
+    def replay_spec(self, job_id: str, packet_variant: str) -> dict[str, Any]: ...
 
 
 class SubmitError(ValueError):
@@ -256,6 +257,14 @@ class JobService:
             # a worker id is never reused in a job (phase 1 run finding #4)
             existing_task_ids=self._used_task_ids(job_id) if job_id else (),
         )
+
+    def gate_drafts(self, repo: str, spec_text: str, plan_text: str, base: str) -> list[str]:
+        """The spec gate's errors for drafts held as text: stores nothing, files nothing
+        (a spec replay's one gate run). A draft that can't be parsed is an error."""
+        try:
+            return self._gate(repo, spec_text, plan_text, base, None)
+        except Exception as e:
+            return [f"the draft can't be parsed: {type(e).__name__}: {e}"[:300]]
 
     def _first_call_fits(self, repo: str) -> None:
         """Preflight: refuse, with the numbers, a job whose roles' first calls

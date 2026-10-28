@@ -67,6 +67,59 @@ def review_replay_set(
     typer.echo(render_report(r.json()))
 
 
+spec_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Spec tools.")
+app.add_typer(spec_app, name="spec")
+
+
+@spec_app.command("replay")
+def spec_replay(
+    job: str = typer.Argument(..., help="a job id, e.g. vi-0002"),
+    packet: str = typer.Option("classic", "--packet", help="The coord packet variant."),
+) -> None:
+    """Re-draft a job's approved spec in one coord session through the running vigild, on
+    the experiment line; prints the gate, AC coverage, packet size, tokens and cost."""
+    import httpx2
+
+    from vigild import config
+
+    cfg = config.load()
+    admin = config.load_secrets().get("VIGIL_API_TOKEN")
+    if not admin:
+        typer.echo("the admin API credential is not set")
+        raise typer.Exit(1)
+    api = cfg.vigild.api
+    try:
+        r = httpx2.post(
+            f"http://{api.host}:{api.port}/api/spec/replay",
+            headers={"Authorization": f"Bearer {admin}"},
+            json={"job_id": job, "packet": packet},
+            timeout=3600,
+        )
+    except httpx2.HTTPError as e:
+        typer.echo(f"vigild is not answering: {type(e).__name__}")
+        raise typer.Exit(1) from e
+    if r.status_code != 200:
+        typer.echo(f"refused ({r.status_code}): {r.json().get('detail', r.text)}"[:500])
+        raise typer.Exit(1)
+    d = r.json()
+    typer.echo(f"{d['id']}  job {d['job_id']}  packet {d['packet']}  status {d['status']}")
+    gate, cov, t = d.get("gate"), d.get("ac_coverage"), d.get("tokens") or {}
+    if gate is not None:
+        typer.echo("gate: " + ("ok" if gate["ok"] else "FAILED"))
+        for err in gate["errors"]:
+            typer.echo(f"  - {err}")
+    if cov is not None:
+        lost = f"; missing {', '.join(cov['missing'])}" if cov["missing"] else ""
+        typer.echo(f"AC coverage: {cov['covered']} of {cov['approved']}{lost}")
+    typer.echo(f"packet: {d.get('packet_chars', 0)} chars")
+    typer.echo(f"tokens: in {t.get('in', 0)}, cache read {t.get('cache_read', 0)}, cache write "
+               f"5m {t.get('cache_write_5m', 0)} / 1h {t.get('cache_write_1h', 0)}, "
+               f"out {t.get('out', 0)}")  # fmt: skip
+    typer.echo(f"cost: ${d['cost_usd']:.4f}")
+    if d.get("error"):
+        typer.echo(f"error: {d['error']}")
+
+
 @hidden_app.command("show")
 def hidden_show(task: str = typer.Argument(..., help="a task id, e.g. pa-0002-w2")) -> None:
     """Print a task's hidden tests and record that you saw them. Owner-only, on

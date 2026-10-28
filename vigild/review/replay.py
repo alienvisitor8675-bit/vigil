@@ -59,6 +59,28 @@ class ReplayRefused(ReplayError):
         self.status = status
 
 
+def _cmd_norm(cmd: str | None) -> str:
+    return " ".join((cmd or "").split())
+
+
+def ac_coverage(approved_spec: str, redraft_spec: str) -> dict[str, Any]:
+    """Whether a redrafted spec keeps every acceptance criterion of the approved one.
+    The rule: an approved AC is covered when the redraft has an AC with the same id and the
+    same backticked test command, after collapsing whitespace. Extra ACs in the redraft are
+    fine; an AC with no command is never covered. `missing` lists the uncovered ids."""
+    from vigild.jobs.artifacts import parse_spec
+
+    have = {c.ident: _cmd_norm(c.test_cmd) for c in parse_spec(redraft_spec).criteria}
+    want = parse_spec(approved_spec).criteria
+    missing = [
+        c.ident
+        for c in want
+        if not _cmd_norm(c.test_cmd) or have.get(c.ident) != _cmd_norm(c.test_cmd)
+    ]
+    return {"approved": len(want), "covered": len(want) - len(missing), "missing": missing,
+            "ok": not missing}  # fmt: skip
+
+
 @dataclass(frozen=True)
 class ResolvedPrompt:
     text: str
