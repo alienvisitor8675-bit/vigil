@@ -58,7 +58,7 @@ feature: vigild logs `config: <feature> is off`, `/api/health` lists it in
 
 | Variable | Purpose | Where to get it | Scope / limits | Phase | `vigil doctor` |
 |---|---|---|---|---|---|
-| `ANTHROPIC_API_KEY` | The gateway's key for every Claude call: coord, workers, reviewer, auditor, the Haiku decider. | Console → org **vigil** → API keys. It already exists. | Org "vigil" only. Set a Console spend limit at or under the monthly credit; vigild's caps sit below it ($5/day, $2/task, $100/month, `configs/budgets.yaml`). | 1 | `GET /v1/models` → 200 |
+| `ANTHROPIC_API_KEY` | The gateway's key for every Claude call: coord, workers, reviewer, auditor, the Haiku decider. | Console → org **vigil** → API keys. It already exists. | Org "vigil" only. Set a Console spend limit at or under the monthly credit; vigild's caps sit below it ($10/day, $2/task, $100/month, `configs/budgets.yaml`). | 1 | `GET /v1/models` → 200 |
 | `GITHUB_APP_ID` | The vigil-worker App's numeric App ID: the `iss` of its JWT. Not secret, but kept with its key. | GitHub → Settings → Developer settings → GitHub Apps → vigil-worker → **App ID**. | — | 1 | `GET /app` → slug `vigil-worker` |
 | `GITHUB_APP_KEY_PATH` | Path to the App's private key, normally `~/.config/vigil/vigil-worker.pem`. | Same page → **Generate a private key**. Save it beside the env file and `chmod 600` it. | Never mounted into any container. | 1 | one installation; mint + revoke a token per repo in `configs/repos.yaml`, and a `contents:read` one on claude-mods |
 | `PHOENIX_SECRET` | Phoenix signs its JWTs with it. | **You generate it** (below), with the `a1` prefix. | Compose only. | 1 | — |

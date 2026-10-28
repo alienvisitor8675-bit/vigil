@@ -24,6 +24,9 @@ from vigild.services import Services, Tokens
 def cfg(tmp_path: Path) -> Config:
     c = config_mod.load()
     c.vigild.data_dir = str(tmp_path / "data")
+    # The cap-mechanics tests are written against a $5 day (two $2 workers fit,
+    # a third queues); the real value is asserted in tests/test_budget.py.
+    c.budgets.daily_usd = 5.0
     return c
 
 

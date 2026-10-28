@@ -125,8 +125,11 @@ def test_a_review_refused_by_the_budget_pages_the_job_not_the_fleet(world: World
 def test_the_coord_prompt_says_how_to_size_caps() -> None:
     from pathlib import Path
 
+    from vigild import config as config_mod
+
     text = (Path(__file__).parents[2] / "prompts" / "coord.md").read_text()
-    assert "max_cost_usd" in text and "$5" in text  # a day with no room is waited for (#15)
+    day = config_mod.load().budgets.daily_usd  # the real cap, so prompt and config agree
+    assert "max_cost_usd" in text and f"${day:g} a day" in text  # no room: waited for (#15)
 
 
 # --- B2-B4 / coord 2: every block has a page with actions ---------------------------------------

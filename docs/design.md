@@ -781,7 +781,7 @@ Why OpenCode over OpenHands, in one paragraph: OpenHands bundles its own sandbox
 - **GitHub:** none. Workers commit; vigild checks scope and pushes from the host (P2).
 - **OTel:** on.
 
-The SDK runs the Claude Code CLI as a child process and exports spans, metrics and log events over OTLP when `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1` and the three `OTEL_*_EXPORTER=otlp` variables are set ([Agent SDK observability](https://code.claude.com/docs/en/agent-sdk/observability)). `vigild` sets `OTEL_RESOURCE_ATTRIBUTES=vigil.task_id=…,vigil.tier=claude,vigil.repo=…` and `TRACEPARENT` so the run nests under the task's trace. It bills to the API key of the "vigil" org. That org's monthly credit ($100–200) is a hard ceiling, so vigild's caps sit well under it: $5 a day, $2 a task, and reviews count toward the day.
+The SDK runs the Claude Code CLI as a child process and exports spans, metrics and log events over OTLP when `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1` and the three `OTEL_*_EXPORTER=otlp` variables are set ([Agent SDK observability](https://code.claude.com/docs/en/agent-sdk/observability)). `vigild` sets `OTEL_RESOURCE_ATTRIBUTES=vigil.task_id=…,vigil.tier=claude,vigil.repo=…` and `TRACEPARENT` so the run nests under the task's trace. It bills to the API key of the "vigil" org. That org's monthly credit ($100–200) is a hard ceiling, so vigild's caps sit well under it: $10 a day, $2 a task, and reviews count toward the day.
 
 **Reviewer.** Same container image, different prompt: it gets the diff from `gh pr diff`, the issue text, and the checklist (wrong charge or consent bypass, test fails before fix, docs updated, no weakened tests, what could be deleted). It can read the repo but has `edit: deny`. It posts a PR review as comments and returns `findings[]` to `vigild`. Empty findings plus green CI marks the PR "ready for human merge"; anything else re-queues a follow-up task.
 
@@ -876,7 +876,7 @@ The tower has no hourly cost, so the question is only whether the local tier's f
 
 At a 20% escalation rate the local tier saves about a third. At 50% escalation it saves nothing, and the right move is to narrow rules 6–8 to the task shapes it passes. `vigild` computes this table from real data every day and shows it on the dashboard, so the decision is never a guess.
 
-**Budget scale.** The table above assumed about $40/day. Your caps are $5/day and $2/task, so expect roughly 3–6 Sonnet tasks a day with their reviews. The 100% Opus audit at rung 0 is the largest line until shapes graduate.
+**Budget scale.** The table above assumed about $40/day. Your caps are $10/day and $2/task, so expect roughly 6–12 Sonnet tasks a day with their reviews. The 100% Opus audit at rung 0 is the largest line until shapes graduate.
 
 **GPU lifecycle on the tower.** `llama-server` keeps a model loaded while the queue has local work and unloads it after 30 idle minutes, dropping idle power to a few watts. The mechanism is router mode if P6 is accepted, and vigild over SSH if not. Load time is 15–30 s from NVMe, so the first task of a batch pays that once. gpt-oss-20b swaps in only for XS tasks, as described above.
 

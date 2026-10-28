@@ -474,7 +474,7 @@ the checklist:
 - pins at least 2 weeks old;
 - what could be deleted.
 
-**Money.** The caps ($5 a day, $2 a task, $100 a month) bind what the
+**Money.** The caps ($10 a day, $2 a task, $100 a month) bind what the
 **vigil key** spends through the gateway: vigild's own sessions, reviews,
 audits and decider calls. Coord's build workers and its PR reviews run on
 your Max plan and aren't counted.
@@ -763,8 +763,8 @@ The outer loop (weekly replay) is part of phase 7 (ruling 3).
 8. **Keys.** No provider key and no GitHub token in any container (P1,
    P2), where the design had a key file and a tmpfs token.
 9. **One GitHub App per role** is deferred (ADR-0001).
-10. **The cost model.** The design assumes $40/day; at $5/day the fleet
-    runs roughly 3–6 Sonnet tasks a day with reviews.
+10. **The cost model.** The design assumes $40/day; at $10/day the fleet
+    runs roughly 6–12 Sonnet tasks a day with reviews.
 11. **Nothing vigil runs bind-mounts from the repo.** The collector's config
     is baked into its image and vigild's data lives in `~/vigil-data`, so
     no container depends on where the checkout is (runbook: Docker Desktop

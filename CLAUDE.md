@@ -26,7 +26,7 @@ exploring. `AGENTS.md` is a symlink to this file.
   layer, pydantic the only schema source (`schemas/*.json` are generated).
 - **Money.** Every hosted model call goes through vigild's gateway
   (`vigild/gateway/`), which meters it and refuses a call that would cross
-  a budget. Nothing else holds a provider key. Caps: $5/day, $2/task,
+  a budget. Nothing else holds a provider key. Caps: $10/day, $2/task,
   $100/month, all hard stops (`configs/budgets.yaml`).
 - **GitHub.** Only vigild talks to GitHub, from the host: it checks scope
   and pushes, and opens draft PRs (P2). Workers never hold a GitHub token.

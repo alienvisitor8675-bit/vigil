@@ -1817,7 +1817,7 @@ def test_a_third_worker_waits_for_the_day_then_runs(world: World) -> None:
     used, and the open reservations never pass the daily cap."""
     w = world
     cfg = w.runner.cfg.budgets
-    assert 3 * cfg.per_task_usd > cfg.daily_usd  # the premise, from the real config
+    assert 3 * cfg.per_task_usd > cfg.daily_usd  # the premise, from the test day (conftest)
 
     def three(job: str) -> tuple[str, str]:
         doc = json.loads(plan(job).split("```json\n")[1].split("\n```")[0])

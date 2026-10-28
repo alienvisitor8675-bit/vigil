@@ -113,7 +113,10 @@ def test_the_overshoot_bound_is_one_call_per_session(budget: Budget) -> None:
     """B14's written bound: the day can't exceed its cap by more than the
     in-flight calls, and the gateway's pre-call check makes even that zero
     for any call whose worst case it can price."""
-    assert budget.cfg.daily_usd == 5.0 and budget.cfg.per_task_usd == 2.0
+    from vigild import config as config_mod
+
+    assert config_mod.load().budgets.daily_usd == 10.0  # the real cap (owner, 2026-10-28)
+    assert budget.cfg.daily_usd == 5.0 and budget.cfg.per_task_usd == 2.0  # the test day
     assert budget.cfg.monthly_usd == 100.0
 
 
