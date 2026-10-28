@@ -4,7 +4,8 @@
       "enum": [
         "claude",
         "local",
-        "human"
+        "human",
+        "eval-only"
       ],
       "title": "Provenance",
       "type": "string"

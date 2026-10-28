@@ -18,10 +18,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from vigild.config import Config, ConfigError
-from vigild.contract.models import Score, Source, Task
+from vigild.contract.models import BenchInfo, Score, Source, Task
 from vigild.db import Store
 from vigild.devimage import missing_tools
 from vigild.gateway.firstcall import refusals as first_call_refusals
@@ -37,6 +37,7 @@ from vigild.jobs.model import InboxItem, Job, JobState
 from vigild.jobs.ownernote import NOTE_MAX_BYTES
 from vigild.metering.calls import session_cost
 from vigild.provenance import Provenance
+from vigild.repos import is_bench_repo
 from vigild.router.rules import RoutingError, route
 from vigild.verifier import runner_overlap
 
@@ -107,6 +108,13 @@ class JobRequest(BaseModel):
     labels: list[str] = Field(default_factory=list)
     # The issue in `repo` this answers: label intake skips an issue a live job carries.
     issue: int | None = Field(default=None, gt=0, strict=True)
+
+    @field_validator("source")
+    @classmethod
+    def _not_bench(cls, v: Source) -> Source:
+        if v is Source.BENCH:
+            raise ValueError("bench jobs are created only by JobService.submit_bench")
+        return v
 
 
 def render_spec(task: Task, money_globs: list[str]) -> str:
@@ -233,12 +241,73 @@ class JobService:
         if errors:
             raise SubmitError(errors)
 
+    @staticmethod
+    def _not_bench(repo: str, source: Source | str) -> None:
+        """A bench repo or the bench source reaches a job only through `submit_bench`."""
+        if is_bench_repo(repo) or str(getattr(source, "value", source)) == "bench":
+            raise SubmitError(["bench jobs are created only by JobService.submit_bench"])
+
+    def submit_bench(
+        self, *, repo: str, base: str, title: str, request: str, bench: BenchInfo
+    ) -> Job:
+        """Make a bench job and start its coord (bench slice 1a). The only way in:
+        there is no REST route. The repo is a virtual `bench/<name>` one that
+        configs/repos.yaml lists; the run never touches GitHub, skips the owner's
+        spec approval (`approve_bench`), and draws from the experiment line."""
+        if not is_bench_repo(repo):
+            raise SubmitError([f"a bench job lives on a bench/ repo, not {repo}"])
+        try:
+            self.cfg.repo(repo)
+            self._first_call_fits(repo)
+        except ConfigError as e:
+            raise SubmitError([str(e)]) from e
+        job = self.store.create_job(
+            repo=repo, base=base, title=title, request=request, notes=[], source="bench"
+        )
+        meta = {
+            "why": f"bench task {bench.task_id} ({bench.dataset})",
+            "value": 3,
+            "risk": 2,
+            "labels": [],
+        }
+        self.store.add_artifact(job.id, "intake.json", json.dumps(meta), Provenance.HUMAN)
+        self.store.add_artifact(
+            job.id, "bench.json", json.dumps(bench.model_dump(mode="json"), sort_keys=True),
+            Provenance.HUMAN,
+        )  # fmt: skip
+        self.runner.on_job_created(job.id, True)
+        return self.store.get_job(job.id)
+
+    def approve_bench(self, job_id: str) -> Job:
+        """`approval: bench` (owner, 2026-10-27): a bench job's draft goes straight to
+        `approved`, through the FSM's guarded bench edge. The spec gate's checks have
+        run and are recorded; a failed gate is tagged by the caller and the run
+        continues, so bench measures spec quality."""
+        job = self.store.get_job(job_id)
+        if job.source != "bench":
+            raise Conflict(f"{job_id} is not a bench job")
+        try:
+            job = transition(
+                self.store, job_id, JobState.APPROVED, Actor.VIGILD,
+                evidence={"bench": True, "approval": "bench"},
+            )  # fmt: skip
+        except TransitionError as e:
+            raise Conflict(str(e)) from e
+        self.store.add_artifact(
+            job_id, "approval.json",
+            json.dumps({"approval": "bench", "actor": "vigild", "edits": None}),
+            Provenance.HUMAN,
+        )  # fmt: skip
+        self.store.add_event("approval", {"approval": "bench"}, Provenance.HUMAN, job_id=job_id)
+        return job
+
     def submit_task(self, raw: dict[str, Any]) -> SubmitOutcome:
         raw = dict(raw)
         # vigild assigns task ids (review r1, item 16); a caller's id is ignored.
         raw["task_id"] = "pending-w1"
         try:
             task = Task.model_validate(raw)
+            self._not_bench(task.repo, task.source)
             self.cfg.repo(task.repo)
             route(task, self.cfg)  # refuse what can't be routed (rule 2 overrides, policy)
             self._first_call_fits(task.repo)
@@ -318,6 +387,7 @@ class JobService:
         """A free-form request becomes a job its coord drafts. `issue` (label
         intake, plan 2a item 2) is the GitHub issue it came from: stored as
         `issue.json` before the coord starts, and fenced in its packet."""
+        self._not_bench(req.repo, req.source)
         try:
             self.cfg.repo(req.repo)
             self._first_call_fits(req.repo)
@@ -377,8 +447,9 @@ class JobService:
 
     def needs_hidden(self, job_id: str) -> dict[str, list[str]]:
         """`flagged_tasks`, but only when the host policy turns hidden tests on for
-        the job's repo: off, nothing waits for an author."""
-        if not self.hidden_enabled(job_id):
+        the job's repo: off, nothing waits for an author. A bench job is graded by its
+        task's own tests, so none is ever written for it."""
+        if self.store.get_job(job_id).source == "bench" or not self.hidden_enabled(job_id):
             return {}
         return self.flagged_tasks(job_id)
 
@@ -390,6 +461,8 @@ class JobService:
         errors = self.gate_spec(job_id)
         if errors or self.needs_hidden(job_id):
             return errors
+        if self.store.get_job(job_id).source == "bench":
+            return []  # no owner step: the runner takes the bench edge
         self.file_item(job_id)
         return []
 
@@ -634,8 +707,18 @@ class JobService:
         self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
     ) -> InboxItem:
         """A question or page for the owner: the third inbox queue. A resumable
-        page carries the job back to work when the owner resumes it."""
+        page carries the job back to work when the owner resumes it. A bench run pages
+        nobody: the page is recorded
+        as an event (and its item closed at once), for the run's report."""
         body = {**body, "resumable": resumable}
+        if job_id is not None and self.store.is_bench(job_id=job_id):
+            item = self.store.create_inbox_item("questions", "page", job_id, title, body)
+            self.store.resolve_inbox_item(item.id, "bench")
+            self.store.add_event(
+                "bench_page", {"title": title, "tag": "harness", **body}, Provenance.HUMAN,
+                job_id=job_id,
+            )  # fmt: skip
+            return self.store.get_inbox_item(item.id)
         item = self.store.create_inbox_item("questions", "page", job_id, title, body)
         self.store.add_event(
             "page", {"item": item.id, "title": title, **body}, Provenance.HUMAN, job_id=job_id

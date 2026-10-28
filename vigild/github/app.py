@@ -44,6 +44,23 @@ class TokenPolicyError(ValueError):
     pass
 
 
+class BenchGitHubRefused(TokenPolicyError):
+    """A bench job (or a `bench/` repo) asked for a GitHub token. Bench mode makes
+    no GitHub call at all (owner, 2026-10-27; issue #8)."""
+
+
+JobSource = Callable[[str], str | None]
+
+
+def bench_exception(repo: str, permissions: Mapping[str, str]) -> bool:
+    """SEAM for bench slice 3, not built (owner, 2026-10-27): the one GitHub write
+    bench mode will make is a single vigild comment, with Smoke results, on a PR of
+    thomasbardhi01/vigil, updated in place. Slice 3 replaces this body (and nothing
+    else here) to allow exactly that token: that repo, `pull_requests: write` only.
+    Until then nothing is allowed, whoever asks."""
+    return False
+
+
 class GitHubError(RuntimeError):
     pass
 
@@ -76,6 +93,7 @@ class GitHubApp:
         allowed_repos: list[str],
         api: str = API,
         clock: Callable[[], float] = time.time,
+        job_source: JobSource | None = None,
     ) -> None:
         self.app_id = app_id
         self.allowed = {_norm(r) for r in allowed_repos}
@@ -84,6 +102,32 @@ class GitHubApp:
         self.claude_mods = _norm(claude_mods)
         self.api = api.rstrip("/")
         self.clock = clock
+        self._job_source = job_source
+
+    def bind_jobs(self, job_source: JobSource) -> None:
+        """Where the lease learns a job's source (`Store.get_job(id).source`), so a
+        bench job is refused here whatever the caller forgot to check."""
+        self._job_source = job_source
+
+    def refuse_bench(self, repo: str, permissions: Mapping[str, str], job_id: str | None) -> None:
+        """The lowest layer of "no GitHub for bench": a job whose source is `bench`,
+        one we can't look up, or any `bench/` repo gets no token (before any HTTP)."""
+        from vigild.repos import is_bench_repo
+
+        why: str | None = None
+        if job_id is not None:
+            try:
+                source = self._job_source(job_id) if self._job_source else None
+            except Exception:  # an unknown job: fail closed
+                source = None
+            if source is None:
+                why = f"job {job_id}'s source can't be read; no token"
+            elif source == "bench":
+                why = f"job {job_id} is a bench job"
+        if why is None and is_bench_repo(repo):
+            why = f"{repo} is a bench repo, not a GitHub repo"
+        if why is not None and not bench_exception(repo, permissions):
+            raise BenchGitHubRefused(f"bench mode makes no GitHub call: {why}; no token minted")
 
     def jwt(self) -> str:
         now = int(self.clock())
@@ -123,7 +167,12 @@ class GitHubApp:
             raise GitHubError(f"no vigil-worker installation on {repo} (HTTP {r.status_code})")
         return int(r.json()["id"])
 
-    def mint(self, repo: str, permissions: Mapping[str, str]) -> InstallationToken:
+    def mint(
+        self, repo: str, permissions: Mapping[str, str], *, job_id: str | None = None
+    ) -> InstallationToken:
+        """`job_id` is the job the token is for; None for vigild's own work (startup,
+        doctor, label intake), which is never a bench job's."""
+        self.refuse_bench(repo, permissions, job_id)
         self.check_policy(repo, permissions)
         repo = repo.strip()
         inst = self.installation_id(repo)
@@ -158,17 +207,21 @@ class GitHubApp:
 
     @contextmanager
     def lease(
-        self, repo: str, permissions: Mapping[str, str] = WORKER_PERMISSIONS
+        self,
+        repo: str,
+        permissions: Mapping[str, str] = WORKER_PERMISSIONS,
+        *,
+        job_id: str | None = None,
     ) -> Iterator[InstallationToken]:
-        tok = self.mint(repo, permissions)
+        tok = self.mint(repo, permissions, job_id=job_id)
         try:
             yield tok
         finally:
             self.revoke(tok.token)
 
-    def is_private(self, repo: str) -> bool:
+    def is_private(self, repo: str, *, job_id: str | None = None) -> bool:
         """The repo's real visibility, read with a metadata-only token (item 10)."""
-        with self.lease(repo, {"metadata": "read"}) as tok:
+        with self.lease(repo, {"metadata": "read"}, job_id=job_id) as tok:
             r = self.http.get(
                 f"{self.api}/repos/{repo.strip()}",
                 headers={

@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from vigild.gitsafe import GitError, git, git_bytes
+from vigild.repos import is_bench_repo
 from vigild.safefile import UnsafeFile, safe_read_bytes
 
 ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -104,6 +105,13 @@ class Workspace:
     def _update_mirror(self, repo: str) -> Path:
         """Fetch (or make) the mirror; the caller holds the repo's lock."""
         path = self._mirror_path(repo)
+        if is_bench_repo(repo):
+            # a bench repo is not on GitHub: its mirror is imported from the task image
+            # (bench slice 1b) and never fetched, so no token is asked for and no
+            # remote is contacted
+            if not path.exists():
+                raise WorkspaceError(f"bench repo {repo} has not been imported; nothing to fetch")
+            return path
         with self.token_for(repo) as token:
             if path.exists():
                 self._git(path, "remote", "update", "--prune", token=token)
@@ -557,6 +565,8 @@ class Workspace:
             raise WorkspaceError(str(e)) from e
 
     def push(self, repo: str, head: str, branch: str, token: str | None) -> None:
+        if is_bench_repo(repo):
+            raise WorkspaceError(f"{repo} is a bench repo: nothing is pushed")
         self._git(
             self.vault(repo), "push", "--quiet", "--no-verify", self.remote_url(repo),
             f"{head}:refs/heads/{branch}", token=token,

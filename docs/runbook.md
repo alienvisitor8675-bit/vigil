@@ -526,6 +526,15 @@ uv run python -m vigild
   waits for its own condition (or your reset). A backend breaker also closes itself
   after a successful probe five minutes on, resolving its page; meanwhile
   its work goes to the preset's fallback in `configs/routing.yaml`.
+- **The experiment line (bench; owner, 2026-10-27).** A bench job's money comes from
+  `experiment_monthly_usd` in `configs/budgets.yaml` ($30 a UTC month), never from the
+  $5 day; it still counts toward the $100 month, and a bench task's own cap is
+  `bench_task_usd` ($1.50). Both are hard stops. A bench reservation with no room is
+  refused, not queued, and pages nobody: the run ends with the failure tag `budget`
+  (a `bench_failure` event). `vigil doctor` prints the line's spend this month ("experiment
+  budget"). At about $0.50-1.50 a task that is 2-6 Smoke runs a month and no Core run;
+  raising the line is your edit of that file. Bench rows are `eval-only`, which the
+  training exporter refuses.
 - **Midnight.** Work still running at UTC midnight counts against the new
   day (and month) until it settles, since its whole cost books to the day it
   settles; the new day's room is $5 less that.

@@ -1,7 +1,7 @@
 """vigild's SQLite store (B2): stdlib sqlite3, WAL, one writer.
 
 Every table that holds an artifact or a record of work carries a
-`provenance` column constrained to claude | local | human.
+`provenance` column constrained to claude | local | human | eval-only.
 """
 
 from __future__ import annotations
@@ -32,8 +32,9 @@ from vigild.jobs.model import (
 )
 from vigild.provenance import Provenance, require
 from vigild.redact import redact
+from vigild.repos import is_bench_repo
 
-PROV = "provenance TEXT NOT NULL CHECK (provenance IN ('claude','local','human'))"
+PROV = "provenance TEXT NOT NULL CHECK (provenance IN ('claude','local','human','eval-only'))"
 
 # Phase 2a: each new table's DDL is a constant, used by SCHEMA (a new
 # database) and by its migration step (an old one).
@@ -236,7 +237,9 @@ def _m10_live_visibility(conn: sqlite3.Connection) -> None:
 
 # A provenance column added to an existing table needs a default: these rows
 # are vigild's own records, which it tags `human` like its events.
-PROV_ADDED = "TEXT NOT NULL DEFAULT 'human' CHECK (provenance IN ('claude','local','human'))"
+PROV_ADDED = (
+    "TEXT NOT NULL DEFAULT 'human' CHECK (provenance IN ('claude','local','human','eval-only'))"
+)
 
 LADDER_CHANGES_DDL = f"""CREATE TABLE IF NOT EXISTS ladder_changes (
   id INTEGER PRIMARY KEY AUTOINCREMENT, shape TEXT NOT NULL, old_rung INTEGER NOT NULL,
@@ -271,6 +274,53 @@ def _m12_issue_link(conn: sqlite3.Connection) -> None:
     )
 
 
+OLD_PROV_CHECK = "'claude','local','human')"
+NEW_PROV_CHECK = "'claude','local','human','eval-only')"
+
+
+def _m13_eval_only(conn: sqlite3.Connection) -> None:
+    """Bench 1a: `eval-only` joins the provenance CHECK (owner, 2026-10-27).
+
+    SQLite can't alter a CHECK in place. The 12-step rebuild (new table, copy, drop,
+    rename) would have to run for sixteen tables, three of them referenced by foreign
+    keys (jobs, tasks, sessions), and it needs `foreign_keys=OFF`, which SQLite
+    ignores inside the transaction every step runs in. A new column would leave the
+    CHECK-bound `provenance` saying something else than the row's real tag. So this
+    uses SQLite's documented in-place route for loosening a constraint
+    (lang_altertable.html, "Making Other Kinds Of Table Schema Changes"): edit the
+    stored CREATE statement of each table, bump `schema_version`, and check the
+    result. Widening a CHECK can't make an existing row invalid, so no row is
+    rewritten. Idempotent: a table whose statement already lists `eval-only` is not
+    touched, and the SQL replaced is the exact text SCHEMA and PROV_ADDED write."""
+    rows = conn.execute(
+        "SELECT name, sql FROM sqlite_schema WHERE type='table' AND sql LIKE ?",
+        (f"%{OLD_PROV_CHECK}%",),
+    ).fetchall()
+    if not rows:
+        return
+    version = int(conn.execute("PRAGMA schema_version").fetchone()[0])
+    conn.execute("PRAGMA writable_schema=ON")
+    try:
+        for name, sql in rows:
+            conn.execute(
+                "UPDATE sqlite_schema SET sql=? WHERE type='table' AND name=?",
+                (sql.replace(OLD_PROV_CHECK, NEW_PROV_CHECK), name),
+            )
+        conn.execute(f"PRAGMA schema_version={version + 1}")
+    finally:
+        conn.execute("PRAGMA writable_schema=OFF")
+    problems = conn.execute("PRAGMA integrity_check").fetchall()
+    if [tuple(r) for r in problems] != [("ok",)]:
+        raise sqlite3.DatabaseError(f"integrity_check after widening provenance: {problems}")
+
+
+def _m14_experiment_pool(conn: sqlite3.Connection) -> None:
+    """Bench 1a: a reservation and a ledger row say which pool they draw from, the
+    operating budget (`ops`) or the experiment line (`experiment`)."""
+    for table in ("reservations", "ledger"):
+        _add_columns(conn, table, {"pool": "TEXT NOT NULL DEFAULT 'ops'"})
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
@@ -284,6 +334,8 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m10_live_visibility,
     _m11_round2,
     _m12_issue_link,
+    _m13_eval_only,
+    _m14_experiment_pool,
 ]
 
 
@@ -355,6 +407,42 @@ class Store:
             cur = self.conn.execute(sql, args)
             return int(cur.lastrowid or 0)
 
+    # --- bench provenance (bench 1a) ------------------------------------------------------
+
+    def is_bench(
+        self,
+        *,
+        job_id: str | None = None,
+        session_id: str | None = None,
+        task_id: str | None = None,
+    ) -> bool:
+        """Whether a record belongs to a bench job, found through whichever of the
+        job, its session or its task the caller has."""
+        if job_id is None and session_id is not None:
+            rows = self.q("SELECT job_id FROM sessions WHERE id=?", (session_id,))
+            job_id = rows[0][0] if rows else None
+        if job_id is None and task_id is not None:
+            rows = self.q("SELECT job_id FROM tasks WHERE id=?", (task_id,))
+            job_id = rows[0][0] if rows else None
+        if job_id is None:
+            return False
+        rows = self.q("SELECT source FROM jobs WHERE id=?", (job_id,))
+        return bool(rows) and rows[0][0] == "bench"
+
+    def row_provenance(
+        self,
+        provenance: Provenance | str,
+        *,
+        job_id: str | None = None,
+        session_id: str | None = None,
+        task_id: str | None = None,
+    ) -> str:
+        """The tag a row is stored with: every row of a bench job is `eval-only`,
+        whatever made it (the one place that decides), else the caller's own."""
+        if self.is_bench(job_id=job_id, session_id=session_id, task_id=task_id):
+            return Provenance.EVAL_ONLY.value
+        return require(provenance).value
+
     # --- jobs ---------------------------------------------------------------
 
     def create_job(
@@ -370,6 +458,12 @@ class Store:
         provenance: Provenance | str = Provenance.HUMAN,
         issue: int | None = None,
     ) -> Job:
+        if (source == "bench") != is_bench_repo(repo):
+            raise ValueError(
+                f"a bench job lives on a bench/ repo and only there: {source!r} on {repo!r}"
+            )
+        if source == "bench":
+            provenance = Provenance.EVAL_ONLY
         depth = 0
         if parent_job_id:
             depth = self.get_job(parent_job_id).fix_depth + 1
@@ -485,7 +579,7 @@ class Store:
                 None,
                 None,
                 iso(),
-                require(provenance).value,
+                self.row_provenance(provenance, job_id=job_id),
             ),
         )
         return self.get_task(tid)
@@ -556,7 +650,7 @@ class Store:
                 "created",
                 branch,
                 iso(),
-                require(provenance).value,
+                self.row_provenance(provenance, job_id=job_id),
             ),
         )
         return self.get_session(sid)
@@ -651,7 +745,7 @@ class Store:
     ) -> None:
         """Transcript lines the harness mirrored from the SDK (its session
         store), in order. Entries are opaque JSON; the SDK reads them back."""
-        now, prov = iso(), require(provenance).value
+        now, prov = iso(), self.row_provenance(provenance, session_id=session_id)
         with self.tx() as c:
             c.executemany(
                 "INSERT INTO transcripts (session_id, sdk_session_id, subpath, entry, ts,"
@@ -692,7 +786,17 @@ class Store:
         return self.x(
             "INSERT INTO events (job_id, session_id, task_id, ts, type, data, provenance)"
             " VALUES (?,?,?,?,?,?,?)",
-            (job_id, session_id, task_id, iso(), type, _j(dict(data)), require(provenance).value),
+            (
+                job_id,
+                session_id,
+                task_id,
+                iso(),
+                type,
+                _j(dict(data)),
+                self.row_provenance(
+                    provenance, job_id=job_id, session_id=session_id, task_id=task_id
+                ),
+            ),
         )
 
     def events(
@@ -735,7 +839,15 @@ class Store:
         return self.x(
             "INSERT INTO artifacts (job_id, task_id, name, content, sha256, created_at, provenance)"
             " VALUES (?,?,?,?,?,?,?)",
-            (job_id, task_id, name, content, digest, iso(), require(provenance).value),
+            (
+                job_id,
+                task_id,
+                name,
+                content,
+                digest,
+                iso(),
+                self.row_provenance(provenance, job_id=job_id),
+            ),
         )
 
     def get_artifact(
@@ -790,7 +902,15 @@ class Store:
         iid = self.x(
             "INSERT INTO inbox_items (queue, kind, job_id, title, body, created_at, provenance)"
             " VALUES (?,?,?,?,?,?,?)",
-            (queue, kind, job_id, title, _j(dict(body)), iso(), require(provenance).value),
+            (
+                queue,
+                kind,
+                job_id,
+                title,
+                _j(dict(body)),
+                iso(),
+                self.row_provenance(provenance, job_id=job_id),
+            ),
         )
         return self.get_inbox_item(iid)
 
@@ -818,5 +938,13 @@ class Store:
         return self.x(
             "INSERT INTO approvals (job_id, inbox_item_id, actor, channel, edits, ts, provenance)"
             " VALUES (?,?,?,?,?,?,?)",
-            (job_id, inbox_item_id, actor, channel, edits, iso(), Provenance.HUMAN.value),
+            (
+                job_id,
+                inbox_item_id,
+                actor,
+                channel,
+                edits,
+                iso(),
+                self.row_provenance(Provenance.HUMAN, job_id=job_id),
+            ),
         )

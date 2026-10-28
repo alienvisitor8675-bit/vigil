@@ -275,6 +275,8 @@ class Ladder:
         never counts toward a shape's graduation (finding #2)."""
         if runner_file:
             return None
+        if self.store.is_bench(job_id=audit.job_id):
+            return None  # a bench run measures vigil; it does not move a repo's rung
         missed = audit.missed()
         high = sum(1 for f in missed if f.severity is Severity.HIGH)
         medium = sum(1 for f in missed if f.severity is Severity.MEDIUM)
