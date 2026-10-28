@@ -16,7 +16,7 @@ import pytest
 
 from tests.conftest import git
 from tests.harness import LocalTestRunner, finish_session
-from vigild.verifier import Verifier, judge, outcome, with_reports
+from vigild.verifier import Halted, Verifier, halt_when, judge, outcome, with_reports
 from vigild.workspace import Workspace
 
 KEY = b"k" * 32
@@ -108,6 +108,29 @@ def test_must_fail_first_off_runs_base_and_after(ws: Workspace, tmp_path: Path) 
     runner = LocalTestRunner()
     rec = _verify(ws, base, head, mff=False, runner=runner)
     assert "before" not in rec and len(runner.calls) == 3  # base twice, after
+
+
+def test_a_job_killed_between_runs_starts_no_further_container(
+    ws: Workspace, tmp_path: Path
+) -> None:
+    """Kill (issue #52): checked before every run; the base ran, the job was killed, and
+    neither the second base run, `before` nor `after` starts a container."""
+    base, head = _session(ws, tmp_path, _turn_on)
+    killed = False
+
+    class Killing(LocalTestRunner):
+        def run(self, *a: Any, **k: Any) -> Any:
+            nonlocal killed
+            out = super().run(*a, **k)
+            killed = True  # the owner's kill lands while the first run is going
+            return out
+
+    runner = Killing()
+    with pytest.raises(Halted), halt_when(lambda: killed):
+        _verify(ws, base, head, runner=runner)
+    assert len(runner.calls) == 1
+    # and with the job alive nothing is held back
+    assert _verify(ws, base, head, runner=LocalTestRunner())["after"]["outcome"] == "pass"
 
 
 def test_each_run_gets_a_fresh_checkout_with_no_hooks(ws: Workspace, tmp_path: Path) -> None:

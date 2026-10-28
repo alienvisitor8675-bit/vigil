@@ -9,6 +9,7 @@ without Docker; `DockerRuntime` runs them (tests/security/ runs it for real).
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import io
 import json
 import re
@@ -18,7 +19,7 @@ import shutil
 import socket
 import tarfile
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,30 @@ from vigild.executors.egress import acl_yaml, allowlist, proxy_config_yaml
 from vigild.verifier import MAX_REPORT, REPORT_DIR, RunResult
 
 LABEL = "dev.vigil.session"
+JOB_LABEL = "dev.vigil.job"  # the job a container works for (kill, issue #52)
+_JOB: contextvars.ContextVar[str] = contextvars.ContextVar("vigil_job", default="")
+
+
+@contextmanager
+def job_scope(job_id: str) -> Iterator[None]:
+    """Containers vigild starts for a job outside a session (verifier checkouts,
+    hidden-test probes, deps builds) carry the job's label while this is open, so
+    `vigil kill` finds them by it; never by a name or a prefix."""
+    token = _JOB.set(job_id)
+    try:
+        yield
+    finally:
+        _JOB.reset(token)
+
+
+def current_job() -> str:
+    return _JOB.get()
+
+
+def job_labels(job_id: str) -> dict[str, str]:
+    return {JOB_LABEL: job_id} if job_id else {}
+
+
 OUTPUT_SCHEMA = "/vigil/output_schema.json"
 RESUME = "/vigil/resume.jsonl"
 HOOK_DIR = "/run/vigil"  # root-owned tmpfs: the Stop hook's inputs (2a round 2, A6/B12)
@@ -132,7 +157,11 @@ def worker_kwargs(
             HOOK_DIR: "rw,size=1m,uid=0,gid=0,mode=0755",
         },
         "stdin_open": True,
-        "labels": {LABEL: spec.session_id, "dev.vigil.role": spec.role.value},
+        "labels": {
+            LABEL: spec.session_id,
+            "dev.vigil.role": spec.role.value,
+            **job_labels(spec.job_id),
+        },
         "working_dir": "/work",
         **_hardening(cfg, host),
         "cap_add": list(HARNESS_CAPS),
@@ -154,7 +183,11 @@ def proxy_kwargs(cfg: Config, spec: SessionSpec, host: SandboxHost | None = None
         "command": ["--config-file=/etc/smokescreen/config.yaml"],
         "mounts": [_mount(str(spec.session_dir / "proxy"), "/etc/smokescreen", read_only=True)],
         "network": "bridge",
-        "labels": {LABEL: spec.session_id, "dev.vigil.role": "egress"},
+        "labels": {
+            LABEL: spec.session_id,
+            "dev.vigil.role": "egress",
+            **job_labels(spec.job_id),
+        },
         **_hardening(cfg, host),
         "mem_limit": "128m",
         "pids_limit": 64,
@@ -343,7 +376,11 @@ def verifier_kwargs(
             **(env or {}),
         },
         "stdin_open": True,  # the report marker, then closed
-        "labels": {LABEL: f"verify-{source.parent.name}", "dev.vigil.role": "verifier"},
+        "labels": {
+            LABEL: f"verify-{source.parent.name}",
+            "dev.vigil.role": "verifier",
+            **job_labels(current_job()),
+        },
         **_hardening(cfg, host),
         "cap_add": list(SUBJECT_CAPS if subject else VERIFIER_CAPS),
         "mem_limit": cfg.vigild.container.verifier_memory,
@@ -394,7 +431,11 @@ def deps_kwargs(
         "mounts": [_mount(str(work), "/work", read_only=False)],
         "tmpfs": {"/tmp": f"rw,exec,size=2g,uid={uid},gid={uid},mode=1777"},  # noqa: S108
         "working_dir": "/work",
-        "labels": {LABEL: f"deps-{work.name}", "dev.vigil.role": "deps"},
+        "labels": {
+            LABEL: f"deps-{work.name}",
+            "dev.vigil.role": "deps",
+            **job_labels(current_job()),
+        },
         **_hardening(cfg, host),
     }
 
@@ -613,7 +654,10 @@ class DockerRuntime:
         write_session_files(self.cfg, spec, self.host)
         net_name = f"vigil-{spec.session_id}"
         net = self.client.networks.create(
-            net_name, driver="bridge", internal=True, labels={LABEL: spec.session_id}
+            net_name,
+            driver="bridge",
+            internal=True,
+            labels={LABEL: spec.session_id, **job_labels(spec.job_id)},
         )
         proxy = collector = None
         try:
@@ -712,6 +756,50 @@ class DockerRuntime:
             with contextlib.suppress(Exception):
                 c.kill()
 
+    @staticmethod
+    def _of_job(labels: Mapping[str, str], job_id: str, session_ids: set[str]) -> bool:
+        """Whether a container or network belongs to the job: it carries the job's label
+        (a verifier checkout, a hidden-test probe, a deps build, a session's sidecar and
+        network), or it is labelled for one of the job's sessions."""
+        return labels.get(JOB_LABEL) == job_id or labels.get(LABEL, "") in session_ids
+
+    def stop_job(self, job_id: str, session_ids: Iterable[str]) -> int:
+        """Kill every running container of a job (kill, #52): its sessions' and
+        sidecars', its verifier's, probes' and deps builds'. Found by vigil's labels
+        only. The sessions' own `run` then sees the exit and cleans up; `purge_job`
+        removes what is left."""
+        sids = set(session_ids)
+        n = 0
+        for c in self.client.containers.list(filters={"label": LABEL}):
+            if self._of_job(c.labels or {}, job_id, sids):
+                with contextlib.suppress(Exception):  # it may have exited already
+                    c.kill()
+                    n += 1
+        return n
+
+    def purge_job(self, job_id: str, session_ids: Iterable[str]) -> dict[str, int]:
+        """Remove every container and network of a job that is still there, by vigil's
+        labels only (kill, #52). Never touches another job's, nor anything unlabelled."""
+        sids = set(session_ids)
+        out = {"containers": 0, "networks": 0}
+        for c in self.client.containers.list(all=True, filters={"label": LABEL}):
+            if self._of_job(c.labels or {}, job_id, sids):
+                with contextlib.suppress(Exception):
+                    c.remove(force=True)
+                    out["containers"] += 1
+        for net in self.client.networks.list(filters={"label": LABEL}):
+            labels = (getattr(net, "attrs", None) or {}).get("Labels") or {}
+            if self._of_job(labels, job_id, sids):
+                with contextlib.suppress(Exception):
+                    net.reload()
+                    # the shared collector is attached to every session network
+                    for cid in net.attrs.get("Containers") or {}:
+                        with contextlib.suppress(Exception):
+                            net.disconnect(cid, force=True)
+                    net.remove()
+                    out["networks"] += 1
+        return out
+
     def run_deps(
         self, image: str, work: Path, command: str, timeout_s: int = 900
     ) -> tuple[int, str]:
@@ -724,7 +812,8 @@ class DockerRuntime:
 
         sid = f"deps-{secrets.token_hex(5)}"
         spec = SessionSpec(
-            session_id=sid, role=Role.DEPS, job_id="", task_id=None, repo="", preset="none",
+            session_id=sid, role=Role.DEPS, job_id=current_job(), task_id=None, repo="",
+            preset="none",
             model="", clone=work, session_dir=self.cfg.vigild.data_path / "sessions" / sid,
             max_turns=0, max_minutes=timeout_s // 60, max_budget_usd=0.0,
         )  # fmt: skip

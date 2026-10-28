@@ -47,7 +47,9 @@ import re
 import shlex
 import shutil
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -570,6 +572,24 @@ def _listed_files(output: str) -> list[str] | None:
                 for x in val
             ]
     return None
+
+
+class Halted(Exception):
+    """The job was killed between two runs: no further container is started."""
+
+
+_HALTED: ContextVar[Callable[[], bool] | None] = ContextVar("verifier_halted", default=None)
+
+
+@contextmanager
+def halt_when(check: Callable[[], bool]) -> Iterator[None]:
+    """While open, every run this thread's verifier makes first asks `check`; true stops
+    the verification with `Halted` before a container starts (kill, issue #52)."""
+    token = _HALTED.set(check)
+    try:
+        yield
+    finally:
+        _HALTED.reset(token)
 
 
 class Verifier:
@@ -1095,6 +1115,9 @@ class Verifier:
         env: Mapping[str, str] | None = None,
         subject: Path | None = None,
     ) -> dict[str, Any]:
+        halted = _HALTED.get()
+        if halted is not None and halted():
+            raise Halted(f"{name}: the job was killed; no further run")
         src = self.ws.verify_checkout(repo, name, sha, take=take, put=put)
         try:
             r = self.runner.run(

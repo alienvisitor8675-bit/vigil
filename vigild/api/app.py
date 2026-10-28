@@ -23,11 +23,13 @@ from vigild.api.auth import (
     require,
 )
 from vigild.db import Store
+from vigild.jobs.fsm import KILL_CHANNELS, Actor
 from vigild.jobs.service import (
     BadNote,
     Conflict,
     DuplicateIssue,
     JobRequest,
+    KillFailed,
     NoteTooLarge,
     NotFound,
     SubmitError,
@@ -173,6 +175,30 @@ def get_job_tree(request: Request, job_id: str) -> dict[str, Any]:
     store = _svc(request).store
     _job_or_404(store, job_id)
     return job_tree(store, job_id)
+
+
+@router.post("/api/jobs/{job_id}/kill", dependencies=[ADMIN])
+def kill_job(
+    request: Request, job_id: str, body: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
+    """Stop a job cleanly (issue #52): its sessions and sidecars, gateway tokens and
+    reservations, then the job is abandoned. `{"channel": "api" | "cli"}` says where the
+    kill came from (default `api`); it is recorded with the actor. A job that is already
+    done or abandoned, or a second kill, is not an error: 200 with `already: <state>`."""
+    channel = (body or {}).get("channel", "api")
+    if not isinstance(channel, str) or channel not in KILL_CHANNELS:
+        raise HTTPException(422, f"channel must be one of {list(KILL_CHANNELS)}")
+    try:
+        return _plain(_svc(request).jobs.kill(job_id, Actor.OWNER, channel))  # type: ignore[no-any-return]
+    except NotFound as e:
+        raise HTTPException(404, "no such job") from e
+    except Conflict as e:
+        raise HTTPException(409, str(e)) from e
+    except KillFailed as e:
+        raise HTTPException(
+            500,
+            f"kill failed at {e}. The job is abandoned; kill it again to finish.",
+        ) from e
 
 
 # --- the inbox --------------------------------------------------------------------

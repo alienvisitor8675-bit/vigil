@@ -265,7 +265,24 @@ def _merged_by_hand(c: Ctx) -> list[str]:
     return errs
 
 
+KILL_CHANNELS = ("api", "cli")  # `vigil kill` and POST /api/jobs/{id}/kill (issue #52)
+
+
+def _killed(c: Ctx) -> bool:
+    """The owner's kill, from the CLI or the API: the one way out of any live state,
+    held ones included (a job that is stuck is the case it is for)."""
+    return (
+        c.actor is Actor.OWNER and c.channel in KILL_CHANNELS and c.evidence.get("action") == "kill"
+    )
+
+
+def _kill_guard(c: Ctx) -> list[str]:
+    return [] if _killed(c) else ["only the owner's kill (CLI or API) abandons a job here"]
+
+
 def _abandon(c: Ctx) -> list[str]:
+    if _killed(c):
+        return []
     if c.actor is not Actor.OWNER or c.channel != "inbox":
         return ["only the owner, from the inbox, abandons a job"]
     return [] if c.evidence.get("action") == "abandon" else ["abandoning needs action=abandon"]
@@ -291,6 +308,19 @@ EDGES: dict[tuple[JobState, JobState], Guard] = {
     (S.MERGED, S.VERIFYING): _none,
     (S.VERIFYING, S.DONE): _verified,
     (S.SPEC_PENDING, S.ABANDONED): _abandon,
+    # the owner's kill reaches every other live state; the inbox's abandon does not
+    **{
+        (frm, S.ABANDONED): _kill_guard
+        for frm in (
+            S.APPROVED,
+            S.PLANNING,
+            S.BUILDING,
+            S.IN_REVIEW,
+            S.READY,
+            S.MERGED,
+            S.VERIFYING,
+        )
+    },
 }
 HOLDS = (S.BLOCKED, S.ESCALATED)
 TERMINAL = (S.DONE, S.ABANDONED)
@@ -322,6 +352,7 @@ def transition(
         ctx = Ctx(store, job, actor, channel, evidence)
         owner_inbox = actor is Actor.OWNER and channel == "inbox"
         blocked_from: JobState | None = None
+        kill_hold = frm in HOLDS and to is S.ABANDONED and _killed(ctx)
 
         if frm in TERMINAL:
             raise TransitionError(f"{job_id} is {frm.value}; no transition out of it")
@@ -337,6 +368,8 @@ def transition(
                 except KeyError as e:
                     raise TransitionError(f"blocked_on names no job: {blocker}") from e
             blocked_from = frm
+        elif kill_hold:
+            pass  # the owner's kill moves a held job to abandoned, nothing else does
         elif frm in HOLDS:
             action = evidence.get("action")
             if to != job.blocked_from and (action is None or FROM_HOLD.get(to) != action):

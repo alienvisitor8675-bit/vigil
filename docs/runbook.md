@@ -546,6 +546,26 @@ refused in code, before anything runs, with a reason on a Resume page.
 doing now; nothing runs there until the transfer is built (bench slice 1b
 needs it).
 
+### Kill a job
+
+`vigil kill <job>` stops a job cleanly, whatever it is doing. It needs `VIGIL_API_TOKEN`
+(in your shell, or in the env file vigild reads) and finds vigild at `VIGIL_API_URL`
+(default: the configured loopback listener, `http://127.0.0.1:8787`):
+
+```sh
+uv run python cli/vigil kill pa-0007
+```
+
+It moves the job to `abandoned`, kills its session containers and egress sidecars (and a
+verifier run), removes them and their networks, revokes the job's gateway tokens, waits up to
+30 s for model calls in flight, and settles what was metered and releases every hold. Open
+PRs stay: close them yourself. The answer lists what it did. If it says a call is still in
+flight (`pending_calls`), the reservation stays open, and counted against the day, until the
+call lands. A job that is already `done` or `abandoned` (or a second kill) is a no-op that
+says so, and exits 0. If a kill fails partway, vigil prints the step (a 500); the job is already
+`abandoned`, and running `vigil kill <job>` again finishes the work. A kill is not a failure: it does not count toward the repo's failure
+breaker. Only containers carrying the job's own `dev.vigil.session` labels are touched.
+
 ### Check everything
 
 ```sh

@@ -70,6 +70,7 @@ from vigild.db import SessionRoleError, Store, iso, utcnow
 from vigild.devimage import DevImages, SessionImages, StaleDevImage, missing_tools
 from vigild.executors.base import ExecOutcome, Executor, Resume, SessionSpec
 from vigild.executors.hosts import HostRefused
+from vigild.executors.runtime import job_scope
 from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
 from vigild.github.publish import LegacyBranch, PublishError, artifact_paths, vigild_paths
 from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
@@ -116,7 +117,7 @@ from vigild.router.rules import RoutingError, route
 from vigild.scheduler import wip
 from vigild.scheduler.graph import Slots, run_graph
 from vigild.telemetry.spans import Telemetry
-from vigild.verifier import Verifier, runner_like, runner_overlap
+from vigild.verifier import Halted, Verifier, halt_when, runner_like, runner_overlap
 from vigild.workspace import Workspace, WorkspaceError
 
 log = logging.getLogger("vigild.runner")
@@ -188,6 +189,10 @@ class Pager(Protocol):
 SPEC_WAIT = frozenset({JobState.SPEC_PENDING})  # where a coord or an author waits
 BUILD_WAIT = frozenset({JobState.BUILDING})  # where a worker waits
 REVIEW_WAIT = frozenset({JobState.IN_REVIEW})  # where a review reserve waits
+
+
+class PublishSkipped(PublishError):
+    """The job was killed: nothing is pushed and no PR is opened (issue #52)."""
 
 
 class QueueCancelled(Exception):
@@ -932,7 +937,17 @@ class JobRunner:
 
     def _publish(self, job: Job, **kw: Any) -> str:
         """Publish through the publisher the job's kind gets: a bench job's is a
-        no-op that records "not published (bench)"."""
+        no-op that records "not published (bench)". A killed job publishes nothing: the
+        check is the last thing before the push, for the worker, the deps job and the
+        re-send of an open PR alike."""
+        if self._abandoned(job.id):
+            self.store.add_event(
+                "publish_skipped",
+                {"reason": "the job was killed", "branch": kw.get("branch"),
+                 "head": kw.get("head")},
+                Provenance.HUMAN, job_id=job.id,
+            )  # fmt: skip
+            raise PublishSkipped(f"{job.id} was killed; nothing is published")
         if job.source == "bench":
             url = self.bench_publisher.publish(**kw)
             self.store.add_event(
@@ -1134,6 +1149,11 @@ class JobRunner:
         with self.slots.session():
             out: ExecOutcome | None = None
             try:
+                if spec.job_id and self._abandoned(spec.job_id):
+                    # killed while this session waited for a slot: it never starts, and
+                    # never gets a token (issue #52). The finally settles its reservation.
+                    out = ExecOutcome("killed", None, {}, "the job was killed")
+                    return out
                 # inside the try: a token refused (the repo went private) still
                 # settles the reservation (2a round 8)
                 token = self.gateway.issue_token(
@@ -1279,10 +1299,106 @@ class JobRunner:
         tasks = json.loads(rows[0]["data"]).get("tasks")
         return tasks if isinstance(tasks, dict) else {}
 
+    def _abandoned(self, job_id: str) -> bool:
+        try:
+            return self.store.get_job(job_id).state is JobState.ABANDONED
+        except KeyError:
+            return False
+
     def busy(self, job_id: str) -> bool:
         """Whether a run already holds the job (a second start would be dropped)."""
         with self._running_lock:
             return job_id in self._running
+
+    # --- kill (issue #52) ----------------------------------------------------------------
+
+    def _kill_sweep(self, job_id: str) -> tuple[list[str], list[str], int]:
+        """Stop what the job has running now: its sessions' and verifier's containers (by
+        label), then revoke every token of its sessions. Returns the session ids, the task
+        ids and the number of tokens revoked."""
+        sids = [s.id for s in self.store.list_sessions(job_id)]
+        tids = [t.id for t in self.store.list_tasks(job_id)]
+        stop = getattr(self.executor, "stop_job", None)
+        if stop is not None:
+            try:
+                stop(job_id, sids)
+            except Exception:
+                log.exception("kill %s: stopping its containers failed", job_id)
+        revoked = 0
+        for sid in sids:
+            live = self.store.q(
+                "SELECT COUNT(*) n FROM gateway_tokens WHERE session_id=? AND revoked_at IS NULL",
+                (sid,),
+            )
+            revoked += int(live[0]["n"])
+            self.gateway.revoke(sid)
+        return sids, tids, revoked
+
+    def kill_job(self, job_id: str, *, wait: float = 30.0) -> dict[str, Any]:
+        """The runner's half of `vigil kill` (the job is already `abandoned`, so nothing new
+        starts). In order: stop the job's containers and revoke its gateway tokens; wait,
+        for at most `wait` seconds, for its run to end and its in-flight model calls to
+        drain; settle what is metered and release what is held (a session's reservations
+        once its calls have landed, so a streamed call's spend is booked once; the review
+        stage and any other hold without a session at once); remove the containers and
+        networks that are left, by label. A call that outlives `wait` settles its session
+        when it lands (`Gateway.after_drain`), and is reported as pending."""
+        deadline = time.monotonic() + wait
+        stopped = [s.id for s in self.store.list_sessions(job_id) if s.status in LIVE_SESSION]
+        sids, tids, revoked = self._kill_sweep(job_id)
+        while self.busy(job_id) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        idle = not self.busy(job_id)
+        sids2, tids2, revoked2 = self._kill_sweep(job_id)  # whatever the run started meanwhile
+        sids = sorted(set(sids) | set(sids2))
+        tids = sorted(set(tids) | set(tids2))
+        revoked += revoked2
+        pending = [
+            sid
+            for sid in sids
+            if not self.gateway.drain(sid, max(0.0, deadline - time.monotonic()))
+        ]
+        # reservations: a session's (and a draw's) settle when its calls have landed
+        with self._stage_lock:
+            stage = self._review_stage_ids.get(job_id)
+        marks = ",".join("?" * len(sids)) or "NULL"
+        tmarks = ",".join("?" * len(tids)) or "NULL"
+        rows = self.store.q(
+            f"SELECT id, session_id FROM reservations WHERE status='open' AND"  # noqa: S608
+            f" (session_id IN ({marks}) OR task_id IN ({tmarks}) OR id=?)",
+            (*sids, *tids, stage if stage is not None else -1),
+        )
+        held = [int(r["id"]) for r in rows]
+        sessions = {r["session_id"] for r in rows if r["session_id"]}
+        for sid in sorted(sessions):
+            self.gateway.after_drain(sid, functools.partial(self.budget.settle_session, sid))
+        for r in rows:
+            if not r["session_id"]:
+                self.budget.settle(int(r["id"]), 0.0)  # nothing metered: the hold goes back
+        # a session row nothing is running any more
+        if idle:
+            for s in self.store.list_sessions(job_id):
+                if s.status in LIVE_SESSION:
+                    self.store.update_session(s.id, status="killed", ended_at=iso())
+        purge = getattr(self.executor, "purge_job", None)
+        removed = {"containers": 0, "networks": 0}
+        if purge is not None:
+            try:
+                removed = purge(job_id, sids)
+            except Exception:
+                log.exception("kill %s: removing its containers failed", job_id)
+        still = set(self.budget.open_reservation_ids())
+        return {
+            "sessions_stopped": stopped,
+            "tokens_revoked": revoked,
+            "run_ended": idle,
+            "drained": not pending,
+            "pending_calls": pending,
+            "reservations_settled": [r for r in held if r not in still],
+            "reservations_open": [r for r in held if r in still],
+            "containers_removed": removed["containers"],
+            "networks_removed": removed["networks"],
+        }
 
     def _replan_notes(self, job_id: str) -> list[str]:
         """The owner's notes, verbatim, oldest first: every note since the last
@@ -1619,6 +1735,8 @@ class JobRunner:
         inbox item exists meanwhile); then the spec is filed. An author that
         fails twice leaves the task marked "hidden tests missing"."""
         assert self.jobs is not None
+        if self._abandoned(job_id):
+            return  # killed: no author, no item (issue #52)
         if self.store.get_job(job_id).source == "bench":
             self._bench_go(job_id)  # no owner step: vigild's own `approval: bench`
             return
@@ -1630,6 +1748,8 @@ class JobRunner:
         if self.jobs.open_spec_item(job_id) is not None:
             return  # an ordinary spec is already filed, or this one is: one item per job
         self._author_hidden_tests(job_id, flagged)
+        if self._abandoned(job_id):
+            return  # killed while the author ran: the close-out stands, no item is filed
         self.jobs.file_item(job_id)
 
     def _author_hidden_tests(self, job_id: str, flagged: dict[str, list[str]]) -> None:
@@ -1699,7 +1819,10 @@ class JobRunner:
             def probe(files: list[str]) -> set[str] | None:
                 try:
                     image = self.dev_images.resolve(job.repo, base_now)
-                    return self.verifier.collect_probe(job.repo, image, base_now, test_cmd, files)
+                    with job_scope(job.id):  # `vigil kill` finds the probe's container
+                        return self.verifier.collect_probe(
+                            job.repo, image, base_now, test_cmd, files
+                        )
                 except StaleDevImage as e:  # DevImages paged it, with Rebuild
                     raise HiddenError(f"the dev image isn't ready: {e}") from e
                 except HostRefused as e:
@@ -1893,11 +2016,12 @@ class JobRunner:
             self.store.update_session(s.id, status="failed")
             return None, str(e)[:300]
         try:
-            check = self.verifier.check_hidden_on_base(
-                repo=job.repo, image=image, task_id=task_id, base_sha=base_sha, hidden=suite,
-                runner_config=self.cfg.repo(job.repo).runner_config, overlap=overlap,
-                scope=list(contract["spec"].get("files_in_scope") or []),
-            )  # fmt: skip
+            with job_scope(job_id):
+                check = self.verifier.check_hidden_on_base(
+                    repo=job.repo, image=image, task_id=task_id, base_sha=base_sha, hidden=suite,
+                    runner_config=self.cfg.repo(job.repo).runner_config, overlap=overlap,
+                    scope=list(contract["spec"].get("files_in_scope") or []),
+                )  # fmt: skip
         except HostRefused as e:
             self.store.update_session(s.id, status="failed")
             self._host_refused(job_id, e, "the hidden-test base check")
@@ -2101,10 +2225,14 @@ class JobRunner:
             }
 
         result = run_graph(deps, done, launch)
-        if cancelled := [t for t in result.failed if t in self._wait_cancelled]:
-            # a worker was waiting for the day's room when its job moved on (abandoned, or
-            # held by a restart): that move owns the job's page, and nothing failed
+        cancelled = [t for t in result.failed if t in self._wait_cancelled]
+        if cancelled:
             self._wait_cancelled.difference_update(cancelled)
+        if cancelled or self._abandoned(job_id):
+            # a worker was waiting for the day's room when its job moved on (abandoned, or
+            # held by a restart): that move owns the job's page, and nothing failed. A
+            # killed job's run ends the same way: no hold, no page, and no count toward
+            # the repo's breaker (issue #52)
             return
         if result.failed:
             self._hold_failed(
@@ -2269,7 +2397,10 @@ class JobRunner:
     def _hold_failed(self, job_id: str, task_ids: list[str]) -> None:
         """Block the job with one item: retry (when every failed task has budget
         left), re-plan, or abandon. It counts toward the repo's failures. A task
-        that needs a dependency instead gets a child deps job (item 5)."""
+        that needs a dependency instead gets a child deps job (item 5). A killed job
+        gets nothing (issue #52)."""
+        if self._abandoned(job_id):
+            return
         tasks: dict[str, dict[str, Any]] = {}
         lefts: list[float] = []  # budget left of each task a retry would run
         for tid in task_ids:
@@ -2423,6 +2554,8 @@ class JobRunner:
         body: dict[str, Any],
         state: str = "failed",
     ) -> bool:
+        if self._abandoned(job_id):  # killed: the close-out stands; nothing resets it
+            return False
         if s is not None:
             self.store.update_session(s.id, status=state)
         self.store.update_task(task_id, state=state)
@@ -2498,6 +2631,9 @@ class JobRunner:
         amount: float,
         held: dict[str, SessionRow],
     ) -> bool:
+        if self._abandoned(job_id):  # killed: no new attempt, no resume (issue #52)
+            self.budget.settle(reservation, 0.0)
+            return False
         job = self.store.get_job(job_id)
         t = self.store.get_task(task_id)
         contract = t.contract
@@ -2778,19 +2914,22 @@ class JobRunner:
             hidden_entry = {"status": "missing", "reason": "VIGIL_HOST_KEY is not set"}
         if test_cmd.strip():
             try:
-                tests = self.verifier.verify(
-                    repo=job.repo,
-                    image=image,
-                    task_id=task_id,
-                    base_sha=base_sha,
-                    head=head,
-                    test_cmd=test_cmd,  # the approved spec's, never the worker's tree
-                    must_fail_first=bool(contract["spec"].get("must_fail_first", True)),
-                    runner_config=self.cfg.repo(job.repo).runner_config,
-                    runner_overlap=overlap,
-                    hidden=entry_suite(hidden_entry),
-                    scope=list(contract["spec"].get("files_in_scope") or []),
-                )
+                with job_scope(job_id), halt_when(lambda: self._abandoned(job_id)):
+                    tests = self.verifier.verify(
+                        repo=job.repo,
+                        image=image,
+                        task_id=task_id,
+                        base_sha=base_sha,
+                        head=head,
+                        test_cmd=test_cmd,  # the approved spec's, never the worker's tree
+                        must_fail_first=bool(contract["spec"].get("must_fail_first", True)),
+                        runner_config=self.cfg.repo(job.repo).runner_config,
+                        runner_overlap=overlap,
+                        hidden=entry_suite(hidden_entry),
+                        scope=list(contract["spec"].get("files_in_scope") or []),
+                    )
+            except Halted:
+                return False  # killed between two runs: no verdict and nothing is written
             except HostRefused as e:  # the grader's host refused: no verdict
                 self._host_refused(job_id, e, "the grader")
                 return self._fail(
@@ -3014,7 +3153,8 @@ class JobRunner:
         lockfiles = list(self.cfg.repo(job.repo).dev_lockfiles)
         try:
             image = self.dev_images.resolve(job.repo, base_sha)
-            res = self.deps.run(job.repo, base_sha, lockfiles, reqs, image)
+            with job_scope(job_id):  # the build container carries the job's label
+                res = self.deps.run(job.repo, base_sha, lockfiles, reqs, image)
         except HostRefused as e:
             self._host_refused(job_id, e, "the deps run")
             return self._fail(

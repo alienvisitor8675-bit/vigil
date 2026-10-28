@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -32,11 +34,12 @@ from vigild.intake.scoring import IntakeOutcome, score
 from vigild.intake.spec_gate import check_job_spec, check_task, runner_files_named
 from vigild.jobs.artifacts import canonicalize_plan, parse_plan, parse_spec
 from vigild.jobs.fixfindings import MAX_PICKED, pick, selectable
-from vigild.jobs.fsm import Actor, TransitionError, transition
+from vigild.jobs.fsm import KILL_CHANNELS, TERMINAL, Actor, TransitionError, transition
 from vigild.jobs.model import InboxItem, Job, JobState
 from vigild.jobs.ownernote import NOTE_MAX_BYTES
 from vigild.metering.calls import session_cost
 from vigild.provenance import Provenance
+from vigild.redact import redact
 from vigild.repos import is_bench_repo
 from vigild.router.rules import RoutingError, route
 from vigild.verifier import runner_overlap
@@ -73,12 +76,24 @@ class DuplicateIssue(SubmitError):
         self.job_id = job_id
 
 
+log = logging.getLogger(__name__)
+
+
 class NotFound(KeyError):
     pass
 
 
 class Conflict(ValueError):
     pass
+
+
+class KillFailed(RuntimeError):
+    """A kill's effects failed at `step`; the job is `abandoned` and a second kill
+    finishes the work (issue #52)."""
+
+    def __init__(self, step: str, message: str) -> None:
+        super().__init__(f"{step}: {message}")
+        self.step = step
 
 
 class BadNote(ValueError):
@@ -213,6 +228,8 @@ class JobService:
         self.last_run: dict[str, str | None] = {}
         # the owner's fix round that moves the task to a pricier backend says so
         self.last_notice: dict[str, str | None] = {}
+        self._kill_locks: dict[str, threading.Lock] = {}  # one kill at a time per job
+        self._kill_locks_guard = threading.Lock()
 
     # --- submissions ----------------------------------------------------------
 
@@ -1046,26 +1063,128 @@ class JobService:
                 )  # fmt: skip
             except TransitionError as e:
                 raise Conflict(str(e)) from e
-            for t in self.store.list_tasks(job.id):
-                if t.state not in ("pr_open", "reviewed"):
-                    self.store.update_task(t.id, state="abandoned")
             self.store.add_event(
                 "abandon", {"inbox_item_id": item_id}, Provenance.HUMAN, job_id=job.id
             )
-            for other in self.store.list_inbox():
-                # the job's own pages; a breaker's page stays for its reset
-                # and for the other jobs it holds (2a round 6)
-                if (other.job_id == job.id and other.queue == "questions"
-                        and other.body.get("kind") != "breaker"):  # fmt: skip
-                    self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
-            # a breaker that then holds nothing resolves its page but stays
-            # open: only its own condition reopens dispatch (owner, 2026-10-23);
-            # one that still holds a job keeps its page for it (2a round 7)
-            breakers.unhold(job.id, by=Actor.OWNER.value)
+            self._close_out(job.id, breakers)
         failed = getattr(self.runner, "job_failed", None)
         if failed is not None:
             failed(job)  # an abandoned job counts toward the repo's breaker (item 4)
         return job
+
+    def _close_out(self, job_id: str, breakers: Any) -> None:
+        """What giving a job up leaves behind, closed: its tasks that have no open PR are
+        abandoned, its own pages are resolved, and no breaker holds it."""
+        for t in self.store.list_tasks(job_id):
+            if t.state not in ("pr_open", "reviewed"):
+                self.store.update_task(t.id, state="abandoned")
+        for other in self.store.list_inbox():
+            # the job's own pages; a breaker's page stays for its reset
+            # and for the other jobs it holds (2a round 6)
+            own = other.job_id == job_id and other.body.get("kind") != "breaker"
+            if own and other.queue in ("questions", "specs"):
+                self.store.resolve_inbox_item(other.id, Actor.OWNER.value)
+        # a breaker that then holds nothing resolves its page but stays
+        # open: only its own condition reopens dispatch (owner, 2026-10-23);
+        # one that still holds a job keeps its page for it (2a round 7)
+        breakers.unhold(job_id, by=Actor.OWNER.value)
+
+    def kill(
+        self, job_id: str, actor: Actor, channel: str, *, wait: float = 30.0
+    ) -> dict[str, Any]:
+        """`vigil kill` (issue #52): stop a job cleanly and give it up. The job moves to
+        `abandoned` through the FSM first (so nothing new starts, and the runner's own
+        steps find it terminal), then the runner stops its sessions and sidecars, revokes
+        its gateway tokens, waits (at most `wait` s) for in-flight calls to drain and
+        settles or releases every reservation it holds. Open PRs stay, for you to close.
+        A kill is your choice, so it doesn't count toward the repo's breaker.
+
+        Idempotent: a job that is already `done`, or `abandoned` with its kill finished (a
+        `job_killed` event), changes nothing and answers `already: <state>`. A kill that
+        failed partway leaves the job `abandoned` with no such event; the next kill runs
+        the effects again (all of them are safe to repeat) and answers `already:
+        abandoned, completed: true`."""
+        if channel not in KILL_CHANNELS:
+            raise Conflict(f"a kill comes from {' or '.join(KILL_CHANNELS)}, not {channel!r}")
+        try:
+            self.store.get_job(job_id)
+        except KeyError as e:
+            raise NotFound(job_id) from e
+        with self._kill_lock(job_id):
+            return self._kill(job_id, actor, channel, wait)
+
+    def _kill_lock(self, job_id: str) -> threading.Lock:
+        with self._kill_locks_guard:
+            return self._kill_locks.setdefault(job_id, threading.Lock())
+
+    def _kill(self, job_id: str, actor: Actor, channel: str, wait: float) -> dict[str, Any]:
+        job = self.store.get_job(job_id)
+        out: dict[str, Any] = {"job_id": job_id, "killed": False, "already": None}
+
+        def already(state: JobState, *, effects: dict[str, Any] | None = None) -> dict[str, Any]:
+            return {
+                **out, "state": state.value, "already": state.value, "completed": True,
+                "message": f"{job_id} is already {state.value}; nothing to kill",
+                **(effects or {}),
+            }  # fmt: skip
+
+        finished = bool(
+            self.store.q("SELECT 1 FROM events WHERE job_id=? AND type='job_killed'", (job_id,))
+        )
+        if job.state is JobState.DONE or (job.state is JobState.ABANDONED and finished):
+            return already(job.state)
+        was = job.state.value
+        if job.state is not JobState.ABANDONED:
+            try:
+                transition(
+                    self.store, job_id, JobState.ABANDONED, actor, channel=channel,
+                    evidence={"action": "kill", "from": was},
+                )  # fmt: skip
+            except TransitionError as e:
+                now = self.store.get_job(job_id).state
+                if now in TERMINAL:  # a second kill got there first
+                    return already(now)
+                raise Conflict(str(e)) from e
+        effects = self._kill_effects(job_id, wait)
+        self.store.add_event(
+            "job_killed",
+            {"actor": actor.value, "channel": channel, "from": was, **effects},
+            Provenance.HUMAN, job_id=job_id,
+        )  # fmt: skip
+        if was == JobState.ABANDONED.value:  # the finish of a kill that failed partway
+            return already(JobState.ABANDONED, effects=effects)
+        message = f"killed {job_id} (was {was}); open PRs stay for you to close"
+        return {
+            **out, "state": JobState.ABANDONED.value, "killed": True, "message": message, **effects,
+        }  # fmt: skip
+
+    def _kill_effects(self, job_id: str, wait: float) -> dict[str, Any]:
+        """The runner's stop, revoke, drain and settle, then the close-out. A step that
+        raises is logged (redacted) and surfaces as `KillFailed` naming it; the job stays
+        `abandoned` without a `job_killed` event, so the next kill runs both again."""
+        effects: dict[str, Any] = {}
+        runner_kill = getattr(self.runner, "kill_job", None)
+        if runner_kill is not None:
+            try:
+                effects = runner_kill(job_id, wait=wait)
+            except Exception as e:
+                raise self._kill_failed(
+                    job_id, "runner.kill_job (stop, revoke, drain, settle)", e
+                ) from e
+        from vigild.breakers import Breakers
+
+        try:
+            with self.store.tx():
+                self._close_out(job_id, Breakers(self.store, self.cfg))
+        except Exception as e:
+            raise self._kill_failed(job_id, "close-out (tasks, pages, breaker holds)", e) from e
+        return effects
+
+    @staticmethod
+    def _kill_failed(job_id: str, step: str, e: Exception) -> KillFailed:
+        what = redact(f"{type(e).__name__}: {e}")
+        log.error("kill %s failed at %s: %s", job_id, step, what)
+        return KillFailed(step, what[:500])
 
     def reset(self, item_id: int) -> dict[str, list[str]]:
         """Reset a tripped circuit breaker (plan 2a, item 4): it closes, and

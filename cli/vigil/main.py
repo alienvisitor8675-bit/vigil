@@ -1,18 +1,23 @@
-"""The `vigil` CLI. Phase 1 ships `doctor` and `dev-image`; `run`, `batch`,
-`ls`, `trace` and `kill` arrive in phase 2 as clients of the API.
+"""The `vigil` CLI. Phase 1 ships `doctor` and `dev-image`; `kill` is the first
+client of the API; `run`, `batch`, `ls` and `trace` follow in phase 2.
 
   uv run python -m vigil doctor
   uv run python -m vigil dev-image --repo owner/name [--rebuild]
   uv run python -m vigil hidden show <task>
   uv run python -m vigil backup [--dest DIR] [--keep-days 14]
   uv run python -m vigil restore <backup.db>   (verify only)
+  uv run python -m vigil kill <job>
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
+
+if TYPE_CHECKING:
+    import httpx2
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 hidden_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Hidden tests.")
@@ -169,6 +174,60 @@ def doctor(
             docker_client.close()
     typer.echo(render(checks))
     raise typer.Exit(0 if all(c.ok is not False for c in checks) else 1)
+
+
+def _api_client() -> httpx2.Client:
+    """A client for vigild's REST API with the admin token: `VIGIL_API_TOKEN` from the
+    environment, else from the env file vigild itself reads (`vigild.config`). The URL is
+    `VIGIL_API_URL`, else the configured loopback listener."""
+    import httpx2
+
+    from vigild import config
+
+    cfg = config.load()
+    token = config.env_override("VIGIL_API_TOKEN") or config.load_secrets().get("VIGIL_API_TOKEN")
+    if not token:
+        typer.echo("no VIGIL_API_TOKEN (set it, or put it in the env file)")
+        raise typer.Exit(1)
+    base = config.env_override("VIGIL_API_URL") or (
+        f"http://{cfg.vigild.api.host}:{cfg.vigild.api.port}"
+    )
+    # a kill waits for in-flight model calls to drain (30 s) before it answers
+    return httpx2.Client(base_url=base, headers={"Authorization": f"Bearer {token}"}, timeout=120)
+
+
+@app.command()
+def kill(job: str = typer.Argument(..., help="a job id, e.g. pa-0007")) -> None:
+    """Stop a job cleanly: its sessions and sidecars, its gateway tokens and its
+    reservations, then the job is abandoned. Open PRs stay, for you to close. Killing a
+    job that is already finished or killed changes nothing and says so."""
+    import httpx2
+
+    with _api_client() as client:
+        try:
+            r = client.post(f"/api/jobs/{job}/kill", json={"channel": "cli"})
+        except httpx2.HTTPError as e:
+            typer.echo(f"could not reach vigild: {type(e).__name__}")
+            raise typer.Exit(1) from e
+    if r.status_code != 200:
+        typer.echo(f"kill failed: HTTP {r.status_code} {r.text[:300]}")
+        raise typer.Exit(1)
+    body = r.json()
+    typer.echo(body.get("message") or f"{job}: {body.get('state')}")
+    if body.get("killed"):
+        typer.echo(
+            f"  sessions stopped {len(body.get('sessions_stopped') or [])}, "
+            f"tokens revoked {body.get('tokens_revoked', 0)}, "
+            f"reservations settled {len(body.get('reservations_settled') or [])}, "
+            f"containers removed {body.get('containers_removed', 0)}"
+        )
+        if not body.get("drained", True):
+            typer.echo(
+                "  a model call is still in flight; its spend settles when it lands: "
+                + ", ".join(body.get("pending_calls") or [])
+            )
+        if body.get("reservations_open"):
+            typer.echo(f"  still open: {body['reservations_open']}")
 
 
 @app.command("dev-image")
