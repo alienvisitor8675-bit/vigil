@@ -234,3 +234,67 @@ def test_closing_a_pr_patches_its_state_with_a_one_repo_write_token() -> None:
         pass
     else:
         raise AssertionError("a PR of another repo was closed")
+
+
+def _foreign(bare: Path, branch: str) -> str:
+    """An outside commit on the remote branch (the owner's own work)."""
+    tree = git(bare, "rev-parse", f"{branch}^{{tree}}")
+    sha = git(bare, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree,
+              "-p", branch, "-m", "outside")  # fmt: skip
+    git(bare, "update-ref", f"refs/heads/{branch}", sha)
+    return sha
+
+
+def test_branch_moved_is_raised_before_anything_is_sent(
+    setup: tuple[Workspace, str, str, Path],
+) -> None:
+    ws, base, head, bare = setup
+    _pub(ws, base, head, FakePulls(bare))
+    recorded = ws.published_sha(REPO, BRANCH)
+    foreign = _foreign(bare, BRANCH)
+    with pytest.raises(PublishError) as e:
+        publish(
+            ws, repo=REPO, head=head, base_sha=base, branch=BRANCH, base="main", title="t",
+            body="b", pulls=FakePulls(bare), scope=["docs/feature-map.md"],
+            existing="https://github.com/o/fixture/pull/1",
+        )  # fmt: skip
+    assert type(e.value).__name__ == "BranchMoved"
+    assert git(bare, "rev-parse", BRANCH) == foreign  # the outside commit stands
+    assert ws.published_sha(REPO, BRANCH) == recorded  # nothing new recorded
+
+
+def test_lost_record_retry_of_a_first_publish_goes_on(
+    setup: tuple[Workspace, str, str, Path],
+) -> None:
+    ws, base, head, bare = setup
+    _pub(ws, base, head, FakePulls(bare))
+    sent = git(bare, "rev-parse", BRANCH)
+    git(ws.vault(REPO), "update-ref", "-d", ws._pub_ref(BRANCH))  # sent, but never recorded
+    _pub(ws, base, head, FakePulls(bare))
+    assert git(bare, "rev-parse", BRANCH) == sent == ws.published_sha(REPO, BRANCH)
+
+
+def test_publish_not_moved_when_auth_fails(setup: tuple[Workspace, str, str, Path]) -> None:
+    from vigild.workspace import WorkspaceError
+
+    ws, base, head, bare = setup
+
+    def denied(repo: str, branch: str, token: str | None) -> str | None:
+        raise WorkspaceError("git ls-remote failed: Authentication failed")
+
+    ws.remote_tip = denied  # type: ignore[method-assign]
+    with pytest.raises(PublishError, match="Authentication") as e:
+        _pub(ws, base, head, FakePulls(bare))
+    assert type(e.value).__name__ == "PublishError"
+    assert ws.published_sha(REPO, BRANCH) is None
+
+
+def test_publish_not_moved_when_the_remote_is_unreachable(
+    setup: tuple[Workspace, str, str, Path], tmp_path: Path
+) -> None:
+    ws, base, head, bare = setup
+    ws.remote_url = lambda r: str(tmp_path / "gone.git")
+    with pytest.raises(PublishError) as e:
+        _pub(ws, base, head, FakePulls(bare))
+    assert type(e.value).__name__ == "PublishError"
+    assert ws.published_sha(REPO, BRANCH) is None

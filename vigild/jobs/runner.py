@@ -72,7 +72,13 @@ from vigild.executors.base import ExecOutcome, Executor, Resume, SessionSpec
 from vigild.executors.hosts import HostRefused
 from vigild.executors.runtime import job_scope
 from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
-from vigild.github.publish import LegacyBranch, PublishError, artifact_paths, vigild_paths
+from vigild.github.publish import (
+    BranchMoved,
+    LegacyBranch,
+    PublishError,
+    artifact_paths,
+    vigild_paths,
+)
 from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
 from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, Place, entry_suite, load_suite, place_for
 from vigild.intake.github import issue_text
@@ -2418,6 +2424,8 @@ class JobRunner:
                 lefts.append(left)
         # retry is offered while every task it would run has budget left
         can_retry = bool(lefts) and all(x >= MIN_RETRY_USD for x in lefts)
+        if any(t.get("branch_moved") for t in tasks.values()):
+            can_retry = False  # the remote branch has an outside commit; a retry can't push
         deps = any("needs_deps" in t for t in tasks.values())
         if deps:
             # item 5: a child deps job; this job resumes on its own when it merges
@@ -2564,6 +2572,17 @@ class JobRunner:
             self._why[task_id] = why
         self.store.add_event("task_failed", why, Provenance.HUMAN, job_id=job_id, task_id=task_id)
         return False
+
+    def _publish_failed(
+        self, job_id: str, s: SessionRow | None, task_id: str, e: PublishError
+    ) -> bool:
+        """A refused publish. A moved branch is its own page: no retry."""
+        if isinstance(e, BranchMoved):
+            return self._fail(
+                job_id, s, task_id, f"{task_id}: branch moved on the remote",
+                {"error": str(e), "branch_moved": True},
+            )  # fmt: skip
+        return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})
 
     def _hidden_entry(self, job_id: str, task_id: str) -> dict[str, Any] | None:
         art = self.store.get_artifact(job_id, HIDDEN_ARTIFACT)
@@ -3026,7 +3045,7 @@ class JobRunner:
                 existing=pr_url,
             )
         except PublishError as e:
-            return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})
+            return self._publish_failed(job_id, s, task_id, e)
         self.store.update_session(s.id, status="pr_open", pr_url=url, detail={"head": head})
         facts = self._pub_facts(job.repo, branch, base_sha)  # vault git: outside the tx
         # #34: the state and the event with its URL land together, or neither does
@@ -3206,7 +3225,7 @@ class JobRunner:
                 title=f"[vigil {job_id}] deps: {names}"[:200], body=body, scope=lockfiles,
             )  # fmt: skip
         except PublishError as e:
-            return self._fail(job_id, s, task_id, f"{task_id}: publish refused", {"error": str(e)})
+            return self._publish_failed(job_id, s, task_id, e)
         self.store.update_session(
             s.id, status="pr_open", pr_url=url, ended_at=iso(), detail={"head": head}
         )

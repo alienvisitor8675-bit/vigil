@@ -466,3 +466,45 @@ def test_a_pr_that_cannot_be_cleaned_pages_with_retry_and_abandon(world: World) 
     r = w.client.post(f"/api/inbox/{item['id']}/retry", headers=auth(w.tokens.admin))
     assert r.status_code == 200, r.text
     assert w.store.get_job(job).state is S.READY
+
+
+def test_branch_moved_pages_with_replan_and_abandon_only(world: World) -> None:
+    w = world
+    real = w.publisher.publish
+    moved: list[str] = []
+
+    def publish_after_outside_commit(**kw: Any) -> str:
+        if not moved:  # the owner commits to the first branch before vigild sends it
+            moved.append(kw["branch"])
+            tree = git(w.bare, "rev-parse", "main^{tree}")
+            sha = git(w.bare, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree",
+                      tree, "-p", "main", "-m", "outside")  # fmt: skip
+            git(w.bare, "update-ref", f"refs/heads/{kw['branch']}", sha)
+        return real(**kw)
+
+    w.publisher.publish = publish_after_outside_commit  # type: ignore[method-assign]
+    job = _approve(w)
+    item = _failure_item(w, job)
+    assert item["body"]["actions"] == ["replan", "abandon"] and not item["body"]["resumable"]
+    assert any(
+        t["title"].endswith("branch moved on the remote") for t in item["body"]["tasks"].values()
+    )
+    assert w.runner.workspace.published_sha(REPO, moved[0]) is None
+
+
+def test_publish_not_moved_still_offers_retry(world: World) -> None:
+    w = world
+    real = w.publisher.publish
+    calls: list[str] = []
+
+    def refuse_once(**kw: Any) -> str:
+        if not calls:
+            calls.append(kw["branch"])
+            raise PublishError("git ls-remote failed: Authentication failed")
+        return real(**kw)
+
+    w.publisher.publish = refuse_once  # type: ignore[method-assign]
+    job = _approve(w)
+    item = _failure_item(w, job)
+    assert item["body"]["actions"] == ["retry", "replan", "abandon"]
+    assert any(t["title"].endswith("publish refused") for t in item["body"]["tasks"].values())
