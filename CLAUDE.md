@@ -85,6 +85,9 @@ phase 1 are ADRs in `docs/decisions/`; the owner's rulings are indexed in
 - `compose.yaml`: Phoenix + the OTel collector.
 
 ## Running checks
+Before every push run `scripts/check-all.sh [--tests]`: it checks the
+committed HEAD in a clean worktree, because a check run on uncommitted
+changes proves nothing. The steps it runs:
 ```sh
 uv python install 3.14.8
 uv sync --locked

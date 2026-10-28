@@ -116,3 +116,20 @@ def test_dangling_reference_in_feature_map_fails(tmp_path: Path) -> None:
 def test_real_repo_has_no_sequential_decision_ids() -> None:
     text = (ROOT / "docs" / "architecture.md").read_text()
     assert "| decision `vigild-native` |" not in text
+
+
+def test_unsorted_feature_table_names_first_row_out_of_place(tmp_path: Path) -> None:
+    root = _tree(tmp_path, features=[_feature("alpha"), _feature("gamma"), _feature("beta")])
+    errors = fm.check(root, code_dirs=[])
+    assert len(errors) == 1
+    assert "not sorted" in errors[0] and "`beta`" in errors[0] and "`gamma`" in errors[0]
+
+
+def test_unsorted_decision_table_fails(tmp_path: Path) -> None:
+    arch = ["| b-one | DB | SQLite | w |", "| a-one | DB | SQLite | w |"]
+    errors = fm.check(_tree(tmp_path, arch=arch), code_dirs=[])
+    assert any("docs/architecture.md" in e and "`a-one`" in e and "not sorted" in e for e in errors)
+
+
+def test_repo_tables_are_sorted() -> None:
+    assert [e for e in fm.check(ROOT) if "not sorted" in e] == []

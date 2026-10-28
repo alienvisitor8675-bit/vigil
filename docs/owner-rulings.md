@@ -73,6 +73,14 @@ applied.
 - **2026-10-26**: The plan gate refuses a reused worker ID, and a job enters `in_review` only if every planned task has an open PR or is superseded (#25).
 - **2026-10-23**: Job artifacts go to the vault, not the target repo (#30).
 
+## Coordination (coord's own rules)
+- **2026-10-28**: Parallel tracks don't share hot files (`vigild/jobs/runner.py`, `vigild/packets/assemble.py`, `vigild/db.py` `MIGRATIONS`, or the same docs table); if they must, they run in sequence.
+- **2026-10-28**: No stacked PRs unless the owner asks.
+- **2026-10-28**: Coord's status holds one merge order; after each merge the next PR is rebased onto main and checked.
+- **2026-10-28**: Coord assigns each migration-adding PR its step name at dispatch.
+- **2026-10-28**: `scripts/check-all.sh` runs on the committed HEAD before every push, by workers and coord.
+- **2026-10-28**: The long-term fix for docs table conflicts is #96 (one file per feature, generated tables).
+
 ## Not adopted (don't re-propose)
 - **2026-10-28** (ADR-0006 I): no multi-agent teams or debate; no memory or recall tools for workers; no LLM-generated instruction files and no longer CLAUDE.md (layer 3 is measured before it grows); no LLM-as-judge selection; no mid-trajectory critics; no RL on weights; no evolved verifiers; no more prompt text. The incident-to-playbook epic stays gated by replay.
 - **2026-10-28** (omp / OMH research): neither project as a library or a layer; no inter-agent messaging bus (`ask_coord` stays the only channel: a single writer, read-only subagents); no fall-through model chains (the private-repo rule, budget predictability); no external memory server (one source of truth); no LLM-as-judge in rewards; omp's approval tiers never substitute for the guard plugin or the egress proxy; snapcompact, stream-abort rules, collab links and search providers are out of scope.

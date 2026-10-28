@@ -6,6 +6,8 @@ Rules:
 - every feature-map row and every `docs/architecture.md` decision row has a
   stable slug in its first `ID` column: unique within its table and
   kebab-case (`^[a-z0-9]+(-[a-z0-9]+)*$`);
+- every such table is sorted by ID (plain string order), so a new row goes in
+  at its sorted place; the first row out of place is named;
 - no sequential `B<n>` decision ID appears in `docs/architecture.md`;
 - every slug cited in the docs as ``decision `slug` `` (or ``decisions `a`,
   `b` ``) is the ID of a decision row.
@@ -113,6 +115,11 @@ def check_ids(name: str, text: str, *, need_column: str | None) -> tuple[list[st
             elif slug in seen:
                 errors.append(f"{name}: duplicate ID `{slug}`")
             seen.add(slug)
+        ids = [row.get("ID", "") for row in rows]
+        for before, after in itertools.pairwise(ids):
+            if after < before:
+                errors.append(f"{name}: table not sorted by ID: `{after}` comes after `{before}`")
+                break
         found |= seen
     return errors, found
 
