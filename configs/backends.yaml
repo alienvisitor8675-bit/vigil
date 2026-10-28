@@ -7,8 +7,8 @@ presets:
   claude-sonnet: {kind: anthropic, base_url: "https://api.anthropic.com", model: claude-sonnet-5-5, key_ref: ANTHROPIC_API_KEY, locality: hosted, provider: anthropic}
   claude-opus:   {kind: anthropic, base_url: "https://api.anthropic.com", model: claude-opus-5-5, key_ref: ANTHROPIC_API_KEY, locality: hosted, provider: anthropic}
   claude-haiku:  {kind: anthropic, base_url: "https://api.anthropic.com", model: claude-haiku-5-5, key_ref: ANTHROPIC_API_KEY, locality: hosted, provider: anthropic}
-  tower-qwen:    {kind: openai_compatible, base_url: "http://tower:8080/v1", model: qwen3.6-35b-a3b, key_ref: LLAMA_API_KEY, locality: local, provider: tower, live: false}  # phase 5
-  tower-fast:    {kind: openai_compatible, base_url: "http://tower:8080/v1", model: gpt-oss-20b, key_ref: LLAMA_API_KEY, locality: local, provider: tower, live: false}  # phase 5
+  tower-qwen:    {kind: openai_compatible, base_url: "http://tower:8080/v1", model: qwen3.6-35b-a3b, key_ref: TOWER_API_KEY, locality: local, provider: tower}  # llama-server b11739, live 2026-10-28
+  tower-fast:    {kind: openai_compatible, base_url: "http://tower:8080/v1", model: gpt-oss-20b, key_ref: TOWER_API_KEY, locality: local, provider: tower, live: false}  # phase 5
   openrouter:    {kind: openrouter, base_url: "https://openrouter.ai/api/v1", model: null, key_ref: OPENROUTER_API_KEY, locality: hosted, provider: openrouter, live: false}  # phase 4
 
 # Decider routes (B21). Same locality rule as backends. A repo lists the

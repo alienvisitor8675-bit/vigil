@@ -49,7 +49,7 @@ When a phase adds or bumps a pin, it updates this file in the same PR.
 | Node.js | 24.21.0 (LTS "Krypton"), only to run the CLI; `node:24.21.0-trixie-slim@sha256:173f1258…fb66` | 2026-09-07 | 24.22.1 | Claude executor image | https://nodejs.org/dist/index.json |
 | Python base image | `python:3.14.8-slim-trixie@sha256:fbecd461…ed4a` | 2026-09-30 (CPython) | — | executor and proxy images | https://hub.docker.com/_/python |
 | OpenCode | v2.0.26 (`@opencode/cli`, linux-arm64 package) | 2026-10-08 | v2.1.3 | OpenCode executor (phase 4) | https://opencode.ai/changelog · https://github.com/anomalyco/opencode |
-| llama.cpp | b11513 (ubuntu-cuda-12.8 / 13.4 x64 binaries, sm_120 included) | 2026-10-08 | b11819 | tower (phase 5) | https://github.com/ggml-org/llama.cpp/releases/tag/b11513 |
+| llama.cpp | b11739 (commit `0ce8cd114`, CUDA build; the owner's tower, 2026-10-28). **Under 14 days old when adopted (9 days; the owner chose it)** | 2026-10-19 | b11819 | tower (phase 5) | https://github.com/ggml-org/llama.cpp/releases/tag/b11739 |
 | nvidia-ml-py | 13.615.71 | 2026-09-25 | same | tower exporter | https://pypi.org/project/nvidia-ml-py/ |
 | psutil | 7.2.2 | 2026-01-28 | same | tower exporter | https://pypi.org/project/psutil/ |
 | Arize Phoenix (self-hosted) | 20.19.0, `arizephoenix/phoenix:version-20.19.0-nonroot@sha256:f2109e09…11c9` (amd64/arm64) | 2026-10-01 | 20.24.0 | trace store (owner decision 2026-10-22) | https://github.com/Arize-ai/phoenix/releases/tag/arize-phoenix-v20.19.0 · https://hub.docker.com/r/arizephoenix/phoenix |
@@ -67,7 +67,7 @@ When a phase adds or bumps a pin, it updates this file in the same PR.
 | Jev on Cloudflare | `typesafe/jev` (unversioned; answers report `jev-1.13.0`) | — | — | decider | https://developers.cloudflare.com/ai/models/typesafe/jev/ |
 
 **Models** (Hugging Face; hashes go in `tower/models.lock` in phase 5):
-- Qwen3.6-35B-A3B, unsloth UD-Q4_K_M, 22.13 GB: https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF
+- Qwen3.6-35B-A3B, unsloth UD-Q4_K_M, 22.13 GB, served as `qwen3.6-35b-a3b` (64k context, 4 slots; live 2026-10-28): https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF
 - gpt-oss-20b, ggml-org MXFP4, 12.11 GB: https://huggingface.co/ggml-org/gpt-oss-20b-GGUF
 - Qwen3.8-27B (eval only), UD-Q3_K_XL, 13.15 GB: https://huggingface.co/unsloth/Qwen3.8-27B-GGUF
 - LFM2.5-1.2B-Instruct, Q4_K_M, 0.73 GB (local decider): https://huggingface.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF

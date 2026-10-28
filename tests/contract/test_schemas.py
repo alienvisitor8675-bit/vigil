@@ -25,7 +25,7 @@ DESIGN_TASK = {
         "kind": "openai_compatible",
         "base_url": "http://tower:8080/v1",
         "model": "qwen3.6-35b-a3b",
-        "key_ref": "LLAMA_API_KEY",
+        "key_ref": "TOWER_API_KEY",
     },
     "why": "rate limiting has no tests; #139 changed it",
     "value": 4,

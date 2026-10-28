@@ -95,7 +95,7 @@ repos:
       - "**/node_modules/**"
   thomasbardhi01/vigil:
     decider: [haiku, jev]
-    backends: [claude-sonnet, claude-opus, claude-haiku]
+    backends: [claude-sonnet, claude-opus, claude-haiku, tower-qwen]
     worker_overflow: []
     auto_merge: false
     dev_dockerfile: images/dev/vigil.Dockerfile

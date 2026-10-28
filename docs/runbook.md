@@ -37,7 +37,7 @@ the phases that build those things.
     installation token lives in vigild's memory for one publish and is
     revoked after it.
   - Trace-store keys stay in the collector.
-- **The tower holds exactly one secret** (phase 5), `LLAMA_API_KEY`, in
+- **The tower holds exactly one secret**, `TOWER_API_KEY`, in
   `/etc/vigil/llama.env` (root, mode `600`).
 - **Nothing here is ever committed.** `.env.example` at the repo root lists
   the names with no values.
@@ -69,7 +69,7 @@ feature: vigild logs `config: <feature> is off`, `/api/health` lists it in
 | `VIGIL_HEARTBEAT_TOKEN` | Lets an outside session post heartbeats for the UI's `/sessions` page. | **You generate it** (below). | Write heartbeats; nothing else. | 3 | — |
 | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | Jev on Workers AI (zero retention): the decider route for **private** repos only. No repo lists it while both are public, and `vigil doctor` skips these then. | Cloudflare → My Profile → API Tokens → Custom token: **Account · Workers AI · Read** and **Edit**, that one account. | Workers AI only. | 1 (optional) | skipped unless a repo lists `jev-cloudflare`; then reported missing |
 | `OPENROUTER_API_KEY` | Jev on OpenRouter's Decisions API: **the decider for public repos** (owner, 2026-10-23), with Haiku as the escalation; later the OpenRouter preset (phase 4). | openrouter.ai → Keys, with a **credit limit**. Set. | Never for a private repo: vigild refuses to start if `repos.yaml` lists it for one. | 2a | `GET /api/v1/key` → 200, and one `decider:` line per repo naming its route |
-| `LLAMA_API_KEY` | llama-server's `--api-key`. In **both** the env file and the tower's `/etc/vigil/llama.env`. | **You generate it** (below), then copy the same line to the tower. | Tower only, over Tailscale. | 5 | — |
+| `TOWER_API_KEY` | llama-server's `--api-key`. In **both** the env file and the tower's `/etc/vigil/llama.env`. | **You generate it** (below), then copy the same line to the tower. | Tower only, over Tailscale. | 5 | `vigil doctor`: `backend: tower-qwen` passes when `GET /v1/models` lists the model; `missing` without the key |
 
 ### The decider: Jev (owner, 2026-10-23)
 
@@ -121,7 +121,7 @@ printf 'VIGIL_API_TOKEN=%s\n' "$(openssl rand -hex 32)" >> ~/.config/vigil/env
 ```
 
 Do the same for `VIGIL_METRICS_TOKEN`, `VIGIL_HEARTBEAT_TOKEN` and
-`LLAMA_API_KEY`. **Phoenix's two secrets keep a prefix.** Phoenix 20.19.0
+`TOWER_API_KEY`. **Phoenix's two secrets keep a prefix.** Phoenix 20.19.0
 still requires each to be at least 32 characters with at least one digit and
 one lowercase letter (`phoenix.auth.REQUIREMENTS_FOR_PHOENIX_SECRET`, checked
 in the running container on 2026-10-22). 64 hex characters almost always have
@@ -135,7 +135,7 @@ printf 'PHOENIX_ADMIN_SECRET=a1%s\n' "$(openssl rand -hex 32)" >> ~/.config/vigi
 **To rotate one:** delete its line from `~/.config/vigil/env`, run its
 command again, and restart vigild (it reads the file once, at start). For the
 Phoenix secrets, also restart the trace stack
-(`docker compose --env-file ~/.config/vigil/env up -d`); for `LLAMA_API_KEY`,
+(`docker compose --env-file ~/.config/vigil/env up -d`); for `TOWER_API_KEY`,
 copy the new line to the tower's `/etc/vigil/llama.env` and restart
 llama-server. Secrets someone else issues (`ANTHROPIC_API_KEY`, the GitHub
 App's key, the Cloudflare token) rotate where they were issued, then the same

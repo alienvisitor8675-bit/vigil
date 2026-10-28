@@ -27,6 +27,7 @@ def _pem() -> bytes:
 
 
 PRIVATE: dict[str, bool] = {}
+TOWER_MODEL = "qwen3.6-35b-a3b"
 
 
 def _handler(req: httpx2.Request) -> httpx2.Response:
@@ -60,6 +61,10 @@ def _handler(req: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(200 if ok else 401, json={"success": ok})
     if p == "/healthz":
         return httpx2.Response(200, text="OK")
+    if req.url.host == "tower" and p == "/v1/models":
+        ok = req.headers.get("authorization") == "Bearer tower-fake-value-000"
+        listed = [{"id": TOWER_MODEL}] if TOWER_MODEL else []
+        return httpx2.Response(200 if ok else 401, json={"data": listed, "secret": "body-value"})
     return httpx2.Response(404)
 
 
@@ -258,6 +263,34 @@ def test_run_checks_includes_backup_freshness(
 
 def test_tests_never_read_the_hosts_backup_plist() -> None:
     assert not doctor.BACKUP_PLIST.is_relative_to(Path.home() / "Library")
+
+
+def _tower_checks(cfg: Config, key: str | None, model: str = "qwen3.6-35b-a3b") -> list[Check]:
+    global TOWER_MODEL
+    TOWER_MODEL = model
+    secrets = Secrets({"TOWER_API_KEY": key} if key else {})
+    http = httpx2.Client(transport=httpx2.MockTransport(_handler))
+    out = run_checks(cfg, secrets, http=http, docker=None, repos=[], include_claude_mods=False)
+    return [c for c in out if c.name.startswith("backend: ")]
+
+
+def test_doctor_checks_each_live_openai_compatible_backend(cfg: Config) -> None:
+    checks = _tower_checks(cfg, "tower-fake-value-000")
+    assert [c.name for c in checks] == ["backend: tower-qwen (TOWER_API_KEY)"]  # tower-fast is off
+    assert checks[0].ok is True
+    shown = render(checks)
+    assert "tower-fake-value-000" not in shown and "body-value" not in shown
+    assert "tower:8080" not in shown and "http" not in shown
+
+
+def test_doctor_tower_missing_key_fails_as_missing(cfg: Config) -> None:
+    (c,) = _tower_checks(cfg, None)
+    assert c.ok is False and c.note == "missing"
+
+
+def test_doctor_tower_fails_on_a_wrong_key_or_a_model_not_served(cfg: Config) -> None:
+    assert _tower_checks(cfg, "wrong-key")[0].ok is False
+    assert _tower_checks(cfg, "tower-fake-value-000", model="other-model")[0].ok is False
 
 
 def test_doctor_has_one_sandbox_host_line_with_only_local() -> None:

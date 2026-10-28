@@ -370,7 +370,7 @@ class Gateway:
         except RepoPolicyError as e:
             raise GatewayError(403, "permission_error", str(e)) from e
         preset = self.cfg.preset(preset_name)
-        if preset.kind.value != "anthropic":
+        if preset.kind.value not in ("anthropic", "openai_compatible"):
             raise GatewayError(
                 403, "permission_error", f"{preset.kind.value} backends arrive in a later phase"
             )
@@ -659,11 +659,23 @@ class Gateway:
 
     # --- forwarding ------------------------------------------------------------------
 
-    def _headers(self, incoming: dict[str, str], key: str) -> dict[str, str]:
+    @staticmethod
+    def _upstream_url(preset: Preset, path: str) -> str:
+        """The one place a preset's base_url meets a request path. An
+        openai_compatible base_url ends in /v1, and the path begins with it."""
+        base = preset.base_url.rstrip("/")
+        if preset.kind.value == "openai_compatible":
+            base = base.removesuffix("/v1")
+        return base + path
+
+    def _headers(self, incoming: dict[str, str], key: str, preset: Preset) -> dict[str, str]:
         out = {h: incoming[h] for h in FORWARD_HEADERS if h in incoming}
         out.setdefault("anthropic-version", "2023-06-01")
         out.setdefault("content-type", "application/json")
-        out["x-api-key"] = key
+        if preset.kind.value == "openai_compatible":  # llama-server: bearer, not x-api-key
+            out["authorization"] = f"Bearer {key}"
+        else:
+            out["x-api-key"] = key
         return out
 
     def _record(
@@ -722,9 +734,11 @@ class Gateway:
         preset, body, raw = hold.preset, hold.body, hold.raw
         try:
             key = self._key(preset)
-            url = preset.base_url.rstrip("/") + path
             req = self.async_client.build_request(
-                "POST", url, headers=self._headers(headers, key), content=raw
+                "POST",
+                self._upstream_url(preset, path),
+                headers=self._headers(headers, key, preset),
+                content=raw,
             )
             started = time.monotonic()
             resp = await self.async_client.send(req, stream=True)
@@ -1025,8 +1039,8 @@ class Gateway:
             started = time.monotonic()
             try:
                 resp = self.sync_client.post(
-                    p.base_url.rstrip("/") + "/v1/messages",
-                    headers=self._headers({}, self._key(p)),
+                    self._upstream_url(p, "/v1/messages"),
+                    headers=self._headers({}, self._key(p), p),
                     content=raw,
                 )
             except httpx2.TransportError as e:

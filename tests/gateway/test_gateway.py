@@ -19,6 +19,7 @@ from vigild.gateway.service import Gateway, GatewayError
 from vigild.jobs.model import Role
 
 FAKE_KEY = "fake-provider-key-for-tests"
+TOWER_KEY = "fake-tower-key-for-tests"
 PA = "thomasbardhi01/parkagent"
 
 
@@ -91,7 +92,7 @@ def gw(cfg: Config, store: Store, budget: Budget, upstream: Upstream) -> Gateway
         cfg,
         store,
         budget,
-        Secrets({"ANTHROPIC_API_KEY": FAKE_KEY}),
+        Secrets({"ANTHROPIC_API_KEY": FAKE_KEY, "TOWER_API_KEY": TOWER_KEY}),
         transport=transport,
         async_transport=transport,
     )
@@ -949,3 +950,27 @@ def test_a_replay_never_claims_a_half_open_probe(
     assert r.status_code == 529 and "replay" in r.text
     assert claimed == []  # the probe is still free for real work
     assert str(store.get_replay(rid)["error"] or "").startswith("gate_refused")
+
+
+def test_tower_call_goes_to_the_servers_messages_route_with_its_bearer_and_costs_nothing(
+    client: TestClient, cfg: Config, store: Store, budget: Budget, gw: Gateway, upstream: Upstream
+) -> None:
+    cfg.repos.repos[PA].backends.append("tower-qwen")
+    _, tok = _session(store, budget, gw, preset="tower-qwen")
+    r = client.post("/v1/messages", json=_msg(model="qwen3.6-35b-a3b"), headers={"x-api-key": tok})
+    assert r.status_code == 200
+    sent = upstream.requests[0]
+    assert str(sent.url) == "http://tower:8080/v1/messages"  # base_url's /v1 is not doubled
+    assert sent.headers["authorization"] == f"Bearer {TOWER_KEY}"
+    assert "x-api-key" not in sent.headers and FAKE_KEY not in str(sent.headers)
+    row = store.q("SELECT * FROM model_calls")[0]
+    assert (row["provider"], row["backend_preset"], row["cost_usd"]) == ("tower", "tower-qwen", 0)
+    assert TOWER_KEY not in r.text
+
+
+def test_every_upstream_url_is_built_one_way_for_each_kind(cfg: Config) -> None:
+    """The bug class from the track C review: a preset's base_url plus the
+    Messages path. The tower's base_url ends in /v1; it must never double."""
+    tower, sonnet = cfg.preset("tower-qwen"), cfg.preset("claude-sonnet")
+    assert Gateway._upstream_url(tower, "/v1/messages") == "http://tower:8080/v1/messages"
+    assert Gateway._upstream_url(sonnet, "/v1/messages") == "https://api.anthropic.com/v1/messages"

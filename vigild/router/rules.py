@@ -71,9 +71,17 @@ def route(task: Task, cfg: Config, *, override_tier: str | None = None) -> Route
         tier = override_tier
 
     preset = cfg.routing.tiers[tier]
+    pol = cfg.repo(task.repo)
+    why = ""
     if not cfg.preset(preset).live:
+        why = "not live"
+    elif (
+        cfg.preset(preset).locality == "local" and preset not in pol.backends + pol.worker_overflow
+    ):
+        why = "not listed"  # a repo that hasn't opted into the tower still routes
+    if why:  # a tier whose preset isn't live, or isn't one this repo lists, falls back
         fallback = cfg.routing.fallback
-        reason = f"{reason}; {preset} not live, fallback {fallback}"
+        reason = f"{reason}; {preset} {why}, fallback {fallback}"
         preset = fallback
     try:
         check_backend(cfg, task.repo, preset, private=live_private(task.repo))

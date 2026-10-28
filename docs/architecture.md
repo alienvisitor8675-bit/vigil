@@ -171,21 +171,27 @@ presets:
   claude-sonnet: {kind: anthropic, base_url: https://api.anthropic.com, model: claude-sonnet-5-5, key_ref: ANTHROPIC_API_KEY, locality: hosted, provider: anthropic}
   claude-opus:   {kind: anthropic, …, model: claude-opus-5-5, …}
   claude-haiku:  {kind: anthropic, …, model: claude-haiku-5-5, …}
-  tower-qwen:    {kind: openai_compatible, base_url: http://tower:8080/v1, model: qwen3.6-35b-a3b, key_ref: LLAMA_API_KEY, locality: local, provider: tower, live: false}  # phase 5
+  tower-qwen:    {kind: openai_compatible, base_url: http://tower:8080/v1, model: qwen3.6-35b-a3b, key_ref: TOWER_API_KEY, locality: local, provider: tower}  # live 2026-10-28
   tower-fast:    {kind: openai_compatible, …, model: gpt-oss-20b, …, live: false}                                                                            # phase 5
   openrouter:    {kind: openrouter, base_url: https://openrouter.ai/api/v1, model: null, key_ref: OPENROUTER_API_KEY, locality: hosted, provider: openrouter, live: false}  # phase 4
 ```
 
 - **Tiers to presets.** `configs/routing.yaml` maps each tier to a preset.
-  A tier whose preset isn't live yet falls back to `fallback`
-  (claude-sonnet), and `tier_reason` says so. The coord's preset is
-  `coord` (claude-opus).
+  A tier whose preset isn't live, or a local one the repo's `backends`
+  doesn't list, falls back to `fallback` (claude-sonnet), and `tier_reason`
+  says so. `tower-qwen` is live; a repo uses it once `configs/repos.yaml`
+  lists it (vigil does, from 2026-10-28; ParkAgent doesn't). The coord's
+  preset is `coord` (claude-opus).
 - **Custom endpoints.** A session may carry a custom object; its `key_ref`
   must be a variable NAME (the contract model rejects anything shaped like
   a value).
 - **Executor and backend compatibility.** Unchanged from the design:
   Claude executor ↔ `anthropic` (and OpenRouter's Anthropic models);
-  OpenCode ↔ any. In phase 1 the gateway forwards `anthropic` only.
+  OpenCode ↔ any. The gateway forwards `anthropic` and, since 2026-10-28,
+  `openai_compatible` (the tower): to the server's own `/v1/messages`
+  (llama-server answers the Messages shape), with `Authorization: Bearer`
+  from the preset's `key_ref` instead of `x-api-key`; the call is metered at
+  the price table's $0 (provider `tower`, provenance `local`).
 - **Private repos** (owner decision Q2, 2026-10-22). `configs/repos.yaml`
   lists, per repo, which backends and decider routes may see its text.
   - **Allowed for a private repo:** local presets, and one hosted route,
@@ -745,7 +751,7 @@ The outer loop (weekly replay) is part of phase 7 (ruling 3).
 ### Resolved without asking (still in force)
 
 - **Tower metering phase:** with the tower, in phase 5.
-- **Tower secret:** the tower keeps `LLAMA_API_KEY` in
+- **Tower secret:** the tower keeps `TOWER_API_KEY` in
   `/etc/vigil/llama.env` (runbook).
 - **Where tokens live outside the env file:** nowhere. The CLI reads the
   env file; the UI holds a cookie, not a token.

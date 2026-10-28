@@ -102,17 +102,34 @@ def test_rule5_escalation(cfg: Config) -> None:
     assert route(_t(review_rounds=2), cfg).tier_reason.startswith("rule5")
 
 
-def test_rule6_local_shapes_fall_back_until_the_tower_is_live(cfg: Config) -> None:
+def test_rule6_local_shapes_fall_back_while_the_tower_is_not_live(cfg: Config) -> None:
+    cfg.backends.presets["tower-qwen"].live = False
     r = route(_t(labels=["tests"], size="S", has_existing_tests=True), cfg)
     assert r.tier == "local" and r.tier_reason.startswith("rule6")
     assert r.preset == "claude-sonnet" and "tower-qwen not live" in r.tier_reason
 
 
-def test_rule6_routes_to_the_tower_once_live(cfg: Config) -> None:
-    cfg.backends.presets["tower-qwen"].live = True
+def test_rule6_routes_to_the_tower_with_no_fallback(cfg: Config) -> None:
     cfg.repos.repos[PA].backends.append("tower-qwen")
     r = route(_t(labels=["tests"], size="M", has_existing_tests=True), cfg)
     assert r.preset == "tower-qwen"
+    assert "not live" not in r.tier_reason and "fallback" not in r.tier_reason
+
+
+def test_rule6_falls_back_when_the_repo_does_not_list_the_tower(cfg: Config) -> None:
+    r = route(_t(labels=["tests"], size="S", has_existing_tests=True), cfg)
+    assert r.preset == "claude-sonnet" and "tower-qwen not listed" in r.tier_reason
+
+
+def test_vigil_lists_the_tower_and_its_rule6_tasks_route_there(cfg: Config) -> None:
+    """Owner, 2026-10-28: vv-26 is the first tower-routed job, on vigil. Only
+    vigil opts in here; ParkAgent's backends are the owner's to change."""
+    assert "tower-qwen" in cfg.repos.repos["thomasbardhi01/vigil"].backends
+    assert "tower-qwen" not in cfg.repos.repos[PA].backends
+    t = _t(repo="thomasbardhi01/vigil", labels=["tests"], size="S", has_existing_tests=True)
+    r = route(t, cfg)
+    assert (r.preset, r.tier_reason.startswith("rule6")) == ("tower-qwen", True)
+    assert "fallback" not in r.tier_reason
 
 
 def test_rule7_xs_docs(cfg: Config) -> None:

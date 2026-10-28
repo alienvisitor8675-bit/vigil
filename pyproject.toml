@@ -63,5 +63,6 @@ asyncio_mode = "auto"
 markers = [
   "docker: needs Docker Desktop and the linux/arm64 images (pytest -m docker, on the Mac)",
   "live: calls a hosted model through vigild's gateway; needs the vigil env file",
+  "tower: calls the tower through vigild's gateway; needs its key in the env file and the tailnet",
 ]
 addopts = "-m 'not docker and not live' --strict-markers"

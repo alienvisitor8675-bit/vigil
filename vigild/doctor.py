@@ -277,6 +277,29 @@ def run_checks(
     else:
         out.append(Check("CLOUDFLARE_ACCOUNT_ID+CLOUDFLARE_API_TOKEN", None,
                          "no private repo lists jev-cloudflare"))  # fmt: skip
+    for name, preset in cfg.backends.presets.items():
+        if preset.kind.value != "openai_compatible" or not preset.live:
+            continue
+        label = f"backend: {name} ({preset.key_ref})"
+        if not (key := secrets.get(preset.key_ref)):
+            out.append(Check(label, False, "missing"))
+            continue
+
+        def models_ok(
+            base: str = preset.base_url, key: str = key, model: str = preset.model or ""
+        ) -> tuple[bool, str]:
+            """GET /models with the bearer: 200 and the preset's model listed."""
+            r = http.get(
+                base.rstrip("/") + "/models",
+                headers={"Authorization": f"Bearer {key}"},
+                timeout=TIMEOUT,
+            )
+            if r.status_code != 200:
+                return False, f"HTTP {r.status_code}"
+            listed = model in {m.get("id") for m in r.json().get("data", [])}
+            return listed, "model listed" if listed else "model not listed"
+
+        out.append(_safe(label, models_ok))
     from vigild.decider.policy import decider_routes
     from vigild.decider.wiring import available_routes
 
