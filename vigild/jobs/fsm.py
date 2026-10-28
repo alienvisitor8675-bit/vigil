@@ -265,7 +265,7 @@ def _merged_by_hand(c: Ctx) -> list[str]:
     return errs
 
 
-KILL_CHANNELS = ("api", "cli")  # `vigil kill` and POST /api/jobs/{id}/kill (issue #52)
+KILL_CHANNELS = ("api", "cli", "mcp")  # `vigil kill`, the MCP `kill` tool, POST /api/jobs/{id}/kill
 
 
 def _killed(c: Ctx) -> bool:
@@ -277,7 +277,7 @@ def _killed(c: Ctx) -> bool:
 
 
 def _kill_guard(c: Ctx) -> list[str]:
-    return [] if _killed(c) else ["only the owner's kill (CLI or API) abandons a job here"]
+    return [] if _killed(c) else ["only the owner's kill (CLI, API or MCP) abandons a job here"]
 
 
 def _abandon(c: Ctx) -> list[str]:

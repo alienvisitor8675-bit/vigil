@@ -7,6 +7,7 @@ client of the API; `run`, `batch`, `ls` and `trace` follow in phase 2.
   uv run python -m vigil backup [--dest DIR] [--keep-days 14]
   uv run python -m vigil restore <backup.db>   (verify only)
   uv run python -m vigil kill <job>
+  uv run python cli/vigil mcp                  (stdio MCP server; VIGIL_API_TOKEN in the env)
 """
 
 from __future__ import annotations
@@ -228,6 +229,16 @@ def kill(job: str = typer.Argument(..., help="a job id, e.g. pa-0007")) -> None:
             )
         if body.get("reservations_open"):
             typer.echo(f"  still open: {body['reservations_open']}")
+
+
+@app.command("mcp")
+def mcp_serve() -> None:
+    """Run the MCP server on stdio, for a Claude Code session: tools submit_job,
+    job_status, list_inbox, inbox_act and kill over vigild's API. The token is
+    VIGIL_API_TOKEN from the environment only; VIGIL_API_URL defaults to the loopback API."""
+    from vigil.mcp_server import serve
+
+    serve()
 
 
 @app.command("dev-image")

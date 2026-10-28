@@ -106,6 +106,7 @@ def require(needed: Scope) -> Callable[[Request], Scope]:
             raise HTTPException(401, "missing or invalid bearer token")
         if needed not in GRANTS[scope]:
             raise HTTPException(403, f"the {scope.value} token can't do this")
+        request.state.authed = True  # the channel middleware logs only authenticated calls
         return scope
 
     return dep

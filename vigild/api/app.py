@@ -7,9 +7,11 @@ scripts/check-feature-map.py can find it.
 from __future__ import annotations
 
 import dataclasses
+import json
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -35,9 +37,16 @@ from vigild.jobs.service import (
     SubmitError,
 )
 from vigild.jobs.tree import job_tree
+from vigild.provenance import Provenance
 from vigild.services import Services
 
 router = APIRouter()
+
+# Where a call came from, as the client says (`X-Vigil-Channel`). A fixed allowlist: any
+# other value is refused, so nothing a caller makes up is ever recorded. `mcp` calls are
+# logged as `mcp_call` events (#55); `api` is the default.
+CHANNEL_HEADER = "X-Vigil-Channel"
+CHANNELS = ("api", "cli", "mcp")
 READ = Depends(require(Scope.READ))
 ADMIN = Depends(require(Scope.ADMIN))
 
@@ -185,7 +194,7 @@ def kill_job(
     reservations, then the job is abandoned. `{"channel": "api" | "cli"}` says where the
     kill came from (default `api`); it is recorded with the actor. A job that is already
     done or abandoned, or a second kill, is not an error: 200 with `already: <state>`."""
-    channel = (body or {}).get("channel", "api")
+    channel = (body or {}).get("channel", request.state.channel)
     if not isinstance(channel, str) or channel not in KILL_CHANNELS:
         raise HTTPException(422, f"channel must be one of {list(KILL_CHANNELS)}")
     try:
@@ -447,6 +456,33 @@ def get_session(request: Request, session_id: str) -> dict[str, Any]:
         raise HTTPException(404, "no such session") from e
 
 
+def _log_mcp_call(store: Store, request: Request, status: int, body: bytes) -> None:
+    """One small `mcp_call` event per call from the MCP server: which route, the item and
+    job it named, the status. Never a body, a note or a header."""
+    params = request.path_params
+    data: dict[str, Any] = {
+        "channel": "mcp",
+        "method": request.method,
+        "route": request.scope["route"].path,  # the template; never the caller's raw path
+        "status": status,
+    }
+    if "item_id" in params:
+        data["item_id"] = int(params["item_id"]) if str(params["item_id"]).isdigit() else None
+    job_id = params.get("job_id")
+    if job_id is None:
+        try:
+            out = json.loads(body)
+        except ValueError:
+            out = None
+        if isinstance(out, dict):
+            job_id = out.get("job_id") or (out.get("id") if request.method == "POST" else None)
+    try:
+        store.get_job(str(job_id))
+    except KeyError:
+        job_id = None
+    store.add_event("mcp_call", data, Provenance.HUMAN, job_id=str(job_id) if job_id else None)
+
+
 def create_app(services: Services, *, ui: bool = False) -> FastAPI:
     """`ui=True` only for the listener on the Mac's Tailscale address: it adds
     the cookie login (P7). The loopback listener is bearer-only (CLI, MCP)."""
@@ -454,6 +490,31 @@ def create_app(services: Services, *, ui: bool = False) -> FastAPI:
     app.state.services = services
     app.state.ui = ui
     app.include_router(router)
+
+    @app.middleware("http")
+    async def _channel(request: Request, call_next: Any) -> Response:
+        channel = request.headers.get(CHANNEL_HEADER, "api")
+        if channel not in CHANNELS:
+            return JSONResponse(
+                {"detail": f"{CHANNEL_HEADER} must be one of {list(CHANNELS)}"}, status_code=422
+            )
+        request.state.channel = channel
+        response: Response = await call_next(request)
+        route = request.scope.get("route")
+        if (
+            channel != "mcp"
+            or not getattr(request.state, "authed", False)
+            or not isinstance(getattr(route, "path", None), str)
+        ):
+            return response
+        body = b"".join([chunk async for chunk in response.body_iterator])  # type: ignore[attr-defined]
+        await run_in_threadpool(_log_mcp_call, services.store, request, response.status_code, body)
+        out = Response(body, status_code=response.status_code)
+        out.raw_headers = [
+            (k, v) for k, v in response.raw_headers if k.lower() != b"content-length"
+        ]
+        out.raw_headers.append((b"content-length", str(len(body)).encode()))
+        return out
 
     @app.exception_handler(KeyError)
     async def _missing(_: Request, exc: KeyError) -> JSONResponse:

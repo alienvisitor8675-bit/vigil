@@ -566,6 +566,25 @@ says so, and exits 0. If a kill fails partway, vigil prints the step (a 500); th
 `abandoned`, and running `vigil kill <job>` again finishes the work. A kill is not a failure: it does not count toward the repo's failure
 breaker. Only containers carrying the job's own `dev.vigil.session` labels are touched.
 
+### Use vigil from a Claude Code session (MCP)
+
+`vigil mcp` is a stdio MCP server over vigild's API. It reads `VIGIL_API_TOKEN` from its own
+environment only (it never opens `~/.config/vigil/`), and finds vigild at `VIGIL_API_URL`
+(default `http://127.0.0.1:8787`). Add it once; give
+it no `--env`, so the token stays out of the MCP config and comes from the shell that starts
+Claude Code:
+
+```sh
+claude mcp add vigil -- uv run --directory <checkout> python cli/vigil mcp
+claude mcp list                      # vigil should show as connected
+```
+
+Start Claude Code from a shell where `VIGIL_API_TOKEN` is exported; the server inherits it.
+In the session, `/mcp` lists the server's tools: `submit_job`, `job_status`, `list_inbox`,
+`inbox_act` (approve, replan with a note, retry, abandon, reset) and `kill`. A job submitted
+there appears in the inbox as a spec; each call is an `mcp_call` event with `channel: mcp`
+on the job, and a kill's transition carries the channel too.
+
 ### Check everything
 
 ```sh
