@@ -5,7 +5,7 @@ A backup *set* is in the destination, named by UTC time:
 `vigil-YYYYMMDDTHHMMSSZ.db` (SQLite online backup of `<data>/vigil.db`, mode
 600), `vigil-YYYYMMDDTHHMMSSZ.vault/` (rsync of `<data>/vault/`) and
 `vigil-YYYYMMDDTHHMMSSZ.marker` (holds the run id). Retention prunes only sets
-that have the marker, so a person's own file with a matching name is never
+whose marker holds a run id this tool wrote, so a person's own file with a matching name is never
 removed. A set is built in `.vigil-<stamp>.tmp/` (marker inside) and moved out.
 This module never opens anything under `~/.config/vigil/`; the destination
 comes from the host (`--dest` or `VIGIL_BACKUP_DIR`), never from the repo.
@@ -32,6 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SECRETS_DIR = Path.home() / ".config" / "vigil"
 _STAMP = r"\d{8}T\d{6}Z"
 _MARKER = re.compile(rf"^vigil-({_STAMP})\.marker$")
+_RUN_ID = re.compile(r"^[0-9a-f]{16}$")
 _TMP = re.compile(rf"^\.vigil-{_STAMP}\.tmp$")
 TMP_MARKER = ".vigil-backup"
 RSYNC_VANISHED = 24
@@ -107,15 +108,13 @@ def run_backup(
         try:
             _copy_db(src, work / "db")
             warnings += _copy_vault(data / "vault", work / "vault")
-            os.rename(work / "vault", final_vault)
+            # The marker lands first, so a piece in dest is never unmarked; a
+            # set cut short by a kill is marked and prune removes it when old.
+            os.link(work / TMP_MARKER, final_marker)  # the tmp dir keeps its copy
             os.rename(work / "db", final_db)
-            (work / TMP_MARKER).rename(final_marker)  # last: the set is complete
+            os.rename(work / "vault", final_vault)
         except BaseException:
-            for p in (final_db, final_vault, final_marker):
-                if p.is_dir():
-                    shutil.rmtree(p, ignore_errors=True)
-                else:
-                    p.unlink(missing_ok=True)
+            _discard([final_db, final_vault, final_marker])
             raise
         finally:
             shutil.rmtree(work, ignore_errors=True)
@@ -124,24 +123,45 @@ def run_backup(
     return BackupSet(final_db, final_vault, warnings)
 
 
+def _discard(paths: list[Path]) -> None:
+    for p in paths:
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            p.unlink(missing_ok=True)
+
+
+def _output_problems(conn: sqlite3.Connection) -> list[str]:
+    problems: list[str] = []
+    rows = conn.execute("PRAGMA integrity_check").fetchall()
+    if [r[0] for r in rows] != ["ok"]:
+        problems.append("integrity_check: " + "; ".join(str(r[0]) for r in rows[:5]))
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) <= 0:
+        problems.append("user_version is 0")
+    return problems
+
+
 def _copy_db(src: Path, out: Path) -> None:
-    # Read-only source (mode=ro): a backup never creates -wal/-shm in the data
-    # dir. The online backup API is consistent while vigild writes. The umask
-    # makes sqlite create the file 600; there is no wider window.
-    # With no -wal/-shm beside it nobody has the file open, so immutable=1 keeps
-    # a read-only WAL reader from creating them; with them, vigild is live and
-    # they already exist.
-    live = any(src.with_name(src.name + sfx).exists() for sfx in ("-wal", "-shm"))
-    flags = "mode=ro" if live else "mode=ro&immutable=1"
-    s = sqlite3.connect(f"file:{quote(str(src))}?{flags}", uri=True, timeout=30)
+    # A normal connection and the online backup API: a consistent snapshot
+    # under WAL while vigild runs. It may create -wal/-shm beside the source;
+    # that is accepted. The umask makes sqlite create the output 600. The
+    # output is checked before the caller renames it into place.
+    s = sqlite3.connect(str(src), timeout=30)
     d = sqlite3.connect(str(out))
     try:
-        s.backup(d)
-        d.execute("PRAGMA journal_mode=DELETE")
-        d.commit()
+        try:
+            s.backup(d)
+            d.execute("PRAGMA journal_mode=DELETE")
+            d.commit()
+            problems = _output_problems(d)
+        except sqlite3.Error as e:
+            raise BackupError(f"database backup failed: {e}") from e
     finally:
         d.close()
         s.close()
+    if problems:
+        out.unlink(missing_ok=True)
+        raise BackupError("backup output failed its check: " + "; ".join(problems))
     os.chmod(out, 0o600)
 
 
@@ -161,11 +181,21 @@ def _copy_vault(vault_src: Path, out: Path) -> list[str]:
     return []
 
 
+def _ours(marker: Path) -> bool:
+    """True if `marker` is a plain file holding exactly a run id this tool wrote."""
+    try:
+        if marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 64:
+            return False
+        return bool(_RUN_ID.fullmatch(marker.read_text()))
+    except OSError, UnicodeDecodeError:
+        return False
+
+
 def _clean_tmp(dest: Path) -> None:
     """Remove leftovers of failed runs: `.vigil-<stamp>.tmp/` dirs that hold
     this tool's marker. Anything else is not ours."""
     for p in dest.iterdir():
-        if _TMP.match(p.name) and p.is_dir() and not p.is_symlink() and (p / TMP_MARKER).is_file():
+        if _TMP.match(p.name) and p.is_dir() and not p.is_symlink() and _ours(p / TMP_MARKER):
             shutil.rmtree(p, ignore_errors=True)
 
 
@@ -175,7 +205,7 @@ def prune(dest: Path, keep_days: int, *, now: datetime) -> list[Path]:
     removed: list[Path] = []
     for m in sorted(dest.iterdir()):
         mm = _MARKER.match(m.name)
-        if not mm or not m.is_file() or m.is_symlink():
+        if not mm or not _ours(m):
             continue
         when = datetime.strptime(mm.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
         if when >= cutoff:
@@ -199,7 +229,7 @@ def verify_backup(db: Path) -> list[str]:
     if not db.is_file():
         return [f"{db} does not exist"]
     try:
-        conn = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
+        conn = sqlite3.connect(f"file:{quote(str(db))}?mode=ro&immutable=1", uri=True)
     except sqlite3.Error as e:
         return [f"cannot open read-only: {e}"]
     try:

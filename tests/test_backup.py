@@ -61,10 +61,12 @@ def test_backup_file_is_mode_600_and_named_by_time(
     assert not [p for p in dest.iterdir() if p.name.endswith(".tmp")]
 
 
-def test_backup_is_consistent_while_a_writer_holds_the_db(data: Path, tmp_path: Path) -> None:
+def test_backup_is_a_committed_snapshot_while_a_writer_inserts(data: Path, tmp_path: Path) -> None:
     writer = sqlite3.connect(data / "vigil.db", isolation_level=None, check_same_thread=False)
     writer.execute("PRAGMA journal_mode=WAL")
+    committed = [writer.execute("SELECT count(*) FROM events").fetchone()[0]]
     stop = threading.Event()
+    started = threading.Event()
 
     def churn() -> None:
         i = 0
@@ -75,10 +77,13 @@ def test_backup_is_consistent_while_a_writer_holds_the_db(data: Path, tmp_path: 
                 (f"{i}" * 200,),
             )
             writer.execute("COMMIT")
+            committed.append(committed[-1] + 1)
+            started.set()
             i += 1
 
     t = threading.Thread(target=churn)
     t.start()
+    started.wait(10)
     try:
         made = backup.run_backup(data, tmp_path / "dest", now=NOW)
     finally:
@@ -88,6 +93,8 @@ def test_backup_is_consistent_while_a_writer_holds_the_db(data: Path, tmp_path: 
     ro = sqlite3.connect(f"file:{made.db}?mode=ro", uri=True)
     assert ro.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert ro.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+    assert ro.execute("SELECT count(*) FROM events").fetchone()[0] in committed
+    ro.close()
 
 
 def test_retention_prunes_only_old_sets_this_tool_made(data: Path, tmp_path: Path) -> None:
@@ -126,14 +133,18 @@ def test_leftover_tmp_is_cleaned_only_when_it_carries_the_marker(
     dest.mkdir()
     ours = dest / ".vigil-20200101T000000Z.tmp"
     ours.mkdir()
-    (ours / ".vigil-backup").write_text("run")
+    (ours / ".vigil-backup").write_text("0123456789abcdef")
     (ours / "x.db").write_text("half")
     theirs = dest / ".vigil-mine.tmp"
     theirs.mkdir()
     (theirs / "keep").write_text("mine")
+    odd = dest / ".vigil-20200102T000000Z.tmp"
+    odd.mkdir()
+    (odd / ".vigil-backup").write_text("someone else's note")
     backup.run_backup(data, dest, now=NOW)
     assert not ours.exists()
     assert (theirs / "keep").exists()
+    assert odd.exists()  # the marker's content is not this tool's
 
 
 def test_destination_may_not_sit_in_the_data_dir_or_repo(data: Path) -> None:
@@ -185,10 +196,101 @@ def test_rsync_vanished_files_is_a_warning_other_errors_fail(
     assert not [p for p in dest.iterdir() if p.name.endswith(".tmp")]
 
 
-def test_backup_leaves_the_data_dir_untouched(data: Path, tmp_path: Path) -> None:
-    before = sorted(p.name for p in data.rglob("*"))
+def test_backup_leaves_the_data_content_unchanged(data: Path, tmp_path: Path) -> None:
+    def snapshot() -> tuple[int, int]:
+        c = sqlite3.connect(data / "vigil.db")
+        try:
+            return (
+                int(c.execute("PRAGMA user_version").fetchone()[0]),
+                int(c.execute("SELECT count(*) FROM jobs").fetchone()[0]),
+            )
+        finally:
+            c.close()
+
+    before_files = {p.name for p in data.rglob("*")}
+    before = snapshot()
     backup.run_backup(data, tmp_path / "dest", now=NOW)
-    assert sorted(p.name for p in data.rglob("*")) == before  # no -wal, no -shm
+    assert snapshot() == before
+    new = {p.name for p in data.rglob("*")} - before_files
+    assert new <= {"vigil.db-wal", "vigil.db-shm"}
+
+
+def test_output_is_checked_before_it_is_renamed_into_place(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dest = tmp_path / "dest"
+    monkeypatch.setattr(backup, "_output_problems", lambda c: ["integrity_check: broken"])
+    with pytest.raises(backup.BackupError, match="integrity"):
+        backup.run_backup(data, dest, now=NOW)
+    assert list(dest.iterdir()) == []
+
+
+def test_output_with_user_version_zero_is_refused(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    c = sqlite3.connect(root / "vigil.db")
+    c.execute("CREATE TABLE t (x)")
+    c.commit()
+    c.close()
+    dest = tmp_path / "dest"
+    with pytest.raises(backup.BackupError, match="user_version"):
+        backup.run_backup(root, dest, now=NOW)
+    assert list(dest.iterdir()) == []
+
+
+def test_prune_requires_the_tools_exact_marker_content(data: Path, tmp_path: Path) -> None:
+    dest = tmp_path / "dest"
+    old = NOW - timedelta(days=30)
+    made = backup.run_backup(data, dest, now=old, keep_days=None)
+    marker = made.db.with_suffix(".marker")
+    assert len(marker.read_text()) == 16
+    other = backup.run_backup(data, dest, now=old - timedelta(days=1), keep_days=None)
+    other.db.with_suffix(".marker").write_text("my own notes")
+    backup.run_backup(data, dest, now=NOW, keep_days=14)
+    assert not made.db.exists() and not marker.exists()
+    assert other.db.exists() and other.vault.exists()
+    assert other.db.with_suffix(".marker").read_text() == "my own notes"
+
+
+def test_a_kill_between_renames_never_leaves_an_unmarked_piece(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Killed(BaseException):
+        pass
+
+    real = os.rename
+    for n in (1, 2):
+        dest = tmp_path / f"dest{n}"
+        calls = 0
+
+        def flaky(a: object, b: object, _n: int = n) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == _n:
+                raise Killed
+            real(a, b)  # type: ignore[arg-type]
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "rename", flaky)
+            # a real kill runs no cleanup
+            m.setattr(backup, "_discard", lambda paths: None)
+            m.setattr(backup.shutil, "rmtree", lambda *a, **k: None)
+            with pytest.raises(Killed):
+                backup.run_backup(data, dest, now=NOW)
+        for p in dest.iterdir():
+            if p.name.startswith("vigil-"):
+                assert (dest / "vigil-20261027T030000Z.marker").is_file(), (n, p.name)
+        backup.run_backup(data, dest, now=NOW + timedelta(days=30), keep_days=14)
+        assert [p.name for p in dest.iterdir() if "20261027T030000Z" in p.name] == []
+
+
+def test_verify_handles_a_path_with_uri_characters(data: Path, tmp_path: Path) -> None:
+    made = backup.run_backup(data, tmp_path / "dest", now=NOW)
+    odd = tmp_path / "we?ird#dir"
+    odd.mkdir()
+    copy = odd / "b%20.db"
+    copy.write_bytes(made.db.read_bytes())
+    assert backup.verify_backup(copy) == []
 
 
 def test_missing_database_is_an_error(tmp_path: Path) -> None:

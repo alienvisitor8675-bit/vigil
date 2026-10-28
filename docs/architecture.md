@@ -349,9 +349,14 @@ from host config (`--dest` or `VIGIL_BACKUP_DIR`; never in the repo, the data
 dir or `~/.config/vigil/`): `vigil-<UTC stamp>.db`, a SQLite online backup of
 `vigil.db` made under umask 077 (mode 600 from creation, consistent while
 vigild writes), and `vigil-<stamp>.vault/`, an rsync of `vault/`. It prunes
-sets older than 14 days. Each set has a `vigil-<stamp>.marker` file; prune
-removes only sets with the marker, so a person's own file is never touched. The
-source DB is opened read-only (no `-wal`/`-shm` created) and the vault rsync
+sets older than 14 days. Each set has a `vigil-<stamp>.marker` file holding the
+run id (16 hex characters); it is written first, in the tmp dir, and linked into
+place before the db and vault, so no piece is ever unmarked. Prune removes only
+sets whose marker holds exactly that format, so a person's own file is never
+touched. The copy is a normal `sqlite3.connect` plus `backup()`, so it is
+consistent under WAL while vigild runs (it may create `-wal`/`-shm` beside the
+source); the output gets `integrity_check` and `user_version` > 0 before it is
+renamed into place, and a failure removes the set. The vault rsync
 uses `--safe-links --no-specials --no-devices` (exit 24 is a warning). It never reads
 the secrets directory; that is backed up separately, encrypted, by the owner.
 `vigil restore <db>` only verifies: it opens the file read-only, runs

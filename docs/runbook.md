@@ -455,6 +455,9 @@ This is the durability story until there is a second machine. `vigil backup`
 writes a dated set to a destination you choose (an external drive, or a
 mount of the tower over Tailscale): `vigil-<UTC stamp>.db` (SQLite online
 backup, mode 600) and `vigil-<stamp>.vault/` (rsync). It keeps 14 days.
+It is safe to run while vigild is running (SQLite's backup API gives a
+consistent snapshot; it may create `vigil.db-wal` and `-shm` beside the
+database), and it checks the copy with `integrity_check` before keeping it.
 The destination must be outside the repo and the data dir. It never reads
 `~/.config/vigil/`: back that directory up separately, encrypted, with a
 key only you hold.
