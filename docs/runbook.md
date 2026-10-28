@@ -565,6 +565,28 @@ decides how many run at once. `GET /api/batch/<id>` shows each job's state and c
 total (spent plus held). `POST /api/batch/<id>/kill` kills every job in it, through the job
 kill below; it answers 200 with each job's result, and any job whose kill failed is listed under `failed`: run it again to finish those.
 
+From the CLI (it needs `VIGIL_API_TOKEN` like `vigil kill`), write the same body as YAML:
+
+```yaml
+name: docs sweep
+jobs:
+  - repo: thomasbardhi01/vigil
+    title: ...
+    request: ...
+    why: ...
+    value: 3
+    risk: 1
+```
+
+```sh
+uv run python cli/vigil batch submit batch.yaml    # prints the batch id and its jobs
+uv run python cli/vigil batch status b-0001        # state and cost per job, and the total
+```
+
+When the specs are in the inbox, `POST /api/batch/<id>/approve-all` (admin) approves every
+open one. Each is an ordinary approval with its own event; a job whose spec is not ready
+yet is skipped and listed, and approving again later takes the rest.
+
 ### Kill a job
 
 `vigil kill <job>` stops a job cleanly, whatever it is doing. It needs `VIGIL_API_TOKEN`

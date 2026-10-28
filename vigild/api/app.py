@@ -243,6 +243,17 @@ def get_batch(request: Request, batch_id: str) -> dict[str, Any]:
         raise HTTPException(404, "no such batch") from e
 
 
+@router.post("/api/batch/{batch_id}/approve-all", dependencies=[ADMIN])
+def approve_batch(request: Request, batch_id: str) -> dict[str, Any]:
+    """Approve every open spec of the batch (owner only). Each is an ordinary per-job
+    approval with its own events (channel `inbox`, evidence naming the batch). A job whose
+    spec is not ready is listed under `skipped` and left as it is."""
+    try:
+        return _svc(request).jobs.approve_batch(batch_id)
+    except NotFound as e:
+        raise HTTPException(404, "no such batch") from e
+
+
 @router.post("/api/batch/{batch_id}/kill", dependencies=[ADMIN])
 def kill_batch(
     request: Request, batch_id: str, body: Annotated[dict[str, Any] | None, Body()] = None

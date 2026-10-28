@@ -101,3 +101,103 @@ def test_kill_fails_on_an_api_error(monkeypatch: pytest.MonkeyPatch, status: int
     _api(monkeypatch, status, {"detail": "no such job"})
     out = CliRunner().invoke(app, ["kill", "nope"])
     assert out.exit_code == 1 and str(status) in out.output
+
+
+# --- vigil batch (issue #54) ----------------------------------------------------------------
+
+BATCH_YAML = """\
+name: docs sweep
+jobs:
+  - repo: o/r
+    title: First
+    request: Do the first thing.
+    why: because
+    value: 3
+    risk: 1
+  - repo: o/r
+    title: Second
+    request: Do the second thing.
+    why: because
+    value: 2
+    risk: 1
+    issue: 12
+    notes: [keep it short]
+"""
+
+
+def test_batch_submit_parses_the_yaml_and_posts_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    import json
+
+    f = tmp_path / "b.yaml"
+    f.write_text(BATCH_YAML)
+    seen = _api(
+        monkeypatch, 202, {"batch_id": "b-0001", "name": "docs sweep", "jobs": ["r-0001", "r-0002"]}
+    )
+    out = CliRunner().invoke(app, ["batch", "submit", str(f)])
+    assert out.exit_code == 0, out.output
+    req = seen[0]
+    assert req.method == "POST" and req.url.path == "/api/batch"
+    body = json.loads(req.content)
+    assert body["name"] == "docs sweep" and [j["title"] for j in body["jobs"]] == [
+        "First",
+        "Second",
+    ]
+    assert body["jobs"][1]["issue"] == 12 and body["jobs"][1]["notes"] == ["keep it short"]
+    assert "b-0001" in out.output and "r-0002" in out.output
+
+
+def test_batch_submit_refusal_names_the_job_and_exits_1(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    f = tmp_path / "b.yaml"
+    f.write_text(BATCH_YAML)
+    _api(monkeypatch, 422, {"detail": {"errors": ["jobs[1]: no such repo"]}})
+    out = CliRunner().invoke(app, ["batch", "submit", str(f)])
+    assert out.exit_code == 1 and "jobs[1]: no such repo" in out.output
+
+
+def test_batch_submit_rejects_a_file_that_is_not_a_batch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    seen = _api(monkeypatch, 202, {})
+    for text in ("- just\n- a list\n", "name: x\n", "name: x\njobs: nope\n", "{{{"):
+        f = tmp_path / "bad.yaml"
+        f.write_text(text)
+        out = CliRunner().invoke(app, ["batch", "submit", str(f)])
+        assert out.exit_code == 1, text
+    assert CliRunner().invoke(app, ["batch", "submit", str(tmp_path / "none.yaml")]).exit_code == 1
+    assert seen == []  # nothing was sent
+
+
+def test_batch_status_prints_each_job_and_the_total(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = {
+        "batch_id": "b-0001", "name": "docs sweep", "created_at": "t",
+        "jobs": [
+            {"job_id": "r-0001", "title": "First", "state": "building", "spent_usd": 0.25, "held_usd": 0.5, "total_usd": 0.75},
+            {"job_id": "r-0002", "title": "Second", "state": "spec_pending", "spent_usd": 0.0, "held_usd": 0.0, "total_usd": 0.0},
+        ],
+        "cost": {"spent_usd": 0.25, "held_usd": 0.5, "total_usd": 0.75},
+    }  # fmt: skip
+    seen = _api(monkeypatch, 200, body)
+    out = CliRunner().invoke(app, ["batch", "status", "b-0001"])
+    assert out.exit_code == 0, out.output
+    assert seen[0].method == "GET" and seen[0].url.path == "/api/batch/b-0001"
+    assert "r-0001" in out.output and "building" in out.output and "0.75" in out.output
+    assert "docs sweep" in out.output
+
+
+def test_batch_status_of_an_unknown_batch_exits_1(monkeypatch: pytest.MonkeyPatch) -> None:
+    _api(monkeypatch, 404, {"detail": "no such batch"})
+    assert CliRunner().invoke(app, ["batch", "status", "b-9"]).exit_code == 1
+
+
+def test_batch_status_refuses_an_id_that_is_not_a_batch_id_before_any_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _api(monkeypatch, 200, {})
+    for bad in ("../x", "b-1/../../jobs", "b-0001?x=1", "x", "b-", "B-1", ""):
+        out = CliRunner().invoke(app, ["batch", "status", bad])
+        assert out.exit_code == 1, bad
+    assert seen == []

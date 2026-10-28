@@ -460,6 +460,43 @@ class JobService:
             self.runner.on_job_created(job_id, True)
         return batch_id, ids
 
+    def approve_batch(self, batch_id: str) -> dict[str, Any]:
+        """Approve all of a batch's open specs (owner, 2026-10-28). Each is the ordinary
+        approval of that job's spec item (its own transaction, `approval` and state events,
+        channel `inbox`), with the batch named in the evidence. A job whose spec is not open
+        (the coord has not drafted it, or it is past approval) is skipped and listed.
+        A job whose approval raises anything else (say the runner's
+        start) is listed under `failed` with the error type, and the rest go on."""
+        try:
+            self.store.get_batch(batch_id)
+        except KeyError as e:
+            raise NotFound(batch_id) from e
+        open_specs = {
+            i.job_id: i.id for i in self.store.list_inbox("open") if i.queue == "specs" and i.job_id
+        }
+        approved: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for job_id in self.store.batch_job_ids(batch_id):
+            item_id = open_specs.get(job_id)
+            if item_id is None:
+                state = self.store.get_job(job_id).state.value
+                skipped.append({"job_id": job_id, "state": state, "reason": "no open spec"})
+                continue
+            try:
+                job = self.approve(item_id, batch_id=batch_id)
+            except Conflict as e:
+                state = self.store.get_job(job_id).state.value
+                skipped.append({"job_id": job_id, "state": state, "reason": str(e)})
+                continue
+            except Exception as e:  # one job's failure must not hide the rest
+                what = redact(str(e))[:200]
+                log.error("approve-all %s: %s failed: %s", batch_id, job_id, what)
+                failed.append({"job_id": job_id, "error": type(e).__name__, "message": what})
+                continue
+            approved.append({"job_id": job.id, "item_id": item_id, "state": job.state.value})
+        return {"batch_id": batch_id, "approved": approved, "skipped": skipped, "failed": failed}
+
     def kill_batch(self, batch_id: str, actor: Actor, channel: str) -> dict[str, Any]:
         """Kill every job of a batch, each through `kill` (#52). One that fails does not stop
         the rest; its entry carries the `error` and the answer's `failed` lists it."""
@@ -833,7 +870,9 @@ class JobService:
         )
         return item
 
-    def approve(self, item_id: int, edits: str | None = None) -> Job:
+    def approve(
+        self, item_id: int, edits: str | None = None, *, batch_id: str | None = None
+    ) -> Job:
         # One transaction: state, approval row, artifact, event and the inbox
         # item commit together or not at all; the build starts after the commit.
         with self.store.tx():
@@ -850,7 +889,8 @@ class JobService:
                     JobState.APPROVED,
                     Actor.OWNER,
                     channel="inbox",
-                    evidence={"inbox_item_id": item_id},
+                    evidence={"inbox_item_id": item_id}
+                    | ({"batch_id": batch_id} if batch_id else {}),
                 )
             except TransitionError as e:
                 raise Conflict(str(e)) from e
@@ -863,7 +903,8 @@ class JobService:
             )
             self.store.add_event(
                 "approval",
-                {"inbox_item_id": item_id, "edits": edits},
+                {"inbox_item_id": item_id, "edits": edits}
+                | ({"batch_id": batch_id} if batch_id else {}),
                 Provenance.HUMAN,
                 job_id=job.id,
             )

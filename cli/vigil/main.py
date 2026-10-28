@@ -8,12 +8,14 @@ client of the API; `run`, `batch`, `ls` and `trace` follow in phase 2.
   uv run python -m vigil restore <backup.db>   (verify only)
   uv run python -m vigil kill <job>
   uv run python cli/vigil mcp                  (stdio MCP server; VIGIL_API_TOKEN in the env)
+  uv run python -m vigil batch submit <file.yaml>
+  uv run python -m vigil batch status <batch>
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
 
@@ -23,6 +25,8 @@ if TYPE_CHECKING:
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 hidden_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Hidden tests.")
 app.add_typer(hidden_app, name="hidden")
+batch_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Batches of jobs.")
+app.add_typer(batch_app, name="batch")
 review_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Review tools.")
 app.add_typer(review_app, name="review")
 
@@ -239,6 +243,89 @@ def mcp_serve() -> None:
     from vigil.mcp_server import serve
 
     serve()
+
+
+def load_batch_file(path: Path) -> dict[str, Any]:
+    """A batch file: `name:` and `jobs:`, a list of what `POST /api/jobs` takes. Raises
+    `ValueError` (with the reason) for anything else; vigild checks the jobs themselves."""
+    import yaml
+
+    try:
+        doc = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError) as e:
+        raise ValueError(f"cannot read {path}: {type(e).__name__}") from e
+    if not isinstance(doc, dict) or not isinstance(doc.get("name"), str) or not doc["name"]:
+        raise ValueError("a batch file is a mapping with a `name`")
+    jobs = doc.get("jobs")
+    if not isinstance(jobs, list) or not jobs or not all(isinstance(j, dict) for j in jobs):
+        raise ValueError("`jobs` must be a non-empty list of job requests")
+    return {"name": doc["name"], "jobs": jobs}
+
+
+@batch_app.command("submit")
+def batch_submit(file: Annotated[Path, typer.Argument(help="a batch YAML file")]) -> None:
+    """Submit a batch: `name:` and `jobs:` (each what POST /api/jobs takes). All jobs are made
+    or none; a refusal names the job. Each then waits for its spec and your approval."""
+    import httpx2
+
+    try:
+        body = load_batch_file(file)
+    except ValueError as e:
+        typer.echo(str(e))
+        raise typer.Exit(1) from e
+    with _api_client() as client:
+        try:
+            r = client.post("/api/batch", json=body)
+        except httpx2.HTTPError as e:
+            typer.echo(f"could not reach vigild: {type(e).__name__}")
+            raise typer.Exit(1) from e
+    if r.status_code != 202:
+        try:
+            detail = r.json().get("detail")
+            errors = detail.get("errors") if isinstance(detail, dict) else None
+        except ValueError:
+            errors = None
+        typer.echo(f"refused: HTTP {r.status_code}; nothing was created")
+        for line in errors or [r.text[:300]]:
+            typer.echo(f"  {line}")
+        raise typer.Exit(1)
+    out = r.json()
+    typer.echo(f"batch {out['batch_id']} ({out['name']}): {len(out['jobs'])} jobs")
+    for job_id in out["jobs"]:
+        typer.echo(f"  {job_id}")
+
+
+@batch_app.command("status")
+def batch_status(batch: str = typer.Argument(..., help="a batch id, e.g. b-0001")) -> None:
+    """Each job's state and cost, and the total (spent plus held)."""
+    import re
+    from urllib.parse import quote
+
+    import httpx2
+
+    if not re.fullmatch(r"b-[0-9]+", batch):
+        typer.echo("a batch id looks like b-0001")
+        raise typer.Exit(1)
+    with _api_client() as client:
+        try:
+            r = client.get(f"/api/batch/{quote(batch, safe='')}")
+        except httpx2.HTTPError as e:
+            typer.echo(f"could not reach vigild: {type(e).__name__}")
+            raise typer.Exit(1) from e
+    if r.status_code != 200:
+        typer.echo(f"batch status failed: HTTP {r.status_code} {r.text[:300]}")
+        raise typer.Exit(1)
+    b = r.json()
+    typer.echo(f"batch {b['batch_id']}: {b['name']}")
+    for j in b["jobs"]:
+        typer.echo(
+            f"  {j['job_id']:<10} {j['state']:<14} ${j['total_usd']:.4f}"
+            f" (spent {j['spent_usd']:.4f}, held {j['held_usd']:.4f})  {j['title']}"
+        )
+    c = b["cost"]
+    typer.echo(
+        f"  total ${c['total_usd']:.4f} (spent {c['spent_usd']:.4f}, held {c['held_usd']:.4f})"
+    )
 
 
 @app.command("dev-image")

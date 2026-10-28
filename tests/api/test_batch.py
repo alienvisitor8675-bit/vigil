@@ -208,3 +208,97 @@ def test_kill_on_a_batch_is_200_with_a_failed_list_when_one_job_fails(
     assert "error" in out["jobs"][1] and out["jobs"][0]["killed"] and out["jobs"][2]["killed"]
     assert store.get_job(a).state is JobState.ABANDONED
     assert store.get_job(c).state is JobState.ABANDONED
+
+
+# --- approve-all (owner, 2026-10-28) ---------------------------------------------------------
+
+
+def _spec_item(store: Store, job_id: str) -> int:
+    """What the coord's filing leaves: the spec, the plan, the gate's pass and the item."""
+    for name, content in (("spec.md", "s"), ("plan.md", "p"), ("spec_gate.json", '{"ok": true}')):
+        store.add_artifact(job_id, name, content, "human")
+    return store.create_inbox_item("specs", "spec", job_id, "spec", {}).id
+
+
+def test_approve_all_approves_only_open_specs_and_lists_the_rest(
+    client: TestClient, tokens: Tokens, store: Store, runner: RecordingRunner
+) -> None:
+    ids = _post(client, tokens, [_job(1), _job(2), _job(3)]).json()
+    a, b, c = ids["jobs"]
+    ia, ib = _spec_item(store, a), _spec_item(store, b)  # c's coord has not drafted yet
+    r = client.post(f"/api/batch/{ids['batch_id']}/approve-all", headers=auth(tokens.admin))
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert [x["job_id"] for x in out["approved"]] == [a, b]
+    assert [x["job_id"] for x in out["skipped"]] == [c] and out["skipped"][0][
+        "state"
+    ] == "spec_pending"
+    assert runner.approved == [a, b]
+    assert store.get_job(c).state is JobState.SPEC_PENDING
+    for jid, item in ((a, ia), (b, ib)):
+        assert store.get_job(jid).state is JobState.APPROVED
+        (ap,) = store.q("SELECT * FROM approvals WHERE job_id=?", (jid,))
+        assert ap["actor"] == "owner" and ap["channel"] == "inbox" and ap["inbox_item_id"] == item
+        (state,) = [
+            e for e in store.events(job_id=jid) if e.type == "state" and e.data["to"] == "approved"
+        ]
+        assert state.data["channel"] == "inbox"
+        assert state.data["evidence"]["batch_id"] == ids["batch_id"]
+        (ev,) = [e for e in store.events(job_id=jid) if e.type == "approval"]
+        assert ev.data["batch_id"] == ids["batch_id"]
+    # run again: the approved are skipped, and the third is still not ready
+    again = client.post(f"/api/batch/{ids['batch_id']}/approve-all", headers=auth(tokens.admin))
+    assert again.json()["approved"] == [] and len(again.json()["skipped"]) == 3
+
+
+def test_approve_all_is_owner_only_and_needs_a_batch(
+    client: TestClient, tokens: Tokens, store: Store
+) -> None:
+    ids = _post(client, tokens, [_job(1)]).json()
+    _spec_item(store, ids["jobs"][0])
+    url = f"/api/batch/{ids['batch_id']}/approve-all"
+    assert client.post(url, headers=auth(tokens.read)).status_code == 403
+    assert client.post(url).status_code in (401, 403)
+    assert store.get_job(ids["jobs"][0]).state is JobState.SPEC_PENDING
+    assert (
+        client.post("/api/batch/b-0099/approve-all", headers=auth(tokens.admin)).status_code == 404
+    )
+
+
+def test_approve_all_leaves_other_batches_and_jobs_alone(
+    client: TestClient, tokens: Tokens, store: Store
+) -> None:
+    one = _post(client, tokens, [_job(1)]).json()
+    two = _post(client, tokens, [_job(2)], name="other").json()
+    solo = client.post("/api/jobs", json=_job(9), headers=auth(tokens.admin)).json()["id"]
+    for jid in (one["jobs"][0], two["jobs"][0], solo):
+        _spec_item(store, jid)
+    client.post(f"/api/batch/{one['batch_id']}/approve-all", headers=auth(tokens.admin))
+    assert store.get_job(one["jobs"][0]).state is JobState.APPROVED
+    assert store.get_job(two["jobs"][0]).state is JobState.SPEC_PENDING
+    assert store.get_job(solo).state is JobState.SPEC_PENDING
+
+
+def test_approve_all_goes_on_past_a_job_that_raises_and_lists_it(
+    client: TestClient, tokens: Tokens, store: Store, runner: RecordingRunner
+) -> None:
+    ids = _post(client, tokens, [_job(1), _job(2), _job(3)]).json()
+    a, b, c = ids["jobs"]
+    for jid in (a, b, c):
+        _spec_item(store, jid)
+    ok = runner.on_approved
+
+    def flaky(job_id: str) -> None:
+        if job_id == b:
+            raise RuntimeError("the runner fell over")
+        ok(job_id)
+
+    runner.on_approved = flaky  # type: ignore[method-assign]
+    r = client.post(f"/api/batch/{ids['batch_id']}/approve-all", headers=auth(tokens.admin))
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert [x["job_id"] for x in out["approved"]] == [a, c] and out["skipped"] == []
+    (bad,) = out["failed"]
+    assert bad["job_id"] == b and bad["error"] == "RuntimeError"
+    assert "fell over" in bad["message"]
+    assert runner.approved == [a, c]
