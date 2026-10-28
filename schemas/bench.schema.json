@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The `bench` block of a bench job (owner, 2026-10-27; issue #8): which run it\nbelongs to, which dataset instance it is, and how it runs. Stored as the job's\n`bench.json`; there is no REST route that takes one.",
+  "properties": {
+    "config_hash": {
+      "minLength": 1,
+      "title": "Config Hash",
+      "type": "string"
+    },
+    "dataset": {
+      "enum": [
+        "polybench",
+        "swebench-pro",
+        "parkagent"
+      ],
+      "title": "Dataset",
+      "type": "string"
+    },
+    "emulated": {
+      "title": "Emulated",
+      "type": "boolean"
+    },
+    "run_id": {
+      "minLength": 1,
+      "title": "Run Id",
+      "type": "string"
+    },
+    "task_id": {
+      "minLength": 1,
+      "title": "Task Id",
+      "type": "string"
+    },
+    "timeout_scale": {
+      "default": 1.0,
+      "exclusiveMinimum": 0,
+      "title": "Timeout Scale",
+      "type": "number"
+    }
+  },
+  "required": [
+    "run_id",
+    "task_id",
+    "dataset",
+    "config_hash",
+    "emulated"
+  ],
+  "title": "BenchInfo",
+  "type": "object"
+}

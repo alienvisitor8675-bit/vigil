@@ -3,6 +3,10 @@
 Every stored artifact and DB row carries one. The training exporter takes
 `local` only, so no Claude output can enter a training set (design,
 "Training-data firewall").
+
+`eval-only` marks every row of a bench job (owner, 2026-10-27): whatever
+produced it, it exists to measure vigil and never to train a model. The
+store applies it (`Store.row_provenance`), and the exporter refuses it.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ class Provenance(StrEnum):
     CLAUDE = "claude"
     LOCAL = "local"
     HUMAN = "human"
+    EVAL_ONLY = "eval-only"
 
 
 class ProvenanceError(ValueError):
@@ -42,8 +47,11 @@ def export_training_rows(rows: Iterable[Mapping[str, Any]]) -> Iterator[Mapping[
     whole export if any row is Claude's, so a filter bug can't leak one."""
     rows = list(rows)
     for row in rows:
-        if require(row.get("provenance")) is Provenance.CLAUDE:
+        prov = require(row.get("provenance"))
+        if prov is Provenance.CLAUDE:
             raise ProvenanceError("export contains a claude-tagged artifact; refused")
+        if prov is Provenance.EVAL_ONLY:
+            raise ProvenanceError("export contains an eval-only (bench) row; refused")
     for row in rows:
         if row["provenance"] == Provenance.LOCAL:
             yield row

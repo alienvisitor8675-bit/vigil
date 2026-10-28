@@ -35,6 +35,13 @@ PRIVATE_HOSTED_PROVIDER_EXCEPTIONS: dict[str, frozenset[str]] = {
     "thomasbardhi01/vigil": frozenset({"anthropic"}),
 }
 JEV = "jev"  # the logical decider entry
+# Bench jobs (owner, 2026-10-27) run on virtual repos named `bench/<name>`: they are
+# not on GitHub, so nothing about them is ever asked of it. Their visibility is
+# decided here, in code: the dataset repos are public; the owner's own code (the
+# ParkAgent history) is private, which keeps hosted backends off it as for any
+# private repo.
+BENCH_NAMESPACE = "bench/"
+BENCH_PRIVATE_REPOS = frozenset({"bench/parkagent"})
 JEV_PUBLIC, JEV_PRIVATE = "jev-openrouter", "jev-cloudflare"
 
 log = logging.getLogger("vigild.repos")
@@ -52,9 +59,16 @@ def set_visibility_source(source: IsPrivate | None) -> None:
     _source = source
 
 
+def is_bench_repo(repo: str) -> bool:
+    return repo.strip().lower().startswith(BENCH_NAMESPACE)
+
+
 def live_private(repo: str, source: IsPrivate | None = None) -> bool:
     """The repo's visibility, asked now. Fails closed: no source, an error, or
-    an answer that isn't a bool all mean private."""
+    an answer that isn't a bool all mean private. A bench repo is never asked
+    of GitHub."""
+    if is_bench_repo(repo):
+        return repo.strip().lower() in BENCH_PRIVATE_REPOS
     ask = source or _source
     if ask is None:
         return True

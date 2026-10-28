@@ -36,6 +36,7 @@ from vigild.contract.models import Source
 from vigild.db import Store, iso
 from vigild.jobs.service import DuplicateIssue
 from vigild.provenance import Provenance
+from vigild.repos import is_bench_repo
 
 log = logging.getLogger("vigild.intake")
 LABEL = "vigil:ready"
@@ -150,7 +151,7 @@ class LabelIntake:
 
         made: list[str] = []
         for repo, pol in self.cfg.repos.repos.items():
-            if not pol.intake:
+            if not pol.intake or is_bench_repo(repo):  # a bench repo is not on GitHub
                 continue
             try:
                 issues = self.issues.labelled(repo, LABEL)

@@ -145,10 +145,13 @@ def publish(
     scope: Sequence[str],
     token: str | None = None,
     existing: str | None = None,
+    push: bool = True,
 ) -> str:
     """Check, push `head` to `branch`, and open a draft PR into `base`. With
     `existing` (a fix round on a published branch, phase 2a), the same checks
-    and the push, and the PR that's already open stands."""
+    and the push, and the PR that's already open stands. With `push=False` (a
+    bench job's no-op publisher) the same checks run and the commit that would be
+    sent is recorded in the vault, but nothing leaves the host."""
     from vigild.workspace import WorkspaceError
 
     if branch in PROTECTED or branch == base or not BRANCH.match(branch) or ".." in branch:
@@ -175,7 +178,8 @@ def publish(
         outside = out_of_scope(sent, scope)  # what is sent, too
         if outside:
             raise PublishError(f"files in the commit sent are outside the scope: {outside}")
-        ws.push(repo, send, branch, token)
+        if push:
+            ws.push(repo, send, branch, token)
         ws.record_published(repo, branch, send)
     except WorkspaceError as e:
         raise PublishError(str(e)) from e

@@ -39,8 +39,9 @@ exploring. `AGENTS.md` is a symlink to this file.
   checks the rule at start and at every dispatch, and a decider list's `jev`
   is OpenRouter while public, Cloudflare while private (`repos.jev_route`).
 - **Provenance.** Every stored artifact and DB row carries
-  `provenance: claude | local | human`. The training exporter takes
-  `local` only.
+  `provenance: claude | local | human | eval-only` (`eval-only` is every
+  row of a bench job). The training exporter takes `local` only;
+  `eval-only` never.
 
 ## Secrets
 - Secrets live only in `~/.config/vigil/env` (mode 600) and the App

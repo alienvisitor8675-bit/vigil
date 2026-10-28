@@ -10,6 +10,10 @@ Check, in order:
 4. Docs updated where the spec requires it.
 5. One way to do each thing: nothing duplicates what the repo already does.
 6. What could be deleted.
+7. For each acceptance criterion in the spec, confirm that every case, assertion and
+   bound it lists exists in the diff. Count bounds literally: "2-4 cases" or "12-25" is
+   a limit, so one case too many or too few is a miss. Report each miss as a finding with
+   the AC id, what is missing, file:line.
 
 End with structured output: `{"verdict": "clean" | "changes", "findings": [{"severity":
 "low|medium|high", "file", "line", "claim", "fix"}], "checklist": {...}}`. Every finding

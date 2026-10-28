@@ -130,7 +130,7 @@ def record_call(
             latency_ms,
             json.dumps(timings) if timings else None,
             iso(),
-            provenance.value,
+            store.row_provenance(provenance, job_id=job_id, session_id=session_id, task_id=task_id),
             int(truncated),
             repo,
         ),
