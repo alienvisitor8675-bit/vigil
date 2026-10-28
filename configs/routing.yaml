@@ -9,7 +9,19 @@ tiers:
   local: tower-qwen
   local-fast: tower-fast
 fallback: claude-sonnet
-coord: claude-opus             # the coord is the one place to spend quality
+# The coord's model by shape (ADR-0005 part 3). Top to bottom, first match
+# wins; `coord:rule-<name>` goes on the coord session. `escalated` is
+# attempt >= escalate_attempt; `architecture` is architecture_labels; `pinned`
+# is a path the request names (or its scope field) in the repo's
+# ladder_pinned_paths (strict) or money_paths (guard's loose match). A fix
+# is small only if the request carries a size; none means the default.
+coord:
+  - {name: escalation, when: escalated, preset: claude-opus}
+  - {name: architecture, when: architecture, preset: claude-opus}
+  - {name: pinned, when: pinned, preset: claude-opus}
+  - {name: tests-docs, when: labels, labels: [tests, docs], preset: claude-sonnet}
+  - {name: fix-small, when: fix, sizes: [S, M], preset: claude-sonnet}
+  - {name: default, when: always, preset: claude-opus}  # the quality default
 coord_packet: classic          # classic | lean (ADR-0005 part 1): lean once the spec replay passes
 reviewer: claude-sonnet
 auditor: claude-opus

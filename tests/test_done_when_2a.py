@@ -40,7 +40,7 @@ from fastapi.testclient import TestClient
 from tests.conftest import auth, git
 from tests.jobs.test_coord_loop import BarePublisher
 from vigild.api.app import create_app
-from vigild.config import RepoPolicy
+from vigild.config import CoordRule, RepoPolicy
 from vigild.db import utcnow
 from vigild.devimage import DevImages, DockerImages, SessionImages
 from vigild.executors.runtime import DockerRuntime, DockerTestRunner
@@ -134,7 +134,8 @@ def live(tmp_path: Path, tokens: Tokens) -> Iterator[Live]:
     # workers on Haiku (the plan allows it); reviews Sonnet, audits Opus (review.yaml)
     for tier in cfg.routing.tiers:
         cfg.routing.tiers[tier] = "claude-haiku"
-    cfg.routing.coord = cfg.routing.fallback = "claude-haiku"
+    cfg.routing.fallback = "claude-haiku"
+    cfg.routing.coord = [CoordRule(name="default", when="always", preset="claude-haiku")]
     # the production caps and WIP limit (configs/budgets.yaml), as they are
     assert (cfg.budgets.per_task_usd, cfg.budgets.daily_usd, cfg.budgets.wip_per_repo) == (
         2.0, 5.0, 4)  # fmt: skip

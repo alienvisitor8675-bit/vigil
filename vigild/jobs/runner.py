@@ -59,6 +59,7 @@ from vigild.contract.models import (
     Limits,
     Review,
     ReviewOutput,
+    Size,
     Spec,
     Task,
     TestOutcome,
@@ -114,7 +115,7 @@ from vigild.review.replay import (
     resolve_prompt,
     run_set,
 )
-from vigild.router.rules import RoutingError, route
+from vigild.router.rules import CoordShape, RoutingError, request_paths, route, route_coord
 from vigild.scheduler import wip
 from vigild.scheduler.graph import Slots, run_graph
 from vigild.telemetry.spans import Telemetry
@@ -1453,6 +1454,29 @@ class JobRunner:
     def _session_dir(self, session_id: str) -> Path:
         return self.cfg.vigild.data_path / "sessions" / session_id
 
+    def _job_attempt(self, job_id: str) -> int:
+        """1 plus the replans so far (#78): the coord's attempt."""
+        n = self.store.q(
+            "SELECT COUNT(*) AS n FROM events WHERE job_id=? AND type='replan'", (job_id,)
+        )[0]["n"]
+        return 1 + int(n)
+
+    def coord_shape(self, job: Job) -> CoordShape:
+        """What the coord's model is chosen from (ADR-0005 part 3). The attempt is 1
+        plus the replans so far; there is no size until ADR-0005 part 5 adds vigild's
+        estimate, so the request's hint is used if it carries one."""
+        intake = self.store.get_artifact(job.id, "intake.json")
+        meta = json.loads(intake.content) if intake else {}
+        labels = meta.get("labels")
+        hint = meta.get("size")
+        return CoordShape(
+            labels=[str(x) for x in labels] if isinstance(labels, list) else [],
+            parent_job_id=job.parent_job_id,
+            size=Size(hint) if hint in {m.value for m in Size} else None,
+            attempt=self._job_attempt(job.id),
+            paths=request_paths(meta),
+        )
+
     # --- stage 1: the coord drafts spec.md and plan.md ------------------------------------
 
     def run_coord(self, job_id: str) -> None:
@@ -1463,9 +1487,19 @@ class JobRunner:
         if b is not None:
             self._hold_for(job_id, b)
             return
-        preset = self._healthy(self.cfg.routing.coord)
+        try:
+            picked = route_coord(self.cfg, job.repo, self.coord_shape(job))
+        except RoutingError as e:
+            self._page(
+                job_id,
+                f"{job_id}: backend refused; coord not started",
+                {"error": str(e)},
+                resumable=True,
+            )
+            return
+        preset = self._healthy(picked.preset)
         if preset is None:
-            self._hold_for(job_id, self._backend_breaker(self.cfg.routing.coord))
+            self._hold_for(job_id, self._backend_breaker(picked.preset))
             return
         try:
             # the repo's dev image must be fresh before any work starts on it;
@@ -1495,6 +1529,14 @@ class JobRunner:
                 job_id, Role.COORD, backend_preset=preset, branch=branch
             )
             self.store.set_coord_session(job_id, coord.id)
+            self.store.update_session(coord.id, detail={"coord_reason": picked.reason})
+            self.store.add_event(
+                "coord_routed",
+                {"preset": preset, "coord_reason": picked.reason},
+                Provenance.HUMAN,
+                job_id=job_id,
+                session_id=coord.id,
+            )
             try:
                 rid = self._reserve_queued(
                     job_id,
@@ -1625,10 +1667,9 @@ class JobRunner:
         # A replan starts the coord fresh (#78, ADR-0005): spec.md, plan.md,
         # spec_changelog.md, the note, the failures. The fork is for true escalation,
         # attempt >= escalate_attempt, where attempt is 1 + the replans so far.
-        replans = self.store.q(
-            "SELECT COUNT(*) AS n FROM events WHERE job_id=? AND type='replan'", (job_id,)
-        )[0]["n"]
-        fresh = bool(replan or amend) and replans + 1 < self.cfg.routing.escalate_attempt
+        fresh = (
+            bool(replan or amend) and self._job_attempt(job_id) < self.cfg.routing.escalate_attempt
+        )
         if fresh:
             for name, label, cap in (
                 ("plan.md", "plan.md (the previous plan)", 12000),

@@ -38,7 +38,11 @@ def first_calls(cfg: Config, repo: str | None = None) -> list[FirstCall]:
     cap = cfg.budgets.session_max_output_tokens
     allowed = set(cfg.repo(repo).backends) if repo else None
     rt = cfg.routing
-    roles: list[tuple[str, str, float]] = [("coord", rt.coord, cfg.budgets.coord_session_usd)]
+    default = rt.coord[-1].preset
+    roles: list[tuple[str, str, float]] = [
+        ("coord" if p == default else f"coord:{p}", p, cfg.budgets.coord_session_usd)
+        for p in dict.fromkeys(r.preset for r in rt.coord)
+    ]
     roles += [(f"tier:{t}", p, cfg.budgets.per_task_usd) for t, p in rt.tiers.items()]
     roles += [
         ("fallback", rt.fallback, cfg.budgets.per_task_usd),

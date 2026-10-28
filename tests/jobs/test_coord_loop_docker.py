@@ -24,7 +24,7 @@ from fastapi.testclient import TestClient
 from tests.conftest import auth, git
 from tests.jobs.test_coord_loop import REPO, BarePublisher
 from vigild.api.app import create_app
-from vigild.config import RepoPolicy
+from vigild.config import CoordRule, RepoPolicy
 from vigild.devimage import DevImages, DockerImages, SessionImages
 from vigild.executors.runtime import DockerRuntime, DockerTestRunner
 from vigild.gateway.app import create_gateway_app
@@ -52,7 +52,8 @@ def live(
     cfg = v.cfg
     for tier in cfg.routing.tiers:
         cfg.routing.tiers[tier] = "claude-haiku"
-    cfg.routing.coord = cfg.routing.fallback = "claude-haiku"
+    cfg.routing.fallback = "claude-haiku"
+    cfg.routing.coord = [CoordRule(name="default", when="always", preset="claude-haiku")]
     cfg.budgets.coord_session_usd = 0.30
     cfg.budgets.per_task_usd = 0.30
     cfg.budgets.review_session_usd = 0.50

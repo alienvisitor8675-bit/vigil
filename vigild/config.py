@@ -15,7 +15,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from vigild.contract.models import Backend
+from vigild.contract.models import Backend, Size
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 DEFAULT_ENV_FILE = Path("~/.config/vigil/env").expanduser()
@@ -116,10 +116,34 @@ class ReposFile(_M):
     repos: dict[str, RepoPolicy]
 
 
+class CoordRule(_M):
+    """One rule of the coord's model by shape (ADR-0005 part 3). `when` is the
+    condition, read in vigild/router/rules.py `route_coord`; first match wins."""
+
+    name: str = Field(min_length=1, pattern=r"^[a-z0-9-]+$")
+    when: Literal["escalated", "architecture", "pinned", "labels", "fix", "always"]
+    preset: str
+    # `pinned`: a scope hint meets the repo's ladder_pinned_paths or the money_paths
+    labels: list[str] = Field(default_factory=list)  # `labels`: any of these
+    sizes: list[Size] = Field(default_factory=list)  # `fix`: only these sizes
+
+    @model_validator(mode="after")
+    def _fields_fit_the_condition(self) -> CoordRule:
+        if self.when == "labels" and not self.labels:
+            raise ValueError(f"coord rule {self.name}: `labels` needs a label")
+        if self.when != "labels" and self.labels:
+            raise ValueError(f"coord rule {self.name}: `labels` only goes with when: labels")
+        if self.when == "fix" and not self.sizes:
+            raise ValueError(f"coord rule {self.name}: `fix` needs sizes")
+        if self.when != "fix" and self.sizes:
+            raise ValueError(f"coord rule {self.name}: `sizes` only goes with when: fix")
+        return self
+
+
 class Routing(_M):
     tiers: dict[str, str]
     fallback: str
-    coord: str
+    coord: list[CoordRule] = Field(min_length=1)
     # Which coord packet a first draft gets: today's, or the lean one (ADR-0005 part 1).
     coord_packet: Literal["classic", "lean"] = "classic"
     reviewer: str
@@ -133,6 +157,15 @@ class Routing(_M):
     # Where a preset's work goes while its backend breaker is open (plan 2a,
     # item 4), in order. A preset with no healthy fallback pauses dispatch.
     fallbacks: dict[str, list[str]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _coord_rules_are_well_formed(self) -> Routing:
+        names = [r.name for r in self.coord]
+        if len(set(names)) != len(names):
+            raise ValueError("routing.coord: duplicate rule name")
+        if self.coord[-1].when != "always" or any(r.when == "always" for r in self.coord[:-1]):
+            raise ValueError("routing.coord: the last rule, and only it, is `when: always`")
+        return self
 
 
 class Budgets(_M):
@@ -450,9 +483,12 @@ def validate(cfg: Config) -> None:
     for tier, preset in cfg.routing.tiers.items():
         if preset not in presets:
             raise ConfigError(f"routing tier {tier} names unknown preset {preset}")
-    for role in ("fallback", "coord", "reviewer", "auditor"):
+    for role in ("fallback", "reviewer", "auditor"):
         if getattr(cfg.routing, role) not in presets:
             raise ConfigError(f"routing.{role} names an unknown preset")
+    for rule in cfg.routing.coord:
+        if rule.preset not in presets:
+            raise ConfigError(f"routing.coord rule {rule.name} names an unknown preset")
     for preset, falls in cfg.routing.fallbacks.items():
         for name in (preset, *falls):
             if name not in presets:
