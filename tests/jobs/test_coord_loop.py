@@ -329,7 +329,7 @@ class BarePublisher:
     prs: list[dict[str, Any]] = field(default_factory=list)
     closed: list[str] = field(default_factory=list)
 
-    def close(self, repo: str, url: str) -> None:
+    def close(self, repo: str, url: str, job_id: str | None = None) -> None:
         self.closed.append(url)
 
     def publish(
@@ -344,6 +344,7 @@ class BarePublisher:
         body: str,
         scope: list[str],
         existing: str | None = None,
+        job_id: str | None = None,
     ) -> str:
         from vigild.github.publish import publish
 

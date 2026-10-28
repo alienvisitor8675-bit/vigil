@@ -145,7 +145,7 @@ class Decider:
                 a.model_version or "unknown",
                 action.value,
                 iso(),
-                prov.value,
+                self.store.row_provenance(prov, job_id=job_id, task_id=task_id),
             ),
         )
 
@@ -351,7 +351,7 @@ class Decider:
                 "unknown",
                 Action.WAIT.value,
                 iso(),
-                Provenance.HUMAN.value,
+                self.store.row_provenance(Provenance.HUMAN, job_id=job_id, task_id=task_id),
             ),
         )
         return Decision(a, Action.WAIT)

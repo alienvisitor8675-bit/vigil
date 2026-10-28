@@ -99,7 +99,8 @@
     "Source": {
       "enum": [
         "human",
-        "self"
+        "self",
+        "bench"
       ],
       "title": "Source",
       "type": "string"
