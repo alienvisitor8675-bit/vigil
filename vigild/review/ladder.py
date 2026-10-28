@@ -13,6 +13,12 @@ item 1; 2a round 2: owner ruling 1, review B8).
 - **Runner-file tasks** (scope names a file that decides how tests run) are
   rung 0 whatever their shape's rung, audited every time, and their audits are
   never recorded: they count toward no shape's graduation or demotion.
+- **Pinned tasks** (`ladder_pinned_paths`, per repo in `configs/repos.yaml`,
+  strict `in_scope` globs): a task whose `files_in_scope` touches one is
+  treated exactly like a runner-file task: rung 0 for good, audited every
+  time, and its audits are not recorded, so they move no rung and count toward
+  no shape's window (the pin is a flag on the task, `Ladder.pinned`, not a
+  shape). Routing and intake never read it.
 - **Rung 0 never graduates** (the design's table: "n/a; this is where every
   shape starts"). **No shape passes rung 1 before the local-reviewer eval**
   (design: "a reviewer enters rung 1 only if it matches >= 80% of the
@@ -46,7 +52,7 @@ from typing import Any
 from vigild.config import Config, ConfigError
 from vigild.contract.models import Audit, Severity, Shape, Task
 from vigild.db import Store, iso
-from vigild.intake.paths import matches_any
+from vigild.intake.paths import globs_overlap, in_scope, matches_any
 from vigild.provenance import Provenance
 
 PERMANENT_RUNG_0 = frozenset({Shape.MONEY, Shape.AUTH, Shape.CONSENT})
@@ -128,6 +134,20 @@ class Ladder:
         self.rng = rng
 
     # --- reading ----------------------------------------------------------------
+
+    def pinned(self, task: Task) -> bool:
+        """Whether the task touches its repo's `ladder_pinned_paths` (strict
+        globs; a wildcard scope entry counts if it can name a pinned file). A
+        repo not in repos.yaml pins nothing. The caller passes this as
+        `runner_file`: rung 0 for good, audited every time, counted nowhere."""
+        repo = self.cfg.repos.repos.get(task.repo)
+        if repo is None or not repo.ladder_pinned_paths:
+            return False
+        pins = repo.ladder_pinned_paths
+        for f in task.spec.files_in_scope:
+            if in_scope(f, pins) or any(globs_overlap(f, g) for g in pins):
+                return True
+        return False
 
     def _limit(self, shape: Shape) -> tuple[int, str]:
         """The highest rung the shape may hold, and why it stops there."""

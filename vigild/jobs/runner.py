@@ -3729,6 +3729,9 @@ class JobRunner:
         shape = classify_shape(task, self.cfg)
         tests = self.store.get_artifact(job.id, "tests.json", t.id)
         rf = bool(tests and json.loads(tests.content).get("runner_files"))
+        # a task on the repo's ladder_pinned_paths is rung 0 for good, the same way
+        # (#59); here, so a real review and a replay (#47) both see it
+        rf = rf or self.ladder.pinned(task)
         return task, shape, rf
 
     def _review_inputs(self, job: Any, t: Any, head: str, base_sha: str, rnd: int) -> ReviewInputs:

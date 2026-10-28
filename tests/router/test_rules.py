@@ -156,3 +156,13 @@ def test_backend_not_listed_for_repo_is_refused(cfg: Config) -> None:
     cfg.repos.repos[PA].backends = ["claude-sonnet"]
     with pytest.raises(RoutingError, match="does not list"):
         route(_t(spec={"files_in_scope": ["src/billing/x.py"]}), cfg)
+
+
+def test_ladder_pinned_paths_do_not_change_routing(cfg: Config) -> None:
+    """Pinning is a ladder effect only: no Opus worker routing from it."""
+    vigil = "thomasbardhi01/vigil"
+    t = _t(repo=vigil, spec={"files_in_scope": ["vigild/gateway/service.py"]})
+    before = route(t, cfg)
+    cfg.repo(vigil).ladder_pinned_paths = []
+    assert route(t, cfg) == before
+    assert before.tier != "claude-opus" or "rule2" not in before.tier_reason

@@ -63,3 +63,9 @@ def test_decider_money_flag_is_a_second_check() -> None:
 def test_human_task_may_touch_money_paths() -> None:
     r = score(_req(files_in_scope=["src/billing/fee.py"]), MONEY)
     assert r.outcome is IntakeOutcome.ACCEPT and r.touches_money
+
+
+def test_a_pinned_ladder_path_is_not_an_intake_refusal() -> None:
+    """ladder_pinned_paths pin a PR at rung 0; intake accepts and scores as before."""
+    r = score(_req(files_in_scope=["vigild/gateway/service.py"]), MONEY)
+    assert r.outcome is IntakeOutcome.ACCEPT and not r.touches_money

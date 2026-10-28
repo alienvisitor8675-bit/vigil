@@ -120,3 +120,14 @@ repos:
       - .pytest.ini
       - uv.toml
       - .python-version
+    # Money-adjacent paths (owner, 2026-10-27; vigild/review/ladder.py). A task
+    # whose files_in_scope touches one is pinned at ladder rung 0 for good: the
+    # Opus audit runs every time, its audits are not recorded, so they promote
+    # nothing (not the shape, not other tasks). Strict scope globs, per repo, no
+    # global list. No other effect: no Opus worker routing, no intake refusal.
+    ladder_pinned_paths:
+      - vigild/gateway/**
+      - vigild/budget.py
+      - vigild/metering/**
+      - configs/budgets.yaml
+      - vigild/review/ladder.py
