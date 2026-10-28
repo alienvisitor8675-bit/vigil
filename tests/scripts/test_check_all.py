@@ -32,9 +32,7 @@ def _run(repo: Path) -> subprocess.CompletedProcess[str]:
         "CHECK_ALL_STEPS": "ruff-check",
         "CHECK_ALL_UV": f"uv run --project {ROOT}",
     }
-    return subprocess.run(
-        ["bash", str(SCRIPT)], cwd=repo, env=env, capture_output=True, text=True
-    )
+    return subprocess.run(["bash", str(SCRIPT)], cwd=repo, env=env, capture_output=True, text=True)
 
 
 def test_refuses_dirty_tracked_tree(tmp_path: Path) -> None:
