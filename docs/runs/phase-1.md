@@ -47,6 +47,24 @@ The phase 1 done-when, run end to end on a real repo through vigild only:
 - **Replan with a note:** it amended the approved spec instead of redrafting it. The owner checked a diff of the spec and a changelog, not a new document.
 - **Isolation:** each worker built in its own container, and every PR went out through the vigil-worker App, with no token in a worker.
 
+## Phase 1: closed (owner, 2026-10-27)
+**The done-when is met on a real repo, through vigild only.** Each part, and its evidence:
+
+| Done-when | Evidence |
+|---|---|
+| An approved spec on ParkAgent produced a coord, which wrote `spec.md` and `plan.md` | pa-0002 (ParkAgent #272) and pa-0003 (ParkAgent #320). Each coord drafted the spec and plan; pa-0003's was also amended once through a replan with a note. |
+| The owner approved it from the inbox | pa-0002's spec item, and pa-0003's items 12 (sent back with a note) and 13 (approved). |
+| Workers built in their own containers | pa-0002: w1 (docs) and w3 (the checker). pa-0003: w1 (tests only), plus one fix round from fix with findings (#40). |
+| Each opened a draft PR through the vigil-worker App, with `worker_report.json` | ParkAgent #316 and #319 (pa-0002, merged; pa-0002 reached `merged` on vigild's PR poll), and ParkAgent #321 (pa-0003, merged). Since #30, published branches carry no `.vigil/`. |
+
+**Beyond phase 1's bar.** pa-0003 also ran the 2a pipeline end to end on real work:
+- the verifier with must-fail-first off and new test ids counted (#33);
+- a Sonnet review and an Opus audit;
+- the owner's fix with findings;
+- a re-review and a re-audit.
+
+**Known gap:** hidden tests are **off** (`hidden_tests.enabled`, host policy) until ADR-0003 part (b), the separate subject container, merges with a clean review. Until then a runner-file task gets the owner-review PR instead (finding #2). The other open finding is #5 (#26). It's queued as a tests-only vigil-on-vigil job.
+
 ## Process changes adopted during the run
 - Verifier, gateway and hidden-test PRs carry `needs-review` until a fresh-context review is clean.
 - Reviews run on Sonnet first. Opus is used only for focused verifier, gateway or hidden-test reviews, with at most two rounds.
