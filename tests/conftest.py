@@ -93,8 +93,15 @@ def auth(token: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+# The session image sets a system core.hooksPath whose pre-push refuses every
+# push; tests push to test-local repos, so every test git call turns hooks off.
+NO_HOOKS = ("-c", "core.hooksPath=")
+
+
 def git(cwd: Path, *args: str) -> str:
-    out = subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+    out = subprocess.run(
+        ["git", *NO_HOOKS, *args], cwd=cwd, check=True, capture_output=True, text=True
+    )
     return out.stdout.strip()
 
 
@@ -103,7 +110,6 @@ def fixture_repo(tmp_path: Path) -> dict[str, Any]:
     """A bare 'remote' standing in for GitHub, seeded with a small repo."""
     bare = tmp_path / "remote" / "fixture.git"
     bare.parent.mkdir(parents=True)
-    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(bare))
     seed = tmp_path / "seed"
     git(tmp_path, "init", "-q", "-b", "main", str(seed))
     git(seed, "config", "user.email", "t@vigil.invalid")
@@ -115,8 +121,8 @@ def fixture_repo(tmp_path: Path) -> dict[str, Any]:
     (seed / "docs" / "runbook.md").write_text("# Runbook\n")
     git(seed, "add", "-A")
     git(seed, "commit", "-q", "-m", "seed")
+    git(tmp_path, "clone", "-q", "--bare", str(seed), str(bare))  # no push
     git(seed, "remote", "add", "origin", str(bare))
-    git(seed, "push", "-q", "origin", "main")
     return {"bare": bare, "seed": seed}
 
 

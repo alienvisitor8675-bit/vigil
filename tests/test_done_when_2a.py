@@ -70,7 +70,6 @@ def log(*a: Any) -> None:
 def _seed(tmp: Path) -> dict[str, Path]:
     bare = tmp / "remote" / "donewhen.git"
     bare.parent.mkdir(parents=True)
-    git(tmp, "init", "-q", "--bare", "-b", "main", str(bare))
     seed = tmp / "seed"
     git(tmp, "init", "-q", "-b", "main", str(seed))
     git(seed, "config", "user.email", "t@vigil.invalid")
@@ -91,8 +90,8 @@ def _seed(tmp: Path) -> dict[str, Path]:
     )  # fmt: skip
     git(seed, "add", "-A")
     git(seed, "commit", "-q", "-m", "seed")
+    git(tmp, "clone", "-q", "--bare", str(seed), str(bare))  # no push
     git(seed, "remote", "add", "origin", str(bare))
-    git(seed, "push", "-q", "origin", "main")
     return {"bare": bare, "seed": seed}
 
 
