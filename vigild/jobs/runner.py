@@ -75,7 +75,9 @@ from vigild.hidden import AUTHOR_ATTEMPTS, HiddenError, Place, entry_suite, load
 from vigild.intake.github import issue_text
 from vigild.intake.spec_gate import test_cmd_problem
 from vigild.jobs.acceptance import NO_HIDDEN, check_worker, escalates
-from vigild.jobs.artifacts import parse_plan, render
+from vigild.jobs.artifacts import canonicalize_plan, parse_plan, render
+from vigild.jobs.bench import NOT_PUBLISHED, BenchPublisher
+from vigild.jobs.bench import TAGS as BENCH_TAGS
 from vigild.jobs.deps import infer_deps, is_lockfile
 from vigild.jobs.fixfindings import selectable
 from vigild.jobs.fsm import HAS_OPEN_PR, Actor, TransitionError, plan_gaps, transition
@@ -141,9 +143,10 @@ class Publisher(Protocol):
         body: str,
         scope: list[str],
         existing: str | None = None,
+        job_id: str | None = None,
     ) -> str: ...
 
-    def close(self, repo: str, url: str) -> None: ...
+    def close(self, repo: str, url: str, job_id: str | None = None) -> None: ...
 
 
 class Pager(Protocol):
@@ -151,6 +154,8 @@ class Pager(Protocol):
         self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
     ) -> Any: ...
     def file_for_approval(self, job_id: str) -> list[str]: ...
+    def gate_spec(self, job_id: str) -> list[str]: ...
+    def approve_bench(self, job_id: str) -> Any: ...
     def flagged_tasks(self, job_id: str) -> dict[str, list[str]]: ...
     def needs_hidden(self, job_id: str) -> dict[str, list[str]]: ...
     def hidden_enabled(self, job_id: str) -> bool: ...
@@ -212,6 +217,7 @@ class JobRunner:
             self.gateway.stop_session = stop
         self.workspace = workspace
         self.publisher = publisher
+        self.bench_publisher = BenchPublisher(workspace)  # a bench job never gets `publisher`
         self.telemetry = telemetry
         self.dev_images = dev_images
         self.session_images = session_images  # None: sessions use the generic executor image
@@ -330,7 +336,11 @@ class JobRunner:
                 if self._queue_turn(key):
                     try:
                         rid = self.budget.reserve(
-                            session_id=session_id, task_id=task_id, amount=amount, purpose=purpose
+                            session_id=session_id,
+                            task_id=task_id,
+                            amount=amount,
+                            purpose=purpose,
+                            job_id=job_id,
                         )
                     except BudgetExceeded as e:
                         if not self._queueable(e, amount):
@@ -817,6 +827,8 @@ class JobRunner:
         actually reached the cap. Anything else (open reservations fill the
         day, a wave too big for what's left) is the job's own problem: None,
         and the caller pages the job."""
+        if e.cap in ("experiment", "bench_task"):
+            return None  # the experiment line is its own hard stop; no global breaker
         kind = CAP_KIND.get(e.cap, Kind.DAILY)
         if kind is Kind.PER_TASK and task_id and self.budget.task_spent(task_id) > 0:
             return self.breakers.trip(
@@ -844,6 +856,10 @@ class JobRunner:
         retry (each task on what's left of its cap), re-plan or abandon."""
         b = self.cfg.budgets
         self._block(job_id, f"budget: {e}")
+        if self.store.is_bench(job_id=job_id):
+            # bench doesn't queue and pages nobody: the run ends with the `budget` tag
+            self._bench_failure(job_id, "budget", cap=e.cap, detail=e.detail, tasks=tasks)
+            return
         self._page(
             job_id, f"{job_id}: the budget can't fit this work now",
             {"kind": "budget", "cap": e.cap, "detail": e.detail, "tasks": tasks,
@@ -854,6 +870,28 @@ class JobRunner:
              "max_cost_usd, or abandon"},
             resumable=True,
         )  # fmt: skip
+
+    def _bench_failure(self, job_id: str, tag: str, **evidence: Any) -> None:
+        """A bench run's failure tag, with its evidence (slice 2 puts it in
+        `bench_runs`): `spec`, `environment`, `model`, `harness` or `budget`."""
+        assert tag in BENCH_TAGS, tag
+        self.store.add_event(
+            "bench_failure", {"tag": tag, **evidence}, Provenance.HUMAN, job_id=job_id
+        )
+
+    def _publish(self, job: Job, **kw: Any) -> str:
+        """Publish through the publisher the job's kind gets: a bench job's is a
+        no-op that records "not published (bench)"."""
+        if job.source == "bench":
+            url = self.bench_publisher.publish(**kw)
+            self.store.add_event(
+                "bench_not_published",
+                {"reason": NOT_PUBLISHED, "branch": kw["branch"], "head": kw["head"],
+                 "pr_url": url},
+                Provenance.HUMAN, job_id=job.id,
+            )  # fmt: skip
+            return url
+        return self.publisher.publish(**kw, job_id=job.id)
 
     def _healthy(self, preset: str) -> str | None:
         """The preset itself, or while its backend breaker is open the first
@@ -1295,12 +1333,42 @@ class JobRunner:
                 job_id=job_id,
                 session_id=coord.id,
             )
+        if self.store.get_job(job_id).source == "bench":
+            # tagged, and the run goes on with no owner step: bench measures spec quality
+            self._bench_failure(job_id, "spec", stage="spec_gate", errors=gate_errors or [])
+            self._bench_go(job_id)
+            return
         self._page(
             job_id,
             f"{job_id}: the spec gate refused {COORD_DRAFTS} drafts",
             {"errors": gate_errors or []},
             resumable=True,
         )
+
+    def _bench_go(self, job_id: str) -> None:
+        """A bench job leaves its draft: vigild takes the guarded bench edge and builds.
+        If the draft is unusable (a failed gate left a plan that can't be built), the
+        run ends there, tagged `spec`."""
+        assert self.jobs is not None
+        art = self.store.get_artifact(job_id, "plan.md")
+        spec = self.store.get_artifact(job_id, "spec.md")
+        try:
+            if art is None or spec is None:
+                raise ValueError("the coord left no spec.md and plan.md")
+            parse_plan(art.content)
+            canonical = canonicalize_plan(job_id, art.content, 1)
+            if canonical != art.content:
+                self.store.add_artifact(job_id, "plan.md", canonical, Provenance.CLAUDE)
+            if self.store.get_artifact(job_id, "spec_gate.json") is None:
+                self.jobs.gate_spec(job_id)
+        except Exception as e:  # an unparseable draft ends the run, tagged
+            self._bench_failure(
+                job_id, "spec", stage="draft", error=f"{type(e).__name__}: {e}"[:500]
+            )
+            self._block(job_id, "bench: the coord's draft can't be built", state=JobState.ESCALATED)
+            return
+        self.jobs.approve_bench(job_id)
+        self.build(job_id)
 
     def _coord_attempt(
         self,
@@ -1486,6 +1554,9 @@ class JobRunner:
         inbox item exists meanwhile); then the spec is filed. An author that
         fails twice leaves the task marked "hidden tests missing"."""
         assert self.jobs is not None
+        if self.store.get_job(job_id).source == "bench":
+            self._bench_go(job_id)  # no owner step: vigild's own `approval: bench`
+            return
         flagged = self.jobs.needs_hidden(job_id)
         if not flagged:
             if self.jobs.flagged_tasks(job_id):  # hidden tests off: no author, just file it
@@ -1769,7 +1840,9 @@ class JobRunner:
     # --- stages 2-3: planning and building -----------------------------------------------
 
     def _task(self, job_id: str, repo: str, base: str, source: str, w: WorkerContract) -> Task:
-        cap = self.cfg.budgets.per_task_usd
+        cap = (
+            self.cfg.budgets.bench_task_usd if source == "bench" else self.cfg.budgets.per_task_usd
+        )
         return Task(
             task_id=w.task_id,
             repo=repo,
@@ -2069,9 +2142,12 @@ class JobRunner:
     def remaining(self, task_id: str) -> tuple[float, float, float]:
         """(cap, spent, left) for a task: a retry gets what's left, never a fresh cap."""
         # the contract's cap, and never more than the task cap in budgets.yaml
+        task = self.store.get_task(task_id)
         cap = min(
-            float(self.store.get_task(task_id).contract["limits"]["max_cost_usd"]),
-            self.cfg.budgets.per_task_usd,
+            float(task.contract["limits"]["max_cost_usd"]),
+            self.cfg.budgets.bench_task_usd
+            if self.store.is_bench(task_id=task_id)
+            else self.cfg.budgets.per_task_usd,
         )
         spent = self.budget.task_spent(task_id)
         return cap, spent, max(0.0, cap - spent)
@@ -2703,7 +2779,8 @@ class JobRunner:
             f"{report.self_check.not_done}.\n\nOpened by vigild; a human merges."
         )
         try:
-            url = self.publisher.publish(
+            url = self._publish(
+                job,
                 repo=job.repo,
                 head=head,
                 base_sha=base_sha,
@@ -2755,6 +2832,14 @@ class JobRunner:
         from vigild.contract.models import DepRequest
 
         parent = self.store.get_job(parent_id)
+        if parent.source == "bench":
+            # a bench task's dependencies are in its derived image (built with network,
+            # once); a deps job would need GitHub and the owner's merge
+            self._bench_failure(
+                parent_id, "environment", stage="deps",
+                error="a bench job asks for dependencies the derived image lacks",
+            )  # fmt: skip
+            return None
         reqs: list[DepRequest] = []
         for d in wanted:
             try:
@@ -2884,8 +2969,8 @@ class JobRunner:
             "merges."
         )
         try:
-            url = self.publisher.publish(
-                repo=job.repo, head=head, base_sha=base_sha, branch=branch, base=job.base,
+            url = self._publish(
+                job, repo=job.repo, head=head, base_sha=base_sha, branch=branch, base=job.base,
                 title=f"[vigil {job_id}] deps: {names}"[:200], body=body, scope=lockfiles,
             )  # fmt: skip
         except PublishError as e:
@@ -2912,6 +2997,8 @@ class JobRunner:
         for job in self.store.list_jobs():
             if job.state in (JobState.ABANDONED, JobState.DONE, JobState.MERGED):
                 continue
+            if job.source == "bench":
+                continue  # nothing was published; there is no PR to poll
             states: dict[str, str] = {}
             closed_tasks: list[str] = []
             for t in self.store.list_tasks(job.id):
@@ -3057,7 +3144,8 @@ class JobRunner:
                 )
                 if facts["published"] != want or facts["vigil_in_pr"] is not False:
                     spec = t.contract.get("spec") or {}
-                    self.publisher.publish(
+                    self._publish(
+                        job,
                         repo=job.repo, head=data["head"], base_sha=base_sha, branch=data["branch"],
                         base=job.base, title="", body="", existing=data["pr_url"],
                         scope=[*(spec.get("files_in_scope") or []), *artifact_paths(job.id, tid),
@@ -3108,7 +3196,11 @@ class JobRunner:
         """Why the owner's fix can't start because of GitHub's live view of the task's
         PR (merged or closed since vigild's poll), if it can't. This is a network
         call: the caller makes it outside any DB transaction."""
-        if self.pr_state is not None and (url := self._task_pr(task_id)):
+        if (
+            self.pr_state is not None
+            and not self.store.is_bench(job_id=job_id)
+            and (url := self._task_pr(task_id))
+        ):
             try:
                 st = self.pr_state(self.store.get_job(job_id).repo, url)
             except Exception:
@@ -3422,7 +3514,9 @@ class JobRunner:
             url = self._task_pr(tid)
             if url:
                 try:
-                    self.publisher.close(job.repo, url)
+                    (self.bench_publisher if job.source == "bench" else self.publisher).close(
+                        job.repo, url, job.id
+                    )
                 except PublishError as e:
                     self._page(
                         job_id, f"{job_id}: deps PR left open after its review failed",
@@ -3465,6 +3559,14 @@ class JobRunner:
     def _ready(self, job_id: str) -> None:
         """Stage 8's queue: the job's PRs, each with its review and audit."""
         job = self.store.get_job(job_id)
+        if job.source == "bench":
+            # nothing was published and no one merges a bench job: the run's result
+            # is graded elsewhere (bench slice 2); the owner's queue stays clear
+            self.store.add_event(
+                "bench_ready", {"tasks": [t.id for t in self.store.list_tasks(job_id)]},
+                Provenance.HUMAN, job_id=job_id,
+            )  # fmt: skip
+            return
         prs = []
         for t in self.store.list_tasks(job_id):
             if t.state in DEAD_TASK:
@@ -3858,11 +3960,12 @@ class GitHubPublisher:
         body: str,
         scope: list[str],
         existing: str | None = None,
+        job_id: str | None = None,
     ) -> str:
         from vigild.github.app import WORKER_PERMISSIONS
         from vigild.github.publish import RestPulls, publish
 
-        with self.app.lease(repo, WORKER_PERMISSIONS) as tok:
+        with self.app.lease(repo, WORKER_PERMISSIONS, job_id=job_id) as tok:
             return publish(
                 self.workspace,
                 repo=repo,
@@ -3878,7 +3981,7 @@ class GitHubPublisher:
                 existing=existing,
             )
 
-    def close(self, repo: str, url: str) -> None:
+    def close(self, repo: str, url: str, job_id: str | None = None) -> None:
         """Close one of vigild's PRs, with a one-repo `pull_requests: write`
         token, revoked after (a deps PR whose review failed, owner ruling 3)."""
         from vigild.github.publish import RestPulls
@@ -3886,7 +3989,7 @@ class GitHubPublisher:
         prefix = f"https://github.com/{repo}/pull/"
         if not url.startswith(prefix) or not url[len(prefix) :].isdigit():
             raise PublishError(f"{url} isn't a PR of {repo}")
-        with self.app.lease(repo, {"pull_requests": "write"}) as tok:
+        with self.app.lease(repo, {"pull_requests": "write"}, job_id=job_id) as tok:
             RestPulls(self.http, tok.token).close(repo, int(url[len(prefix) :]))
 
 
@@ -3920,8 +4023,9 @@ class NoPublisher:
         body: str,
         scope: list[str],
         existing: str | None = None,
+        job_id: str | None = None,
     ) -> str:
         raise PublishError("the GitHub App is not configured (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)")
 
-    def close(self, repo: str, url: str) -> None:
+    def close(self, repo: str, url: str, job_id: str | None = None) -> None:
         raise PublishError("the GitHub App is not configured (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)")

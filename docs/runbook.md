@@ -526,6 +526,28 @@ uv run python -m vigild
   waits for its own condition (or your reset). A backend breaker also closes itself
   after a successful probe five minutes on, resolving its page; meanwhile
   its work goes to the preset's fallback in `configs/routing.yaml`.
+- **The experiment line (bench; owner, 2026-10-27).** A bench job's money comes from
+  `experiment_monthly_usd` in `configs/budgets.yaml` ($30 a UTC month), never from the
+  $5 day; it still counts toward the $100 month, and a bench task's own cap is
+  `bench_task_usd` ($1.50). Both are hard stops. A bench reservation with no room is
+  refused, not queued, and pages nobody: the run ends with the failure tag `budget`
+  (a `bench_failure` event). `vigil doctor` prints the line's spend this month ("experiment
+  budget"). At about $0.50-1.50 a task that is 2-6 Smoke runs a month and no Core run;
+  raising the line is your edit of that file. Bench rows are `eval-only`, which the
+  training exporter refuses.
+- **Migration 13 backup (bench 1a).** The first start that finds a database without
+  `eval-only` in its provenance CHECKs writes a copy beside it,
+  `vigil.db.pre-m13-<UTC stamp>.bak`. The file is created private (umask 077, mode 600),
+  and vigild logs the path. **Every start** then checks, on a new connection and inside
+  a transaction it rolls back, that each provenance table stores `eval-only`. Only a
+  failed CHECK on provenance counts as a refusal. Any other error (a test value that
+  clashes) is inconclusive: the table passes if its stored CHECK lists `eval-only`,
+  with a warning in the log. On a real refusal vigild **refuses to start**, names the
+  table and the newest backup, and
+  repairs nothing. To go back: stop vigild, move `vigil.db`, `vigil.db-wal` and
+  `vigil.db-shm` aside, copy the `.bak` to `vigil.db`, start the previous build. The
+  `.bak` is a whole database (every row, including secrets-adjacent text); keep it at
+  mode 600 and delete it once the new build has run well.
 - **Midnight.** Work still running at UTC midnight counts against the new
   day (and month) until it settles, since its whole cost books to the day it
   settles; the new day's room is $5 less that.

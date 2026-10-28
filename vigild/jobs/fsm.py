@@ -2,7 +2,8 @@
 
 A stage advances only when its acceptance check (code, not judgment) holds.
 Approval from the inbox, by the owner, is the only way out of
-`spec_pending`. The one manual override is the owner's, from the inbox, and
+`spec_pending`, except a bench job's own `approval: bench` edge (vigild's, and
+only for a job whose source is `bench`). The one manual override is the owner's, from the inbox, and
 it is logged; it never skips approval and never invents an edge.
 """
 
@@ -64,6 +65,30 @@ def _approval(c: Ctx) -> list[str]:
     if item is None or item.job_id != c.job.id or item.queue != "specs" or item.status != "open":
         errs.append("no open 'Specs to approve' inbox item for this job")
     return errs
+
+
+def _bench_approval(c: Ctx) -> list[str]:
+    """Bench 1a (owner, 2026-10-27): a bench job goes from its coord's draft straight
+    on, with no owner step. The edge is vigild's, carries `bench: true`, and exists
+    only for a job whose source is `bench`. The spec gate's checks must have run and
+    been recorded (a failed gate does not stop the run: bench measures spec quality)."""
+    errs: list[str] = []
+    if c.job.source != "bench":
+        return ["only a bench job takes the bench edge"]
+    if c.actor is not Actor.VIGILD:
+        errs.append("only vigild moves a bench job past its draft")
+    if c.evidence.get("bench") is not True:
+        errs.append("the bench edge needs evidence bench: true")
+    for name in ("spec.md", "plan.md", "spec_gate.json"):
+        if c.store.get_artifact(c.job.id, name) is None:
+            errs.append(f"{name} is missing")
+    return errs
+
+
+def _approval_or_bench(c: Ctx) -> list[str]:
+    """The one edge out of `spec_pending`: the owner's, from the inbox; or, for a
+    bench job only, vigild's own (`_bench_approval`)."""
+    return _bench_approval(c) if c.job.source == "bench" else _approval(c)
 
 
 def _none(c: Ctx) -> list[str]:
@@ -254,7 +279,7 @@ def _verified(c: Ctx) -> list[str]:
 
 
 EDGES: dict[tuple[JobState, JobState], Guard] = {
-    (S.SPEC_PENDING, S.APPROVED): _approval,
+    (S.SPEC_PENDING, S.APPROVED): _approval_or_bench,
     (S.APPROVED, S.PLANNING): _none,
     (S.PLANNING, S.BUILDING): _workers_routed,
     (S.BUILDING, S.IN_REVIEW): _workers_done,

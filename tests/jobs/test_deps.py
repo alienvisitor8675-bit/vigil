@@ -526,7 +526,7 @@ def test_a_deps_pr_that_wont_close_pages_the_owner(
     w = world
     _parent, child, _pm = _deps_child(w, fixture_repo)
 
-    def refuse(repo: str, url: str) -> None:
+    def refuse(repo: str, url: str, job_id: str | None = None) -> None:
         raise PublishError("422: not allowed")
 
     w.publisher.close = refuse  # type: ignore[method-assign]

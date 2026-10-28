@@ -218,7 +218,7 @@ def test_closing_a_pr_patches_its_state_with_a_one_repo_write_token() -> None:
         from contextlib import contextmanager
 
         @contextmanager
-        def lease(self, repo: str, perms: dict[str, str]):  # type: ignore[no-untyped-def]
+        def lease(self, repo: str, perms: dict[str, str], job_id: str | None = None):  # type: ignore[no-untyped-def]
             leased.append((repo, perms))
             yield InstallationToken(repo, perms, "z", "ghs_w")
 

@@ -814,7 +814,7 @@ class Gateway:
                              tokens_in=math.ceil(body_chars / CHARS_PER_TOKEN), tokens_out=1024)
         ) if self.prices.has(model) else 0.0  # fmt: skip
         amount = max(self.cfg.budgets.decider_call_usd, worst)
-        with self._own_call(amount, purpose) as cost:
+        with self._own_call(amount, purpose, job_id) as cost:
             started = time.monotonic()
             payload = run()
             result = payload.get("result", payload) if isinstance(payload, dict) else {}
@@ -880,15 +880,21 @@ class Gateway:
             return amount
 
     @contextmanager
-    def _own_call(self, amount: float, purpose: str) -> Iterator[list[float]]:
+    def _own_call(
+        self, amount: float, purpose: str, job_id: str | None = None
+    ) -> Iterator[list[float]]:
         """One of vigild's own calls (Jev through `metered`, Haiku through
         `call`): reserve its worst case, keep that reservation live while the
         call is in flight (2a round 9), then settle it at the call's cost,
         never past what was reserved. A cost past it is recorded
         (`settle_excess`) and trips the daily breaker (2a rounds 8-9), on
-        both paths. The caller sets the yielded list's one item to the cost."""
+        both paths. The caller sets the yielded list's one item to the cost. `job_id`
+        is the job the call is for: a bench job's own calls draw from the experiment
+        line, never the day (owner's rule)."""
         try:
-            rid = self.budget.reserve(session_id=None, task_id=None, amount=amount, purpose=purpose)
+            rid = self.budget.reserve(
+                session_id=None, task_id=None, amount=amount, purpose=purpose, job_id=job_id
+            )
         except BudgetExceeded as e:
             raise GatewayError(403, "permission_error", str(e)) from e
         with self._inflight_lock:
@@ -995,7 +1001,7 @@ class Gateway:
         purpose: str,
         job_id: str | None,
     ) -> dict[str, Any]:
-        with self._own_call(amount, purpose) as cost:
+        with self._own_call(amount, purpose, job_id) as cost:
             started = time.monotonic()
             try:
                 resp = self.sync_client.post(

@@ -29,3 +29,12 @@ audit_session_usd: 0.80  # one auditor session (Opus)
 # drifted or is failing: the repo's breaker trips, pages, and holds its
 # dispatch until the owner resets it (owner, 2026-10-23).
 decider_fallback_per_repo_usd: 1.00
+# The experiment line (owner, 2026-10-27; vigil bench, issue #8). Bench jobs
+# (source: bench) reserve from this monthly ledger and NEVER from daily_usd;
+# their spend still counts toward monthly_usd. Both are hard stops, and a bench
+# reservation the line has no room for is refused (bench does not queue): the run
+# records `budget` as its failure tag. $30 buys 2-6 Smoke runs a month and no Core
+# run until the baseline shows real costs; raising it is the owner's edit.
+experiment_monthly_usd: 30.00
+# One bench task's own cap, in place of per_task_usd (proposed $1.50).
+bench_task_usd: 1.50

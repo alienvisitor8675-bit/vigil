@@ -134,6 +134,10 @@ class Budgets(_M):
     audit_session_usd: float = Field(default=0.80, gt=0)
     # Haiku decisions Jev couldn't give, per repo per UTC day (owner ruling 4)
     decider_fallback_per_repo_usd: float = Field(default=1.00, gt=0)
+    # The experiment line (owner, 2026-10-27): bench reservations draw from this
+    # monthly ledger and never from the day; they count toward monthly_usd.
+    experiment_monthly_usd: float = Field(default=30.00, gt=0)
+    bench_task_usd: float = Field(default=1.50, gt=0)  # a bench task's own cap
 
 
 class ShapePolicy(_M):

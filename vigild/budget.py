@@ -7,7 +7,21 @@ max_cost_usd. A reservation is refused unless
     spent (today) + every open reservation + this one <= daily cap,
 
 the same against the month, and the task's own spend + this one <= the
-per-task cap. Settling turns a reservation into metered spend (the sum of the
+per-task cap.
+
+A bench job's reservations (bench 1a, owner 2026-10-27) are the one exception
+to the day: they draw from the experiment line instead,
+
+    spent (this month, experiment) + every open experiment reservation
+        + this one <= experiment_monthly_usd,
+
+never count against the daily cap, but do count toward the month, and a bench
+task's own cap is bench_task_usd. A bench reservation the line has no room for
+is refused, never queued. Every reservation and ledger row says which pool it
+belongs to (`ops` or `experiment`), worked out here from the session, task or job
+it is for, so a caller can't forget it.
+
+Settling turns a reservation into metered spend (the sum of the
 session's model_calls rows). The gateway refuses any call whose worst case
 would take its session past the reservation, so metered spend can't pass a
 cap by more than the error in that worst-case estimate (which errs high).
@@ -24,6 +38,7 @@ from vigild.db import Store, iso, utcnow
 from vigild.metering.calls import session_cost
 
 EPS = 1e-9
+OPS, EXPERIMENT = "ops", "experiment"
 
 
 class BudgetExceeded(Exception):
@@ -48,22 +63,55 @@ class Budget:
     def _sum(self, sql: str, args: tuple[object, ...]) -> float:
         return float(self.store.q(sql, args)[0][0] or 0)
 
+    def pool_of(
+        self,
+        *,
+        session_id: str | None = None,
+        task_id: str | None = None,
+        job_id: str | None = None,
+    ) -> str:
+        """`experiment` for a bench job's session, task or job; else `ops`."""
+        bench = self.store.is_bench(job_id=job_id, session_id=session_id, task_id=task_id)
+        return EXPERIMENT if bench else OPS
+
     def spent_today(self) -> float:
-        return self._sum("SELECT SUM(amount_usd) FROM ledger WHERE day=?", (self._day(),))
+        """Today's spend on the operating budget; the experiment line is not the day's."""
+        return self._sum(
+            "SELECT SUM(amount_usd) FROM ledger WHERE day=? AND pool != ?",
+            (self._day(), EXPERIMENT),
+        )
 
     def open_today(self) -> float:
         """Every open reservation, whatever day it was made (2a round 7): a
         session still running at UTC midnight books its whole cost to the
         day it settles, so the new day's cap must already see it. One a
-        crash left open is settled by the startup reconcile."""
-        return self._sum("SELECT SUM(amount_usd) FROM reservations WHERE status='open'", ())
+        crash left open is settled by the startup reconcile. Experiment holds are
+        not the day's."""
+        return self._sum(
+            "SELECT SUM(amount_usd) FROM reservations WHERE status='open' AND pool != ?",
+            (EXPERIMENT,),
+        )
 
     def open_month(self) -> float:
         """Every open reservation, whatever month it was made (2a round 7)."""
         return self._sum("SELECT SUM(amount_usd) FROM reservations WHERE status='open'", ())
 
     def spent_month(self) -> float:
+        """Every pool: experiment spend counts toward the month."""
         return self._sum("SELECT SUM(amount_usd) FROM ledger WHERE month=?", (self._month(),))
+
+    def spent_experiment_month(self) -> float:
+        return self._sum(
+            "SELECT SUM(amount_usd) FROM ledger WHERE month=? AND pool=?",
+            (self._month(), EXPERIMENT),
+        )
+
+    def open_experiment(self) -> float:
+        """Every open experiment reservation, whatever month it was made."""
+        return self._sum(
+            "SELECT SUM(amount_usd) FROM reservations WHERE status='open' AND pool=?",
+            (EXPERIMENT,),
+        )
 
     def task_spent(self, task_id: str) -> float:
         return self._sum("SELECT SUM(amount_usd) FROM ledger WHERE task_id=?", (task_id,))
@@ -80,22 +128,41 @@ class Budget:
         return [int(r[0]) for r in self.store.q("SELECT id FROM reservations WHERE status='open'")]
 
     def reserve(
-        self, *, session_id: str | None, task_id: str | None, amount: float, purpose: str
+        self,
+        *,
+        session_id: str | None,
+        task_id: str | None,
+        amount: float,
+        purpose: str,
+        job_id: str | None = None,
     ) -> int:
         if amount <= 0:
             raise ValueError("a reservation must be positive")
         with self.store.tx() as c:
-            if task_id and self.task_total(task_id) + amount > self.cfg.per_task_usd + EPS:
+            pool = self.pool_of(session_id=session_id, task_id=task_id, job_id=job_id)
+            bench = pool == EXPERIMENT
+            task_cap = self.cfg.bench_task_usd if bench else self.cfg.per_task_usd
+            if task_id and self.task_total(task_id) + amount > task_cap + EPS:
                 raise BudgetExceeded(
-                    "per_task",
+                    "bench_task" if bench else "per_task",
                     f"task {task_id} has {self.task_total(task_id):.2f} of "
-                    f"{self.cfg.per_task_usd:.2f}; {amount:.2f} more doesn't fit",
+                    f"{task_cap:.2f}; {amount:.2f} more doesn't fit",
                 )
-            day_used = self.spent_today() + self.open_today()
-            if day_used + amount > self.cfg.daily_usd + EPS:
-                raise BudgetExceeded(
-                    "daily", f"{day_used:.2f} of {self.cfg.daily_usd:.2f} used; {amount:.2f} more"
-                )
+            if bench:
+                used = self.spent_experiment_month() + self.open_experiment()
+                if used + amount > self.cfg.experiment_monthly_usd + EPS:
+                    raise BudgetExceeded(
+                        "experiment",
+                        f"{used:.2f} of {self.cfg.experiment_monthly_usd:.2f} used this month; "
+                        f"{amount:.2f} more",
+                    )
+            else:
+                day_used = self.spent_today() + self.open_today()
+                if day_used + amount > self.cfg.daily_usd + EPS:
+                    raise BudgetExceeded(
+                        "daily",
+                        f"{day_used:.2f} of {self.cfg.daily_usd:.2f} used; {amount:.2f} more",
+                    )
             month_used = self.spent_month() + self.open_month()
             if month_used + amount > self.cfg.monthly_usd + EPS:
                 raise BudgetExceeded(
@@ -104,7 +171,7 @@ class Budget:
                 )
             cur = c.execute(
                 "INSERT INTO reservations (session_id, task_id, purpose, amount_usd, status, day,"
-                " month, created_at) VALUES (?,?,?,?, 'open', ?,?,?)",
+                " month, created_at, pool) VALUES (?,?,?,?, 'open', ?,?,?,?)",
                 (
                     session_id,
                     task_id,
@@ -113,6 +180,7 @@ class Budget:
                     self._day(),
                     self._month(),
                     iso(self.clock()),
+                    pool,
                 ),
             )
             return int(cur.lastrowid or 0)
@@ -124,7 +192,7 @@ class Budget:
         and the others (an over-cap extension, a draw's top-up) close with it."""
         with self.store.tx() as c:
             row = c.execute(
-                "SELECT session_id, task_id, status FROM reservations WHERE id=?",
+                "SELECT session_id, task_id, status, pool FROM reservations WHERE id=?",
                 (reservation_id,),
             ).fetchone()
             if row is None or row["status"] != "open":
@@ -172,7 +240,7 @@ class Budget:
                 )
             c.execute(
                 "INSERT INTO ledger (reservation_id, session_id, task_id, amount_usd, day, month,"
-                " ts) VALUES (?,?,?,?,?,?,?)",
+                " ts, pool) VALUES (?,?,?,?,?,?,?,?)",
                 (
                     reservation_id,
                     row["session_id"],
@@ -181,6 +249,7 @@ class Budget:
                     self._day(),
                     self._month(),
                     iso(self.clock()),
+                    row["pool"],
                 ),
             )
             return spent
@@ -192,8 +261,16 @@ class Budget:
         with self.store.tx() as c:
             c.execute(
                 "INSERT INTO ledger (reservation_id, session_id, task_id, amount_usd, day, month,"
-                " ts) VALUES (NULL,?,?,?,?,?,?)",
-                (session_id, task_id, amount, self._day(), self._month(), iso(self.clock())),
+                " ts, pool) VALUES (NULL,?,?,?,?,?,?,?)",
+                (
+                    session_id,
+                    task_id,
+                    amount,
+                    self._day(),
+                    self._month(),
+                    iso(self.clock()),
+                    self.pool_of(session_id=session_id, task_id=task_id),
+                ),
             )
 
     def draw(self, parent_id: int, *, session_id: str, amount: float, purpose: str) -> int:
@@ -207,7 +284,7 @@ class Budget:
         rid, take = 0, 0.0
         with self.store.tx() as c:
             row = c.execute(
-                "SELECT amount_usd, status FROM reservations WHERE id=?", (parent_id,)
+                "SELECT amount_usd, status, pool FROM reservations WHERE id=?", (parent_id,)
             ).fetchone()
             if row is not None and row["status"] == "open":
                 take = min(amount, float(row["amount_usd"]))
@@ -218,9 +295,9 @@ class Budget:
                 )
                 cur = c.execute(
                     "INSERT INTO reservations (session_id, task_id, purpose, amount_usd, status,"
-                    " day, month, created_at) VALUES (?,?,?,?, 'open', ?,?,?)",
+                    " day, month, created_at, pool) VALUES (?,?,?,?, 'open', ?,?,?,?)",
                     (session_id, None, purpose, take, self._day(), self._month(),
-                     iso(self.clock())),
+                     iso(self.clock()), row["pool"]),
                 )  # fmt: skip
                 rid = int(cur.lastrowid or 0)
         if take <= 0:
@@ -276,6 +353,9 @@ class Budget:
             "spent_today": round(self.spent_today(), 6),
             "reserved_open": round(self.open_today(), 6),
             "spent_month": round(self.spent_month(), 6),
+            "experiment_cap": self.cfg.experiment_monthly_usd,
+            "experiment_spent_month": round(self.spent_experiment_month(), 6),
+            "experiment_reserved_open": round(self.open_experiment(), 6),
             "decider_today": self.spent_today_by_purpose().get("decider", 0.0),
             "decider_fallback_today": self.spent_today_by_purpose().get("decider_fallback", 0.0),
         }

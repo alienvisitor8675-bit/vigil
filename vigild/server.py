@@ -167,6 +167,7 @@ def _github_app(v: Vigild) -> Any:
     import httpx2
 
     from vigild.github.app import GitHubApp
+    from vigild.repos import is_bench_repo
 
     app_id, key_path = v.secrets.get("GITHUB_APP_ID"), v.secrets.get("GITHUB_APP_KEY_PATH")
     if not (app_id and key_path):
@@ -176,7 +177,8 @@ def _github_app(v: Vigild) -> Any:
         Path(key_path).expanduser().read_bytes(),
         http=httpx2.Client(timeout=30),
         claude_mods=v.cfg.vigild.github.claude_mods,
-        allowed_repos=list(v.cfg.repos.repos),
+        allowed_repos=[r for r in v.cfg.repos.repos if not is_bench_repo(r)],
+        job_source=lambda job_id: v.store.get_job(job_id).source,
     )
 
 
