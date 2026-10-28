@@ -52,3 +52,21 @@ The phase 1 done-when, run end to end on a real repo through vigild only:
 - Reviews run on Sonnet first. Opus is used only for focused verifier, gateway or hidden-test reviews, with at most two rounds.
 - Security issues are described as classes, never as exploit steps.
 - Development runs use a scratch `VIGIL_DATA_DIR` and never `~/vigil-data`.
+
+## Follow-up run: pa-0003 (ParkAgent #320), first with the reviewer and auditor live
+This was a tests-only job: unit tests for `placeClassification.ts`, with must-fail-first off and a stated reason (#33). The job reached `ready` as ParkAgent PR #321. The owner then sent both of the auditor's findings back with **fix with findings** (#40), and merged #321 after the fix round.
+
+| Stage | Model | First pass | Fix round |
+|---|---|---|---|
+| Coord | Opus ×3 | $1.71: a spec-gate redraft (trailing slashes, #36) and an owner replan with a note | n/a |
+| Worker | Sonnet | $0.20, ~3 min, 25 test cases | $0.24, ~2 min, 24 test cases |
+| Verifier | none | $0, ~3 min, 25 new test ids passed | $0, ~1.5 min, 24 new test ids passed |
+| Review | Sonnet | $0.10, clean, 0 findings | $0.10, clean, 0 findings |
+| Audit | Opus | $0.24, 2 low findings the reviewer missed | $0.24, 2 new low findings the reviewer missed |
+
+- **Total: $2.83.**
+- **Fix round: $0.58.** Its review stage reserved $1.20 and spent $0.34.
+- **Review caps:** unchanged at review $0.40 and audit $0.80. Every reviewer and auditor session so far came in at about a third of its cap. The owner will revisit after more runs.
+- **What the auditor found:** the reviewer missed all 4 of its findings, and every one was an acceptance-criterion bound or assertion. The reviewer prompt now gets an AC-checklist step, with a dry run on pa-0003's final diff to confirm it catches them.
+- **Still open:** the fix round's two findings went to a new, unlabelled ParkAgent issue for a later job.
+- **A dropped row:** the owner's note expected 25 cases. The added AC1 row sits in a plain loop inside one test, not `it.each`, so it adds no test id. The file ends at 24 cases, which is inside AC8's bound of 12-25.
