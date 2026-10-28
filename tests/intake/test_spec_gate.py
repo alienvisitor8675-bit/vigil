@@ -534,3 +534,31 @@ def test_a_task_with_it_off_and_no_reason_needs_a_spec() -> None:
     res = check_task(_task(must_fail_first=False))
     assert not res.ok and any("must_fail_first_reason" in e for e in res.errors)
     assert check_task(_task(must_fail_first=False, must_fail_first_reason="tests only")).ok
+
+
+BARE_DIR = "use dir/** (a bare directory matches only itself)"
+
+
+def _is_dir(path: str) -> bool:
+    return path in {"tests/gateway", "tests"}
+
+
+def _scoped(entry: str) -> tuple[str, str]:
+    spec = SPEC.replace("- `docs/runbook.md`\n", f"- `docs/runbook.md`\n- `{entry}`\n")
+    return spec, _with_scope(entry)
+
+
+def test_a_bare_existing_directory_in_a_worker_scope_is_refused() -> None:
+    spec, plan = _scoped("tests/gateway")
+    errors = check_job_spec(parse_spec(spec), parse_plan(plan), MONEY, is_dir=_is_dir)
+    assert any(f"tests/gateway: {BARE_DIR}" in e and "pa-0001-w2" in e for e in errors), errors
+    assert any(f"tests/gateway: {BARE_DIR}" in e and "spec.md" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "entry", ["tests/gateway/**", "tests/gateway/x.py", "tests/new.py", "tests/*.py"]
+)
+def test_a_dir_glob_file_new_path_or_glob_passes_the_bare_dir_rule(entry: str) -> None:
+    spec, plan = _scoped(entry)
+    errors = check_job_spec(parse_spec(spec), parse_plan(plan), MONEY, is_dir=_is_dir)
+    assert not any(BARE_DIR in e for e in errors), errors

@@ -246,3 +246,15 @@ def test_parallel_clones_and_fetches_on_one_mirror(
     assert errors == []
     mirror = ws._mirror_path("o/fixture")
     assert not list((mirror / "objects").glob("*.lock"))
+
+
+def test_mirror_is_dir_sees_a_directory_at_the_base_tip(
+    tmp_path: Path, fixture_repo: dict[str, Path]
+) -> None:
+    ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
+    assert not ws.mirror_is_dir("o/fixture", "main", "docs")  # no mirror yet
+    ws.mirror("o/fixture")
+    assert ws.mirror_is_dir("o/fixture", "main", "docs")
+    assert not ws.mirror_is_dir("o/fixture", "main", "README.md")
+    assert not ws.mirror_is_dir("o/fixture", "main", "nope")
+    assert not ws.mirror_is_dir("o/fixture", "main;rm", "docs")

@@ -399,6 +399,19 @@ class Workspace:
         except WorkspaceError, GitError:
             return None
 
+    def mirror_is_dir(self, repo: str, branch: str, path: str) -> bool:
+        """`path` is a directory at the tip of `branch` in the mirror as last
+        fetched (`ls-tree` reads git objects only; False if unknown)."""
+        mirror = self._mirror_path(repo)
+        if not mirror.exists() or not BRANCH_NAME.match(branch):
+            return False
+        try:
+            sha = self._git(mirror, "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}")
+            out = self._git(mirror, "ls-tree", "-z", sha, "--", path)
+        except WorkspaceError, GitError:
+            return False
+        return any(e.partition("\t")[0].split()[1:2] == ["tree"] for e in out.split("\0") if e)
+
     def tree_paths(self, repo: str, sha: str) -> set[str]:
         """Every file path at `sha` in the vault."""
         if not SHA.match(sha):

@@ -24,6 +24,8 @@ from vigild.jobs.artifacts import SPEC_SECTIONS, PlanDoc, SpecDoc
 from vigild.shellwords import Command, parse
 from vigild.verifier import ReadFile, plan_reports, runner_overlap
 
+BARE_DIR = "use dir/** (a bare directory matches only itself)"
+
 
 @dataclass(frozen=True)
 class GateResult:
@@ -192,11 +194,20 @@ def check_job_spec(
     *,
     missing_tools: Callable[[str], list[str]] | None = None,
     read: ReadFile | None = None,
+    is_dir: Callable[[str], bool] | None = None,
     existing_task_ids: Collection[str] = (),
 ) -> list[str]:
+    def entry_error(entry: str) -> str | None:
+        if err := scope_entry_error(entry):
+            return err
+        # strict globs: a bare directory matches only itself, so a plan that
+        # lists one could never pass acceptance (vi-0001)
+        bare = is_dir is not None and not entry.endswith("/**") and not set("*?[") & set(entry)
+        return f"{entry}: {BARE_DIR}" if bare and is_dir is not None and is_dir(entry) else None
+
     errors: list[str] = []
     for entry in spec.files_in_scope:
-        if err := scope_entry_error(entry):
+        if err := entry_error(entry):
             errors.append(f"spec.md files in scope: {err}")
     for sec in SPEC_SECTIONS:
         if sec not in spec.sections:
@@ -234,6 +245,9 @@ def check_job_spec(
                 errors.append(f"worker {w.task_id} depends on unknown worker {dep}")
         for f in w.files_in_scope + w.out_of_scope:
             if err := scope_entry_error(f):
+                errors.append(f"worker {w.task_id}: {err}")
+        for f in w.files_in_scope:
+            if not scope_entry_error(f) and (err := entry_error(f)):
                 errors.append(f"worker {w.task_id}: {err}")
         for f in w.files_in_scope:
             if not scope_entry_error(f) and not _scope_within(f, spec.files_in_scope):

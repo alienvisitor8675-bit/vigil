@@ -266,7 +266,11 @@ stateDiagram-v2
   drafts again, up to three drafts, then you are paged (resumable). The
   spec gate **refuses a worker id that already exists in the job**
   (merged, failed or superseded) and one repeated in the plan; a new worker
-  may list an existing id in `depends_on`. After the gate vigild renames the
+  may list an existing id in `depends_on`. It also **refuses a scope entry
+  that is an existing directory at the base without `/**`** ("use dir/** (a
+  bare directory matches only itself)"): scope globs are strict, so such a
+  plan could never pass acceptance; `JobService.dirs` reads the mirror's
+  tree at the base's tip (vi-0001). After the gate vigild renames the
   plan's workers to `{job}-w<n>`, **starting after the job's highest task
   number** (`{job}-w1`, `{job}-w2`, … for a first plan, so a re-plan's tasks
   are always new ones). A

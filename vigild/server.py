@@ -284,6 +284,8 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         return lambda path: ws.mirror_file(repo, base, path)
 
     v.services.jobs.files = files
+    # the same mirror tells the gate which scope entries are directories
+    v.services.jobs.dirs = lambda repo, base: lambda path: ws.mirror_is_dir(repo, base, path)
     return runner
 
 

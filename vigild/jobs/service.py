@@ -218,7 +218,9 @@ class JobService:
         store: Store,
         runner: Runner,
         files: Callable[[str, str], Callable[[str], str | None]] | None = None,
+        dirs: Callable[[str, str], Callable[[str], bool]] | None = None,
     ) -> None:
+        self.dirs = dirs  # (repo, base) -> is this path a directory at the base's tip
         self.files = files  # (repo, base) -> read a file at the base's tip
         self.cfg = cfg
         self.store = store
@@ -250,6 +252,7 @@ class JobService:
             # the base's files, so the gate resolves package scripts as the
             # verifier will (round 4, item 6)
             read=self.files(repo, base) if self.files is not None else None,
+            is_dir=self.dirs(repo, base) if self.dirs is not None else None,
             # a worker id is never reused in a job (phase 1 run finding #4)
             existing_task_ids=self._used_task_ids(job_id) if job_id else (),
         )
