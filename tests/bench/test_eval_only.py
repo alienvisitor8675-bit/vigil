@@ -194,3 +194,49 @@ def test_the_probe_names_a_table_that_refuses_it(tmp_path: Path) -> None:
     assert db.verify_fresh_connection(str(path)) == []
     mode = oct(next(path.parent.glob("*.bak")).stat().st_mode & 0o777)
     assert mode == "0o600"
+
+
+def test_every_start_refuses_when_a_table_rejects_eval_only(tmp_path: Path) -> None:
+    """Owner, 2026-10-27: the start check fails closed on every start, not only the one
+    that made the backup. It names the table and the backup and repairs nothing."""
+    path = tmp_path / "vigil.db"
+    _old_database(path)
+    Store.open(path).conn.close()  # migrates and makes the backup
+    (bak,) = _backups(path)
+    # something later makes a table refuse the value (here a trigger; the CHECK is fine,
+    # so nothing needs rewriting and no new backup is made)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TRIGGER no_eval BEFORE INSERT ON events WHEN NEW.provenance = 'eval-only' "
+        "BEGIN SELECT RAISE(ABORT, 'no'); END"
+    )
+    conn.commit()
+    conn.close()
+    for _ in range(2):  # the second start refuses too
+        with pytest.raises(sqlite3.DatabaseError) as e:
+            Store.open(path)
+        assert "events" in str(e.value) and str(bak) in str(e.value)
+    assert _backups(path) == [bak]  # repairs nothing, copies nothing
+    conn = sqlite3.connect(path)
+    names = [r[0] for r in conn.execute("SELECT name FROM sqlite_schema WHERE type='trigger'")]
+    conn.close()
+    assert names == ["no_eval"]
+
+
+def test_the_backup_is_private_from_the_moment_it_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No window with default permissions: the file is created under umask 077, so its
+    mode is already 600 before any chmod runs."""
+    seen: list[int] = []
+    real_chmod = db.os.chmod
+
+    def spy(p: object, mode: int) -> None:
+        seen.append(Path(str(p)).stat().st_mode & 0o777)
+        real_chmod(p, mode)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(db.os, "chmod", spy)
+    path = tmp_path / "vigil.db"
+    _old_database(path)
+    Store.open(path).conn.close()
+    assert seen == [0o600], [oct(m) for m in seen]

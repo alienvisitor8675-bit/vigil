@@ -304,7 +304,11 @@ def _backup_before_rewrite(conn: sqlite3.Connection, tag: str) -> Path | None:
         return None
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     dest = f"{file}.{tag}-{stamp}.bak"
-    conn.execute("VACUUM INTO ?", (dest,))
+    old = os.umask(0o077)  # created private: no window with default permissions
+    try:
+        conn.execute("VACUUM INTO ?", (dest,))
+    finally:
+        os.umask(old)
     os.chmod(dest, 0o600)
     log.warning("about to rewrite the schema (%s); backup at %s", tag, dest)
     return Path(dest)
@@ -446,10 +450,9 @@ def migrate(conn: sqlite3.Connection) -> int:
     branch's build may have raised it past steps this build has never run, so
     it never decides to skip one. Each step is idempotent, so a re-run is free."""
     for step in MIGRATIONS:
-        backup: Path | None = None
         if step is _m13_eval_only:
             if _needs_widening(conn):
-                backup = _backup_before_rewrite(conn, "pre-m13")  # not inside the step's tx
+                _backup_before_rewrite(conn, "pre-m13")  # not inside the step's tx
             else:
                 log.info("no backup before migration 13: no table needs rewriting")
         conn.execute("BEGIN IMMEDIATE")
@@ -459,14 +462,18 @@ def migrate(conn: sqlite3.Connection) -> int:
         except BaseException:
             conn.execute("ROLLBACK")
             raise
-        if step is _m13_eval_only and backup is not None:
-            file = _db_file(conn)
-            refused = verify_fresh_connection(file) if file else []
-            if refused:  # committed, so it can't roll back: stop the start, point at the copy
-                raise sqlite3.DatabaseError(
-                    f"after migration 13 a new connection can't store 'eval-only' in {refused};"
-                    f" restore the backup {backup}"
-                )
+    # Every start, not only the one that made the backup (owner, 2026-10-27): a new
+    # connection must store `eval-only` in every provenance table, inside a transaction
+    # it rolls back. Fails closed: names the tables and the backup, repairs nothing.
+    file = _db_file(conn)
+    refused = verify_fresh_connection(file) if file else []
+    if refused:
+        baks = sorted(Path(file).parent.glob(f"{Path(file).name}.pre-m13-*.bak"))
+        where = f"restore the backup {baks[-1]}" if baks else "no pre-m13 backup is beside it"
+        raise sqlite3.DatabaseError(
+            f"a new connection can't store 'eval-only' in {refused} of {file}; vigild won't"
+            f" start and repairs nothing: {where}"
+        )
     conn.execute(f"PRAGMA user_version = {len(MIGRATIONS)}")
     return len(MIGRATIONS)
 
