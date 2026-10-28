@@ -4,7 +4,11 @@ story until there is a second machine.
 A backup *set* is in the destination, named by UTC time:
 `vigil-YYYYMMDDTHHMMSSZ.db` (SQLite online backup of `<data>/vigil.db`, mode
 600), `vigil-YYYYMMDDTHHMMSSZ.vault/` (rsync of `<data>/vault/`) and
-`vigil-YYYYMMDDTHHMMSSZ.marker` (holds the run id). Retention prunes only sets
+`vigil-YYYYMMDDTHHMMSSZ.marker` (holds the run id; a plain copy of the temp
+marker, made with an exclusive create, so it works on exFAT and FAT drives
+that have no hard links and is never written through a planted symlink).
+`freshness` says whether the newest complete set is recent (`vigil doctor`).
+Retention prunes only sets
 whose marker holds a run id this tool wrote, so a person's own file with a matching name is never
 removed. A set is built in `.vigil-<stamp>.tmp/` (marker inside) and moved out.
 This module never opens anything under `~/.config/vigil/`; the destination
@@ -100,7 +104,7 @@ def run_backup(
         final_db = dest / f"vigil-{stamp}.db"
         final_vault = dest / f"vigil-{stamp}.vault"
         final_marker = dest / f"vigil-{stamp}.marker"
-        if final_db.exists() or final_vault.exists() or final_marker.exists():
+        if any(os.path.lexists(p) for p in (final_db, final_vault, final_marker)):
             raise BackupError(f"backup set {stamp} already exists")
         work = dest / f".vigil-{stamp}.tmp"
         work.mkdir()
@@ -110,7 +114,10 @@ def run_backup(
             warnings += _copy_vault(data / "vault", work / "vault")
             # The marker lands first, so a piece in dest is never unmarked; a
             # set cut short by a kill is marked and prune removes it when old.
-            os.link(work / TMP_MARKER, final_marker)  # the tmp dir keeps its copy
+            # A copy, not a hard link (exFAT/FAT have none); "x" never opens an
+            # existing file or a symlink at that name.
+            with open(final_marker, "x") as f:
+                f.write(run_id)
             os.rename(work / "db", final_db)
             os.rename(work / "vault", final_vault)
         except BaseException:
@@ -246,3 +253,34 @@ def verify_backup(db: Path) -> list[str]:
     if version != len(MIGRATIONS):
         problems.append(f"user_version is {version}, expected {len(MIGRATIONS)}")
     return problems
+
+
+MAX_AGE = timedelta(hours=36)
+
+
+def freshness(dest: Path, *, now: datetime, max_age: timedelta = MAX_AGE) -> tuple[bool, str]:
+    """Is the newest complete set in `dest` at most `max_age` old? A complete
+    set is a marker that is ours, a regular-file db and a vault directory. Age
+    is `now` minus the stamp in the name. The note never holds the path."""
+    try:
+        names = sorted(p.name for p in dest.iterdir())
+    except OSError as e:
+        return False, f"destination unreachable: {type(e).__name__}"
+    newest: datetime | None = None
+    for name in names:
+        mm = _MARKER.match(name)
+        if not mm or not _ours(dest / name):
+            continue
+        db, vault = dest / f"vigil-{mm.group(1)}.db", dest / f"vigil-{mm.group(1)}.vault"
+        if not (db.is_file() and not db.is_symlink() and vault.is_dir() and not vault.is_symlink()):
+            continue
+        when = datetime.strptime(mm.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+        if newest is None or when > newest:
+            newest = when
+    if newest is None:
+        return False, "no complete backup set"
+    age = now.astimezone(UTC) - newest
+    note = (
+        f"newest set {newest.strftime('%Y%m%dT%H%M%SZ')}, {int(age.total_seconds() // 3600)}h old"
+    )
+    return age <= max_age, note

@@ -350,8 +350,9 @@ dir or `~/.config/vigil/`): `vigil-<UTC stamp>.db`, a SQLite online backup of
 `vigil.db` made under umask 077 (mode 600 from creation, consistent while
 vigild writes), and `vigil-<stamp>.vault/`, an rsync of `vault/`. It prunes
 sets older than 14 days. Each set has a `vigil-<stamp>.marker` file holding the
-run id (16 hex characters); it is written first, in the tmp dir, and linked into
-place before the db and vault, so no piece is ever unmarked. Prune removes only
+run id (16 hex characters); it is written first in the tmp dir, then copied
+(exclusive create, no hard link, so exFAT works and a planted symlink is never
+written through) into place before the db and vault, so no piece is ever unmarked. Prune removes only
 sets whose marker holds exactly that format, so a person's own file is never
 touched. The copy is a normal `sqlite3.connect` plus `backup()`, so it is
 consistent under WAL while vigild runs (it may create `-wal`/`-shm` beside the
@@ -361,6 +362,10 @@ uses `--safe-links --no-specials --no-devices` (exit 24 is a warning). It never 
 the secrets directory; that is backed up separately, encrypted, by the owner.
 `vigil restore <db>` only verifies: it opens the file read-only, runs
 `PRAGMA integrity_check`, and compares `user_version` with `len(MIGRATIONS)`.
+`vigil doctor` runs a `backup freshness` check: it fails when the newest complete
+set (marker, db and vault) is over 36 hours old, none exists or the destination
+is unreachable; the destination is `VIGIL_BACKUP_DIR` or the installed plist's,
+and it skips only while neither exists.
 There is no automated restore; the runbook has the manual steps. Code: `vigild/backup.py`.
 
 Every record table carries `provenance: claude | local | human`, enforced

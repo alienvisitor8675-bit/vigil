@@ -4,6 +4,7 @@ vault rsync, retention, and a read-only restore check."""
 from __future__ import annotations
 
 import builtins
+import errno
 import os
 import sqlite3
 import stat
@@ -394,3 +395,109 @@ def _guarded(fn, secrets: Path, seen: list[str]):  # type: ignore[no-untyped-def
         return fn(self, *a, **k)
 
     return inner
+
+
+def test_marker_is_a_copy_so_a_filesystem_without_hard_links_works(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_link(*a: object, **k: object) -> None:
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "link", no_link)
+    made = backup.run_backup(data, tmp_path / "dest", now=NOW)
+    marker = made.db.with_suffix(".marker")
+    assert backup._ours(marker) and made.db.is_file() and made.vault.is_dir()
+
+
+def test_a_dangling_symlink_at_the_marker_name_fails_and_is_not_written_through(
+    data: Path, tmp_path: Path
+) -> None:
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    target = tmp_path / "planted"
+    (dest / "vigil-20261027T030000Z.marker").symlink_to(target)
+    with pytest.raises(backup.BackupError, match="already exists"):
+        backup.run_backup(data, dest, now=NOW)
+    assert not target.exists()
+    assert sorted(p.name for p in dest.iterdir()) == ["vigil-20261027T030000Z.marker"]
+
+
+def test_exclusive_create_refuses_a_symlink_that_appears_after_the_precheck(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dest = tmp_path / "dest"
+    target = tmp_path / "planted"
+    real = backup._copy_vault
+
+    def plant(*a: object, **k: object) -> list[str]:
+        out = real(*a, **k)  # type: ignore[arg-type]
+        (dest / "vigil-20261027T030000Z.marker").symlink_to(target)  # the race
+        return out
+
+    monkeypatch.setattr(backup, "_copy_vault", plant)
+    with pytest.raises(FileExistsError):
+        backup.run_backup(data, dest, now=NOW)
+    assert not target.exists()
+    assert not [p for p in dest.iterdir() if p.suffix in (".db", ".vault")]
+
+
+def _set(
+    dest: Path, when: datetime, *, db: bool = True, vault: bool = True, run_id: str = "a" * 16
+) -> None:
+    stamp = when.strftime("%Y%m%dT%H%M%SZ")
+    dest.mkdir(exist_ok=True)
+    (dest / f"vigil-{stamp}.marker").write_text(run_id)
+    if db:
+        (dest / f"vigil-{stamp}.db").write_bytes(b"x")
+    if vault:
+        (dest / f"vigil-{stamp}.vault").mkdir()
+
+
+def test_freshness_passes_for_a_recent_complete_set(tmp_path: Path) -> None:
+    dest = tmp_path / "d"
+    _set(dest, NOW - timedelta(hours=1))
+    ok, note = backup.freshness(dest, now=NOW)
+    assert ok and note == "newest set 20261027T020000Z, 1h old"
+
+
+def test_freshness_fails_past_36_hours_and_gives_the_age(tmp_path: Path) -> None:
+    dest = tmp_path / "d"
+    _set(dest, NOW - timedelta(hours=37))
+    ok, note = backup.freshness(dest, now=NOW)
+    assert not ok and "37h old" in note
+
+
+def test_a_newer_incomplete_set_does_not_mask_an_older_complete_one(tmp_path: Path) -> None:
+    dest = tmp_path / "d"
+    _set(dest, NOW - timedelta(hours=40))
+    _set(dest, NOW - timedelta(hours=2), db=False, vault=False)
+    _set(dest, NOW - timedelta(hours=3), vault=False)
+    ok, note = backup.freshness(dest, now=NOW)
+    assert not ok and "40h old" in note and "20261025T110000Z" in note
+
+
+def test_unmarked_or_foreign_marker_sets_do_not_count(tmp_path: Path) -> None:
+    dest = tmp_path / "d"
+    _set(dest, NOW - timedelta(hours=30))
+    _set(dest, NOW - timedelta(hours=2), run_id="my own notes")
+    stamp = (NOW - timedelta(hours=1)).strftime("%Y%m%dT%H%M%SZ")
+    (dest / f"vigil-{stamp}.db").write_bytes(b"x")
+    (dest / f"vigil-{stamp}.vault").mkdir()  # no marker at all
+    ok, note = backup.freshness(dest, now=NOW)
+    assert ok and "30h old" in note
+
+
+def test_an_empty_destination_fails(tmp_path: Path) -> None:
+    dest = tmp_path / "d"
+    dest.mkdir()
+    ok, note = backup.freshness(dest, now=NOW)
+    assert not ok and "no complete backup set" in note
+
+
+def test_an_unreachable_destination_fails_without_naming_it(tmp_path: Path) -> None:
+    f = tmp_path / "afile"
+    f.write_text("x")
+    for bad in (tmp_path / "secret-missing-dir", f):
+        ok, note = backup.freshness(bad, now=NOW)
+        assert not ok and "unreachable" in note
+        assert str(tmp_path) not in note and bad.name not in note

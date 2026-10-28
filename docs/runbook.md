@@ -458,7 +458,9 @@ backup, mode 600) and `vigil-<stamp>.vault/` (rsync). It keeps 14 days.
 It is safe to run while vigild is running (SQLite's backup API gives a
 consistent snapshot; it may create `vigil.db-wal` and `-shm` beside the
 database), and it checks the copy with `integrity_check` before keeping it.
-The destination must be outside the repo and the data dir. It never reads
+Any filesystem works for the destination, exFAT included (the marker is a
+plain copy, not a hard link); mode 600 is not enforced on FAT or exFAT. The
+destination must be outside the repo and the data dir. It never reads
 `~/.config/vigil/`: back that directory up separately, encrypted, with a
 key only you hold.
 
@@ -474,8 +476,17 @@ key only you hold.
    (501 is your uid; `id -u` prints it).
 5. Test once with `launchctl kickstart gui/501/dev.vigil.backup`, then read
    `/tmp/dev.vigil.backup.log` and check a new set appeared. Docker Desktop
-   is not needed. The job runs at 03:15; the issue's done-when is two
-   nights with old sets pruned.
+   is not needed. Then `vigil doctor` should show `pass  backup freshness`.
+   The job runs at 03:15; the issue's done-when is two nights with old sets
+   pruned.
+
+`vigil doctor` checks freshness: it fails when the newest complete set (marker,
+db and vault) is more than 36 hours old, when there is none, or when the
+destination can't be listed. It reads the destination from `VIGIL_BACKUP_DIR`,
+else from the installed plist's `EnvironmentVariables`; it skips only while
+neither exists, and once the plist is installed an unparseable plist, a missing
+key, the `__BACKUP_DESTINATION__` placeholder or an unreachable destination all
+fail.
 
 Run by hand: `VIGIL_BACKUP_DIR=/path/to/dest uv run python cli/vigil backup`
 (`--keep-days N`, `--data-dir DIR`).
@@ -497,26 +508,44 @@ missing, corrupt or wrong-version file.
 5. Start vigild.
 
 **The drill** (run on a scratch copy, never on `~/vigil-data`). Recorded run,
-2026-10-27, scratch dirs only; the manual restore is steps 2 and 3 into a
-second scratch dir:
+2026-10-28, scratch dirs only (`$DRILL`); the manual restore is steps 2 and 3
+into a second scratch dir. The last step truncates a copy of the db.
 
 ```
 $ vigil backup
-backed up vigil-20261028T033605Z.db and vigil-20261028T033605Z.vault
+backed up vigil-20261028T101303Z.db and vigil-20261028T101303Z.vault
+[exit 0]
 $ ls -l dest
--rw-------  1 thomasbardhi  wheel  167936 Oct 27 23:36 vigil-20261028T033605Z.db
--rw-------  1 thomasbardhi  wheel      16 Oct 27 23:36 vigil-20261028T033605Z.marker
-drwxr-xr-x  3 thomasbardhi  wheel      96 Oct 27 23:36 vigil-20261028T033605Z.vault
-$ vigil restore <db>
-vigil-20261028T033605Z.db passes integrity_check, user_version 14
+total 336
+-rw-------  1 owner group  167936 Oct 28 06:13 vigil-20261028T101303Z.db
+-rw-------  1 owner group      16 Oct 28 06:13 vigil-20261028T101303Z.marker
+drwxr-xr-x  4 owner group     128 Oct 28 06:13 vigil-20261028T101303Z.vault
+[exit 0]
+$ vigil restore <dest db>
+vigil-20261028T101303Z.db passes integrity_check, user_version 14
+[exit 0]
 $ cp <db> restored/vigil.db; cp -R dest/vigil-*.vault restored/vault
+[exit 0]
 $ vigil restore restored/vigil.db
 vigil.db passes integrity_check, user_version 14
+[exit 0]
 $ sqlite3 restored/vigil.db "PRAGMA integrity_check; PRAGMA user_version; SELECT count(*) FROM jobs"
 ok
 14
 3
-$ diff -r src/vault restored/vault      # identical
+[exit 0]
+$ diff -r src/vault restored/vault && echo identical
+identical
+[exit 0]
+$ freshness(dest, now=now)
+(True, 'newest set 20261028T101303Z, 0h old')
+[exit 0]
+$ freshness(dest, now=now + 37h)
+(False, 'newest set 20261028T101303Z, 37h old')
+[exit 0]
+$ vigil restore truncated.db
+backup failed verification: not a readable database: database disk image is malformed
+[exit 1]
 ```
 
 `vigil doctor` has no `--data-dir`: it checks credentials and dependencies,
