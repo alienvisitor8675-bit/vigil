@@ -546,6 +546,25 @@ refused in code, before anything runs, with a reason on a Resume page.
 doing now; nothing runs there until the transfer is built (bench slice 1b
 needs it).
 
+### Submit and kill a batch
+
+`POST /api/batch` (admin) makes up to 10 jobs at once. The body is a name and a list of
+job requests, each exactly what `POST /api/jobs` takes (`repo`, `title`, `request`, `why`,
+`value`, `risk`, and optionally `base`, `notes`, `labels`, `issue`):
+
+```json
+{"name": "docs sweep", "jobs": [
+  {"repo": "thomasbardhi01/vigil", "title": "...", "request": "...", "why": "...", "value": 3, "risk": 1}
+]}
+```
+
+It is all or none: if any job is refused, the answer is a 422 whose errors name it
+(`jobs[1]: ...`) and no job exists. On success you get `{"batch_id", "name", "jobs"}`; each
+job waits for its spec and your approval in the inbox as any job does, and the WIP limit
+decides how many run at once. `GET /api/batch/<id>` shows each job's state and cost and the
+total (spent plus held). `POST /api/batch/<id>/kill` kills every job in it, through the job
+kill below; it answers 200 with each job's result, and any job whose kill failed is listed under `failed`: run it again to finish those.
+
 ### Kill a job
 
 `vigil kill <job>` stops a job cleanly, whatever it is doing. It needs `VIGIL_API_TOKEN`

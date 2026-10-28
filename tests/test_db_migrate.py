@@ -221,3 +221,22 @@ def test_one_live_job_per_issue_is_a_unique_index(tmp_path: Path) -> None:
     store.create_job(repo="o/other", base="main", title="t", request="r", notes=[], issue=5)
     store.x("UPDATE jobs SET state='abandoned' WHERE id=?", (first.id,))
     store.create_job(repo="o/r", base="main", title="t", request="r", notes=[], issue=5)
+
+
+def test_the_batch_step_is_the_last_one_and_idempotent(tmp_path: Path) -> None:
+    """Batch (#54): the step is appended last, adds `jobs.batch_id` and the batches table to
+    a database from before, keeps its rows, and runs twice."""
+    assert db.MIGRATIONS[-1].__name__ == "_m16_batches"
+    path = tmp_path / "batch.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db.SCHEMA)
+    assert "batch_id" not in {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    conn.commit()
+    conn.close()
+    store = Store.open(path)
+    assert "batch_id" in _cols(store, "jobs") and "name" in _cols(store, "batches")
+    db.migrate(store.conn)
+    db.migrate(store.conn)
+    assert store.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)
+    job = store.create_job(repo="o/r", base="main", title="t", request="r", notes=[])
+    assert store.get_job(job.id).batch_id is None  # a job from before is in no batch

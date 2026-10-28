@@ -463,6 +463,18 @@ def _m15_replays(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS replays_session ON replays(session_id)")
 
 
+BATCH_DDL = f"""CREATE TABLE IF NOT EXISTS batches (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL, {PROV})"""
+
+
+def _m16_batches(conn: sqlite3.Connection) -> None:
+    """Batch (#54): a batch is a name and an id; each of its jobs carries `batch_id`.
+    Jobs from before are in no batch (NULL)."""
+    _create(conn, BATCH_DDL)
+    _add_columns(conn, "jobs", {"batch_id": "TEXT"})
+    conn.execute("CREATE INDEX IF NOT EXISTS jobs_batch ON jobs(batch_id)")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
@@ -479,6 +491,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m13_eval_only,
     _m14_experiment_pool,
     _m15_replays,
+    _m16_batches,
 ]
 
 
@@ -697,7 +710,29 @@ class Store:
         parent_job_id: str | None = None,
         provenance: Provenance | str = Provenance.HUMAN,
         issue: int | None = None,
+        batch_id: str | None = None,
     ) -> Job:
+        with self.tx() as c:
+            job_id = self._insert_job(
+                c, repo, base, title, request, notes, source, parent_job_id, provenance, issue,
+                batch_id,
+            )  # fmt: skip
+        return self.get_job(job_id)
+
+    def _insert_job(
+        self,
+        c: sqlite3.Connection,
+        repo: str,
+        base: str,
+        title: str,
+        request: str,
+        notes: list[str],
+        source: str,
+        parent_job_id: str | None,
+        provenance: Provenance | str,
+        issue: int | None,
+        batch_id: str | None,
+    ) -> str:
         if (source == "bench") != is_bench_repo(repo):
             raise ValueError(
                 f"a bench job lives on a bench/ repo and only there: {source!r} on {repo!r}"
@@ -711,33 +746,70 @@ class Store:
                 raise FixDepthExceeded(f"fix-job depth {depth} exceeds {MAX_FIX_DEPTH}")
         prefix = ID_PREFIX.sub("", repo.split("/")[-1].lower())[:2] or "jb"
         now = iso()
+        n = c.execute("SELECT COUNT(*) FROM jobs WHERE id LIKE ?", (f"{prefix}-%",)).fetchone()
+        job_id = f"{prefix}-{int(n[0]) + 1:04d}"
+        c.execute(
+            "INSERT INTO jobs (id, repo, base, title, request, notes, source, state,"
+            " blocked_from, parent_job_id, fix_depth, coord_session_id, created_at,"
+            " updated_at, provenance, issue, batch_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                job_id,
+                repo,
+                base,
+                title,
+                request,
+                _j(notes),
+                source,
+                JobState.SPEC_PENDING.value,
+                None,
+                parent_job_id,
+                depth,
+                None,
+                now,
+                now,
+                require(provenance).value,
+                issue,
+                batch_id,
+            ),
+        )
+        return job_id
+
+    def create_batch(self, name: str, jobs: list[dict[str, Any]]) -> tuple[str, list[str]]:
+        """A batch and all its jobs in one transaction (#54): every job is made or none,
+        and a failure (say a live issue) rolls the batch back. `jobs` are `create_job`'s
+        arguments without `batch_id`, plus an optional `intake` (text), stored as the job's
+        `intake.json` in the same transaction. Returns the batch id and the job ids, in order."""
         with self.tx() as c:
-            n = c.execute("SELECT COUNT(*) FROM jobs WHERE id LIKE ?", (f"{prefix}-%",)).fetchone()
-            job_id = f"{prefix}-{int(n[0]) + 1:04d}"
+            n = c.execute("SELECT COUNT(*) FROM batches").fetchone()
+            batch_id = f"b-{int(n[0]) + 1:04d}"
             c.execute(
-                "INSERT INTO jobs (id, repo, base, title, request, notes, source, state,"
-                " blocked_from, parent_job_id, fix_depth, coord_session_id, created_at,"
-                " updated_at, provenance, issue) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    job_id,
-                    repo,
-                    base,
-                    title,
-                    request,
-                    _j(notes),
-                    source,
-                    JobState.SPEC_PENDING.value,
-                    None,
-                    parent_job_id,
-                    depth,
-                    None,
-                    now,
-                    now,
-                    require(provenance).value,
-                    issue,
-                ),
+                "INSERT INTO batches (id, name, created_at, provenance) VALUES (?,?,?,?)",
+                (batch_id, name, iso(), Provenance.HUMAN.value),
             )
-        return self.get_job(job_id)
+            ids: list[str] = []
+            for item in jobs:
+                spec = dict(item)
+                intake = spec.pop("intake", None)
+                job_id = self._insert_job(
+                    c, spec["repo"], spec["base"], spec["title"], spec["request"], spec["notes"],
+                    spec.get("source", "human"), None, Provenance.HUMAN, spec.get("issue"),
+                    batch_id,
+                )  # fmt: skip
+                if intake is not None:
+                    self.add_artifact(job_id, "intake.json", intake, Provenance.HUMAN)
+                ids.append(job_id)
+        return batch_id, ids
+
+    def get_batch(self, batch_id: str) -> dict[str, Any]:
+        rows = self.q("SELECT id, name, created_at FROM batches WHERE id=?", (batch_id,))
+        if not rows:
+            raise KeyError(batch_id)
+        return dict(rows[0])
+
+    def batch_job_ids(self, batch_id: str) -> list[str]:
+        rows = self.q("SELECT id FROM jobs WHERE batch_id=? ORDER BY created_at, id", (batch_id,))
+        return [str(r["id"]) for r in rows]
 
     def live_job_for_issue(self, repo: str, issue: int) -> str | None:
         """The id of the job of `repo` holding GitHub issue `issue` (any state but
@@ -775,6 +847,7 @@ class Store:
             provenance=r["provenance"],
             blocked_on=r["blocked_on"],
             issue=r["issue"],
+            batch_id=r["batch_id"],
         )
 
     def list_jobs(self) -> list[Job]:

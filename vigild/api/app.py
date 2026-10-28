@@ -25,6 +25,7 @@ from vigild.api.auth import (
     require,
 )
 from vigild.db import Store
+from vigild.jobs.batch import MAX_JOBS, batch_view
 from vigild.jobs.fsm import KILL_CHANNELS, Actor
 from vigild.jobs.service import (
     BadNote,
@@ -208,6 +209,55 @@ def kill_job(
             500,
             f"kill failed at {e}. The job is abandoned; kill it again to finish.",
         ) from e
+
+
+# --- batches (issue #54) ---------------------------------------------------------
+
+
+class BatchBody(BaseModel):
+    """`POST /api/batch`: a name and 1 to 10 job requests, as `POST /api/jobs` takes them."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    jobs: list[JobRequest] = Field(min_length=1, max_length=MAX_JOBS)
+
+
+@router.post("/api/batch", dependencies=[ADMIN], status_code=202)
+def submit_batch(request: Request, body: BatchBody) -> dict[str, Any]:
+    """All of the batch's jobs are made or none: a refusal is a 422 whose errors name the item
+    (`jobs[i]: ...`). Each job is an ordinary one with `batch_id` set; WIP is unchanged."""
+    try:
+        batch_id, ids = _svc(request).jobs.submit_batch(body.name, body.jobs)
+    except SubmitError as e:
+        raise HTTPException(422, {"errors": e.reasons}) from e
+    return {"batch_id": batch_id, "name": body.name, "jobs": ids}
+
+
+@router.get("/api/batch/{batch_id}", dependencies=[READ])
+def get_batch(request: Request, batch_id: str) -> dict[str, Any]:
+    """Per-job state and cost, and the batch total: spent plus held."""
+    try:
+        return batch_view(_svc(request).store, batch_id)
+    except KeyError as e:
+        raise HTTPException(404, "no such batch") from e
+
+
+@router.post("/api/batch/{batch_id}/kill", dependencies=[ADMIN])
+def kill_batch(
+    request: Request, batch_id: str, body: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
+    """Kill every job of the batch, each through the job kill (`{"channel": "api" | "cli"}`,
+    default `api`). Per-job answers are the job kill's; one that fails is listed under
+    `failed`; the answer is still 200 (kill the batch again to finish those)."""
+    channel = (body or {}).get("channel", request.state.channel)
+    if not isinstance(channel, str) or channel not in KILL_CHANNELS:
+        raise HTTPException(422, f"channel must be one of {list(KILL_CHANNELS)}")
+    try:
+        out = _svc(request).jobs.kill_batch(batch_id, Actor.OWNER, channel)
+    except NotFound as e:
+        raise HTTPException(404, "no such batch") from e
+    return _plain(out)  # type: ignore[no-any-return]
 
 
 # --- the inbox --------------------------------------------------------------------

@@ -407,10 +407,8 @@ class JobService:
         self.runner.on_job_created(job.id, False)
         return SubmitOutcome("spec_pending", task.task_id, job.id)
 
-    def submit_request(self, req: JobRequest, *, issue: dict[str, Any] | None = None) -> Job:
-        """A free-form request becomes a job its coord drafts. `issue` (label
-        intake, plan 2a item 2) is the GitHub issue it came from: stored as
-        `issue.json` before the coord starts, and fenced in its packet."""
+    def _validate_request(self, req: JobRequest) -> None:
+        """What `POST /api/jobs` checks before it makes a job (repo, first call, intake)."""
         self._not_bench(req.repo, req.source)
         try:
             self.cfg.repo(req.repo)
@@ -418,6 +416,76 @@ class JobService:
         except ConfigError as e:
             raise SubmitError([str(e)]) from e
         self._intake(req.model_dump(mode="json"), [])
+
+    def submit_batch(self, name: str, reqs: list[JobRequest]) -> tuple[str, list[str]]:
+        """Batch (#54): every request goes through the checks of `submit_request`, and the jobs
+        are made together or not at all. A refusal names the item (`jobs[i]`) and creates
+        nothing. The scheduler and the WIP limit are not involved: each job's coord starts as
+        for any job. Returns the batch id and its job ids."""
+        errors: list[str] = []
+        seen: dict[tuple[str, int], int] = {}
+        for i, req in enumerate(reqs):
+            try:
+                self._validate_request(req)
+            except SubmitError as e:
+                errors += [f"jobs[{i}]: {r}" for r in e.reasons]
+            if req.issue is not None:
+                key = (req.repo, req.issue)
+                held = self.store.live_job_for_issue(*key)
+                if key in seen:
+                    errors.append(f"jobs[{i}]: issue {req.issue} is also in jobs[{seen[key]}]")
+                elif held is not None:
+                    errors.append(f"jobs[{i}]: issue {req.issue} is already job {held}")
+                seen.setdefault(key, i)
+        if errors:
+            raise SubmitError(errors)
+        items = [
+            {
+                "repo": r.repo,
+                "base": r.base,
+                "title": r.title,
+                "request": r.request,
+                "notes": r.notes,
+                "source": r.source.value,
+                "issue": r.issue,
+                "intake": r.model_dump_json(),
+            }
+            for r in reqs
+        ]
+        try:
+            batch_id, ids = self.store.create_batch(name, items)
+        except sqlite3.IntegrityError as e:  # jobs_live_issue: the database is the check
+            raise SubmitError([f"a job's issue is held by a live job ({e})"]) from e
+        for job_id in ids:
+            self.runner.on_job_created(job_id, True)
+        return batch_id, ids
+
+    def kill_batch(self, batch_id: str, actor: Actor, channel: str) -> dict[str, Any]:
+        """Kill every job of a batch, each through `kill` (#52). One that fails does not stop
+        the rest; its entry carries the `error` and the answer's `failed` lists it."""
+        try:
+            self.store.get_batch(batch_id)
+        except KeyError as e:
+            raise NotFound(batch_id) from e
+        if channel not in KILL_CHANNELS:
+            raise Conflict(f"a kill comes from {' or '.join(KILL_CHANNELS)}, not {channel!r}")
+        out: list[dict[str, Any]] = []
+        for job_id in self.store.batch_job_ids(batch_id):
+            try:
+                out.append(self.kill(job_id, actor, channel))
+            except (KillFailed, Conflict) as e:
+                out.append({"job_id": job_id, "killed": False, "error": str(e)})
+        return {
+            "batch_id": batch_id,
+            "jobs": out,
+            "failed": [j["job_id"] for j in out if "error" in j],
+        }
+
+    def submit_request(self, req: JobRequest, *, issue: dict[str, Any] | None = None) -> Job:
+        """A free-form request becomes a job its coord drafts. `issue` (label
+        intake, plan 2a item 2) is the GitHub issue it came from: stored as
+        `issue.json` before the coord starts, and fenced in its packet."""
+        self._validate_request(req)
         try:
             job = self.store.create_job(
                 repo=req.repo,

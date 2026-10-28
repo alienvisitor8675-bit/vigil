@@ -57,6 +57,7 @@ class Job:
     provenance: str
     blocked_on: str | None = None  # a deps job this one waits for (round 3)
     issue: int | None = None  # the GitHub issue in this repo it answers, if any
+    batch_id: str | None = None  # the batch it was submitted in, if any (#54)
 
 
 @dataclass
