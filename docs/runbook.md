@@ -437,38 +437,6 @@ round, so the second trips routing rule 5 as any fix round does; the 200 then ca
 event. A task that has used its `routing.escalate_review_rounds` (2) is refused with a
 409: replan, or merge as is. Only a `ready` job takes a fix (an `in_review` one is refused).
 
-### Review dry run
-
-Rerun the reviewer on a past task to see what a changed prompt would say, with no
-effects on `~/vigil-data`: the database is opened read-only, the vault and mirror are
-read through gitsafe, and the run happens in a scratch data dir (default: a new temp
-dir) with its own database and gateway. It changes no job or task, makes no inbox item
-or PR, calls no GitHub. It uses the task's existing session image, so run vigild once
-first if the dev image is stale. It needs port 8788 for its gateway: **stop vigild
-first**.
-
-**The run's real spend is NOT recorded in the production ledger.** Its calls are
-metered in the scratch database only, so add the printed cost to your own records. The
-tool prints `COST $X.XXXX: NOT recorded in the production ledger; add it to your
-records` and puts `cost_usd` in the JSON. To keep the caps true, it first seeds the
-scratch ledger from the source database (read-only): this month's spend, the task's
-spend and every open reservation. The $5 day, $2 task and $100 month caps then bite as
-in production, and the tool refuses before any call if the run doesn't fit. The run
-itself is capped at `review_session_usd` ($0.40; about $0.10 for a review).
-
-```sh
-uv run python scripts/review-dry-run.py --data-dir ~/vigil-data --job pa-0003 \
-  --task pa-0003-w1 --head 5e57b155fdef46d266fd768492fd6094f3c1da89 \
-  --out ~/review-dry/pa-0003-w1.json --repo-visibility public
-```
-
-vigild's own loader reads the env file for the Anthropic key; you pass no secret.
-GitHub isn't asked for the repo's visibility, so you state it (`--repo-visibility`,
-default `private`, which refuses a hosted backend the repo's policy doesn't list;
-`public` is refused for a repo whose entry lists only private-safe backends).
-`--head` defaults to the latest `pr_open` event's head. The verdict and findings are
-printed and written to `--out`, which must not be under the data dir.
-
 ### Check everything
 
 ```sh

@@ -42,7 +42,6 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -180,27 +179,6 @@ def as_outcome(run: dict[str, Any] | None) -> TestOutcome:
     if got in ("fail", "timeout"):
         return TestOutcome.FAIL
     return TestOutcome.UNKNOWN
-
-
-@dataclass
-class ReviewInputs:
-    """What one review is built from (`JobRunner._review_inputs`)."""
-
-    task: Task
-    shape: Any
-    level: Any
-    rf: bool
-    rung: int
-    reviewer: str
-    auditor: str
-    rnd: int
-    audit_required: bool
-    base_sha: str
-    diff: str
-    request: dict[str, Any]
-    untrusted: dict[str, str]
-    rules: str
-    packet: Any
 
 
 class JobRunner:
@@ -3526,18 +3504,20 @@ class JobRunner:
             log.exception("review of %s failed", t.id)
             return "failed", f"vigild error: {type(e).__name__}: {e}"[:1000]
 
-    def _review_inputs(self, job: Any, t: Any, head: str) -> ReviewInputs:
-        """Everything a review of `head` is built from, read from vigild's own
-        record and the vault; no write. The dry-run tool (`vigild/reviewdry.py`)
-        calls this too, so a rerun builds the packet a real review would."""
+    def _review_one(self, job: Any, t: Any) -> tuple[str, Any]:
+        head = self._task_head(t.id)
+        if head is None:
+            return "failed", "no published head"
         task = Task.model_validate(t.contract)
         shape = classify_shape(task, self.cfg)
         level = task.spec.verify.level
         tests = self.store.get_artifact(job.id, "tests.json", t.id)
         # the verifier's own record says whether the task changes how tests run
         rf = bool(tests and json.loads(tests.content).get("runner_files"))
+        rung = self.ladder.rung(shape, runner_file=rf)
         reviewer, auditor = self.ladder.presets(shape, runner_file=rf)
         rnd = task.review_rounds + 1
+        audit_required = self.ladder.should_audit(shape, level, runner_file=rf)
         base_sha = self.workspace.base_sha(t.id)
         diff = self.workspace.full_diff(job.repo, base_sha, head)
         spec_md = self.store.get_artifact(job.id, "spec.md")
@@ -3557,35 +3537,11 @@ class JobRunner:
             "the worker's report": report.content if report else "(none)",
         }
         rules = self.workspace.read_blob(job.repo, base_sha, "CLAUDE.md") or ""  # the base's
-        return ReviewInputs(
-            task=task, shape=shape, level=level, rf=rf,
-            rung=self.ladder.rung(shape, runner_file=rf),
-            reviewer=reviewer, auditor=auditor, rnd=rnd,
-            audit_required=self.ladder.should_audit(shape, level, runner_file=rf),
-            base_sha=base_sha, diff=diff, request=request, untrusted=untrusted, rules=rules,
-            packet=assemble_review(rules, request, diff=diff, untrusted=untrusted),
+        packet = assemble_review(rules, request, diff=diff, untrusted=untrusted)
+        out, why = self._read_only_session(
+            job, t, Role.REVIEWER, reviewer, head, base_sha, rnd, packet.text, ReviewOutput,
+            self.cfg.budgets.review_session_usd, shape.value,
         )  # fmt: skip
-
-    def _review_session(
-        self, job: Any, t: Any, head: str, ri: ReviewInputs
-    ) -> tuple[ReviewOutput | AuditOutput | None, str]:
-        """The reviewer's one read-only session on `head`."""
-        return self._read_only_session(
-            job, t, Role.REVIEWER, ri.reviewer, head, ri.base_sha, ri.rnd, ri.packet.text,
-            ReviewOutput, self.cfg.budgets.review_session_usd, ri.shape.value,
-        )  # fmt: skip
-
-    def _review_one(self, job: Any, t: Any) -> tuple[str, Any]:
-        head = self._task_head(t.id)
-        if head is None:
-            return "failed", "no published head"
-        ri = self._review_inputs(job, t, head)
-        task, shape, level, rf, rung = ri.task, ri.shape, ri.level, ri.rf, ri.rung
-        reviewer, auditor, rnd, audit_required = ri.reviewer, ri.auditor, ri.rnd, ri.audit_required
-        base_sha, diff, request, untrusted, rules = (
-            ri.base_sha, ri.diff, ri.request, ri.untrusted, ri.rules,
-        )  # fmt: skip
-        out, why = self._review_session(job, t, head, ri)
         if out is None:
             return "failed", f"no valid review.json: {why}"
         assert isinstance(out, ReviewOutput)
