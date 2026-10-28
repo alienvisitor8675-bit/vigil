@@ -477,46 +477,47 @@ key only you hold.
 Run by hand: `VIGIL_BACKUP_DIR=/path/to/dest uv run python cli/vigil backup`
 (`--keep-days N`, `--data-dir DIR`).
 
-**Check a backup** (writes nothing):
+**Check a backup** (verify only, writes nothing):
 `uv run python cli/vigil restore /path/to/dest/vigil-<stamp>.db`. It opens
 the file read-only, runs `PRAGMA integrity_check` and compares
 `user_version` with the code's migration count; it exits 1 and says why on a
 missing, corrupt or wrong-version file.
 
-**Restore**: stop vigild, then
-`uv run python cli/vigil restore --no-dry-run --target <empty dir> <db>`.
-It refuses a target that already holds `vigil.db`, the live data dir unless
-`--allow-live`, and the live dir while vigild is listening. To go live, move
-the restored dir into place by hand after checking it.
+**Restore** (manual; there is no automated restore):
+
+1. Stop vigild.
+2. Move `vigil.db`, `vigil.db-wal`, `vigil.db-shm` and `vault/` out of the
+   data dir to a safe place (do not delete them).
+3. Copy the backup's `vigil-<stamp>.db` to `<data>/vigil.db` (mode 600) and
+   `vigil-<stamp>.vault/` to `<data>/vault`.
+4. Run `uv run python cli/vigil restore <data>/vigil.db` to verify the copy.
+5. Start vigild.
 
 **The drill** (run on a scratch copy, never on `~/vigil-data`). Recorded run,
-2026-10-27, scratch dirs only:
+2026-10-27, scratch dirs only; the manual restore is steps 2 and 3 into a
+second scratch dir:
 
 ```
 $ vigil backup
-backed up vigil-20261028T025710Z.db and vigil-20261028T025710Z.vault
+backed up vigil-20261028T033605Z.db and vigil-20261028T033605Z.vault
 $ ls -l dest
--rw-------  1 thomasbardhi  wheel  167936 Oct 27 22:57 vigil-20261028T025710Z.db
-drwxr-xr-x  3 thomasbardhi  wheel      96 Oct 27 22:56 vigil-20261028T025710Z.vault
-$ vigil restore <db>              # dry run
-vigil-20261028T025710Z.db passes integrity_check, user_version 14
-dry run: would restore into <scratch>/src; nothing written
-$ vigil restore --no-dry-run --target restored <db>
-restored into <scratch>/restored
+-rw-------  1 thomasbardhi  wheel  167936 Oct 27 23:36 vigil-20261028T033605Z.db
+-rw-------  1 thomasbardhi  wheel      16 Oct 27 23:36 vigil-20261028T033605Z.marker
+drwxr-xr-x  3 thomasbardhi  wheel      96 Oct 27 23:36 vigil-20261028T033605Z.vault
+$ vigil restore <db>
+vigil-20261028T033605Z.db passes integrity_check, user_version 14
+$ cp <db> restored/vigil.db; cp -R dest/vigil-*.vault restored/vault
+$ vigil restore restored/vigil.db
+vigil.db passes integrity_check, user_version 14
 $ sqlite3 restored/vigil.db "PRAGMA integrity_check; PRAGMA user_version; SELECT count(*) FROM jobs"
 ok
 14
 3
 $ diff -r src/vault restored/vault      # identical
-$ vigil restore --no-dry-run --target <live dir> <db>
-restore refused: <scratch>/src is the live data dir; pass --allow-live to restore into it
 ```
 
-Steps: seed a scratch data dir (`Store.open` plus a vault file), back it up,
-restore into a second scratch dir, run `integrity_check`. `vigil doctor`
-has no `--data-dir`: it checks credentials and dependencies, not a data dir,
-so it can't be pointed at the restored copy; step 3 of the issue's drill
-(one dry-run job) needs a running scratch vigild and is not covered here.
+`vigil doctor` has no `--data-dir`: it checks credentials and dependencies,
+not a data dir, so it can't be pointed at the restored copy.
 
 ### Keep development off the production data
 

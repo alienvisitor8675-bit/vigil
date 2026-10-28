@@ -349,13 +349,14 @@ from host config (`--dest` or `VIGIL_BACKUP_DIR`; never in the repo, the data
 dir or `~/.config/vigil/`): `vigil-<UTC stamp>.db`, a SQLite online backup of
 `vigil.db` made under umask 077 (mode 600 from creation, consistent while
 vigild writes), and `vigil-<stamp>.vault/`, an rsync of `vault/`. It prunes
-sets older than 14 days, touching only names of that pattern. It never reads
+sets older than 14 days. Each set has a `vigil-<stamp>.marker` file; prune
+removes only sets with the marker, so a person's own file is never touched. The
+source DB is opened read-only (no `-wal`/`-shm` created) and the vault rsync
+uses `--safe-links --no-specials --no-devices` (exit 24 is a warning). It never reads
 the secrets directory; that is backed up separately, encrypted, by the owner.
-`vigil restore <db>` is a dry run by default: it opens the file read-only,
-runs `PRAGMA integrity_check`, and compares `user_version` with
-`len(MIGRATIONS)`. A real restore (`--no-dry-run --target DIR`) writes only
-into an empty dir, refuses the live data dir without `--allow-live`, and
-refuses that while vigild is listening. Code: `vigild/backup.py`.
+`vigil restore <db>` only verifies: it opens the file read-only, runs
+`PRAGMA integrity_check`, and compares `user_version` with `len(MIGRATIONS)`.
+There is no automated restore; the runbook has the manual steps. Code: `vigild/backup.py`.
 
 Every record table carries `provenance: claude | local | human`, enforced
 by a CHECK constraint. `human` means not model output: you, or vigild's own

@@ -1,12 +1,14 @@
-"""`vigil backup` and `vigil restore`: the durability story until there is a
-second machine (issue #23).
+"""`vigil backup` and `vigil restore` (verify only; issue #23): the durability
+story until there is a second machine.
 
-A backup *set* is two siblings in the destination, named by UTC time:
+A backup *set* is in the destination, named by UTC time:
 `vigil-YYYYMMDDTHHMMSSZ.db` (SQLite online backup of `<data>/vigil.db`, mode
-600) and `vigil-YYYYMMDDTHHMMSSZ.vault/` (rsync of `<data>/vault/`). Retention
-and pruning touch only names matching that pattern. This module never opens
-anything under `~/.config/vigil/`; the destination comes from the host
-(`--dest` or `VIGIL_BACKUP_DIR`), never from the repo.
+600), `vigil-YYYYMMDDTHHMMSSZ.vault/` (rsync of `<data>/vault/`) and
+`vigil-YYYYMMDDTHHMMSSZ.marker` (holds the run id). Retention prunes only sets
+that have the marker, so a person's own file with a matching name is never
+removed. A set is built in `.vigil-<stamp>.tmp/` (marker inside) and moved out.
+This module never opens anything under `~/.config/vigil/`; the destination
+comes from the host (`--dest` or `VIGIL_BACKUP_DIR`), never from the repo.
 """
 
 from __future__ import annotations
@@ -14,19 +16,26 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 from vigild.db import MIGRATIONS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SECRETS_DIR = Path.home() / ".config" / "vigil"
-_SET = re.compile(r"^vigil-(\d{8}T\d{6}Z)\.(db|vault)$")
+_STAMP = r"\d{8}T\d{6}Z"
+_MARKER = re.compile(rf"^vigil-({_STAMP})\.marker$")
+_TMP = re.compile(rf"^\.vigil-{_STAMP}\.tmp$")
+TMP_MARKER = ".vigil-backup"
+RSYNC_VANISHED = 24
+RSYNC_FLAGS = ["-a", "--safe-links", "--no-specials", "--no-devices"]
 
 
 class BackupError(Exception):
@@ -37,6 +46,7 @@ class BackupError(Exception):
 class BackupSet:
     db: Path
     vault: Path
+    warnings: list[str] = field(default_factory=list)
 
 
 @contextlib.contextmanager
@@ -61,6 +71,8 @@ def _check_dest(data: Path, dest: Path) -> Path:
     ):
         if _inside(dest, bad):
             raise BackupError(f"destination {dest} is inside {name}")
+        if _inside(bad, dest):
+            raise BackupError(f"destination {dest} contains {name}")
     return dest
 
 
@@ -78,70 +90,106 @@ def run_backup(
     dest = _check_dest(data, dest)
     now = (now or datetime.now(UTC)).astimezone(UTC)
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    run_id = secrets.token_hex(8)
+    warnings: list[str] = []
     with _umask(0o077):
         dest.mkdir(parents=True, exist_ok=True)
         os.chmod(dest, 0o700)
+        _clean_tmp(dest)
         final_db = dest / f"vigil-{stamp}.db"
         final_vault = dest / f"vigil-{stamp}.vault"
-        if final_db.exists() or final_vault.exists():
+        final_marker = dest / f"vigil-{stamp}.marker"
+        if final_db.exists() or final_vault.exists() or final_marker.exists():
             raise BackupError(f"backup set {stamp} already exists")
-        tmp = dest / f".vigil-{stamp}.db.tmp"
-        tmp.unlink(missing_ok=True)
-        # The online backup API: consistent while vigild writes. The umask
-        # makes sqlite create the file 600; there is no wider window.
-        s = sqlite3.connect(str(src), timeout=30)
-        d = sqlite3.connect(str(tmp))
+        work = dest / f".vigil-{stamp}.tmp"
+        work.mkdir()
+        (work / TMP_MARKER).write_text(run_id)
         try:
-            s.backup(d)
-            d.execute("PRAGMA journal_mode=DELETE")
-            d.commit()
+            _copy_db(src, work / "db")
+            warnings += _copy_vault(data / "vault", work / "vault")
+            os.rename(work / "vault", final_vault)
+            os.rename(work / "db", final_db)
+            (work / TMP_MARKER).rename(final_marker)  # last: the set is complete
         except BaseException:
-            d.close()
-            s.close()
-            tmp.unlink(missing_ok=True)
+            for p in (final_db, final_vault, final_marker):
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink(missing_ok=True)
             raise
-        d.close()
-        s.close()
-        os.chmod(tmp, 0o600)
-        vault_src = data / "vault"
-        tmp_vault = dest / f".vigil-{stamp}.vault.tmp"
-        shutil.rmtree(tmp_vault, ignore_errors=True)
-        tmp_vault.mkdir()
-        if vault_src.is_dir():
-            r = subprocess.run(
-                ["rsync", "-a", "--", f"{vault_src}/", f"{tmp_vault}/"],
-                capture_output=True,
-                text=True,
-            )
-            if r.returncode != 0:
-                tmp.unlink(missing_ok=True)
-                shutil.rmtree(tmp_vault, ignore_errors=True)
-                raise BackupError(f"rsync failed ({r.returncode}): {r.stderr.strip()[:300]}")
-        os.rename(tmp_vault, final_vault)
-        os.rename(tmp, final_db)  # the .db appears last: a set with a .db is complete
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
     if keep_days is not None:
         prune(dest, keep_days, now=now)
-    return BackupSet(final_db, final_vault)
+    return BackupSet(final_db, final_vault, warnings)
+
+
+def _copy_db(src: Path, out: Path) -> None:
+    # Read-only source (mode=ro): a backup never creates -wal/-shm in the data
+    # dir. The online backup API is consistent while vigild writes. The umask
+    # makes sqlite create the file 600; there is no wider window.
+    # With no -wal/-shm beside it nobody has the file open, so immutable=1 keeps
+    # a read-only WAL reader from creating them; with them, vigild is live and
+    # they already exist.
+    live = any(src.with_name(src.name + sfx).exists() for sfx in ("-wal", "-shm"))
+    flags = "mode=ro" if live else "mode=ro&immutable=1"
+    s = sqlite3.connect(f"file:{quote(str(src))}?{flags}", uri=True, timeout=30)
+    d = sqlite3.connect(str(out))
+    try:
+        s.backup(d)
+        d.execute("PRAGMA journal_mode=DELETE")
+        d.commit()
+    finally:
+        d.close()
+        s.close()
+    os.chmod(out, 0o600)
+
+
+def _copy_vault(vault_src: Path, out: Path) -> list[str]:
+    out.mkdir()
+    if not vault_src.is_dir():
+        return []
+    r = subprocess.run(
+        ["rsync", *RSYNC_FLAGS, "--", f"{vault_src}/", f"{out}/"],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode == RSYNC_VANISHED:
+        return ["rsync: some files vanished while copying (the vault changed underneath)"]
+    if r.returncode != 0:
+        raise BackupError(f"rsync failed ({r.returncode}): {r.stderr.strip()[:300]}")
+    return []
+
+
+def _clean_tmp(dest: Path) -> None:
+    """Remove leftovers of failed runs: `.vigil-<stamp>.tmp/` dirs that hold
+    this tool's marker. Anything else is not ours."""
+    for p in dest.iterdir():
+        if _TMP.match(p.name) and p.is_dir() and not p.is_symlink() and (p / TMP_MARKER).is_file():
+            shutil.rmtree(p, ignore_errors=True)
 
 
 def prune(dest: Path, keep_days: int, *, now: datetime) -> list[Path]:
-    """Remove dated sets older than `keep_days`; nothing else in `dest`."""
+    """Remove dated sets older than `keep_days`, only those with the marker."""
     cutoff = now - timedelta(days=keep_days)
     removed: list[Path] = []
-    for p in sorted(dest.iterdir()):
-        m = _SET.match(p.name)
-        if not m:
+    for m in sorted(dest.iterdir()):
+        mm = _MARKER.match(m.name)
+        if not mm or not m.is_file() or m.is_symlink():
             continue
-        when = datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+        when = datetime.strptime(mm.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
         if when >= cutoff:
             continue
-        if m.group(2) == "db" and p.is_file() and not p.is_symlink():
-            p.unlink()
-        elif m.group(2) == "vault" and p.is_dir() and not p.is_symlink():
-            shutil.rmtree(p)
-        else:
-            continue
-        removed.append(p)
+        db = dest / f"vigil-{mm.group(1)}.db"
+        vault = dest / f"vigil-{mm.group(1)}.vault"
+        if db.is_file() and not db.is_symlink():
+            db.unlink()
+            removed.append(db)
+        if vault.is_dir() and not vault.is_symlink():
+            shutil.rmtree(vault)
+            removed.append(vault)
+        m.unlink()
+        removed.append(m)
     return removed
 
 
@@ -168,53 +216,3 @@ def verify_backup(db: Path) -> list[str]:
     if version != len(MIGRATIONS):
         problems.append(f"user_version is {version}, expected {len(MIGRATIONS)}")
     return problems
-
-
-def vault_of(db: Path) -> Path:
-    m = _SET.match(db.name)
-    return db.with_name(f"vigil-{m.group(1)}.vault") if m else db.with_name(db.stem + ".vault")
-
-
-def restore(
-    db: Path,
-    target: Path,
-    *,
-    live_dir: Path,
-    dry_run: bool = True,
-    allow_live: bool = False,
-    running: Callable[[], bool] = lambda: False,
-) -> list[str]:
-    """Check a backup, and unless `dry_run`, copy it into `target` (a data dir).
-    Returns what it did or would do."""
-    problems = verify_backup(db)
-    if problems:
-        raise BackupError("; ".join(problems))
-    vault = vault_of(db)
-    plan = [f"{db.name} passes integrity_check, user_version {len(MIGRATIONS)}"]
-    plan.append(f"vault: {vault if vault.is_dir() else 'none in this set'}")
-    if dry_run:
-        return [*plan, f"dry run: would restore into {target}; nothing written"]
-    target = target.expanduser().resolve()
-    is_live = target == live_dir.expanduser().resolve()
-    if is_live and not allow_live:
-        raise BackupError(f"{target} is the live data dir; pass --allow-live to restore into it")
-    # A scratch target collides with nothing a running vigild holds; the live
-    # dir is the one a running vigild has open.
-    if is_live and running():
-        raise BackupError("vigild is running; stop it first")
-    if (target / "vigil.db").exists():
-        raise BackupError(f"{target / 'vigil.db'} exists; restore into an empty dir")
-    with _umask(0o077):
-        target.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(db, target / "vigil.db")
-        os.chmod(target / "vigil.db", 0o600)
-        (target / "vault").mkdir(exist_ok=True)
-        if vault.is_dir():
-            r = subprocess.run(
-                ["rsync", "-a", "--", f"{vault}/", f"{target / 'vault'}/"],
-                capture_output=True,
-                text=True,
-            )
-            if r.returncode != 0:
-                raise BackupError(f"rsync failed ({r.returncode}): {r.stderr.strip()[:300]}")
-    return [*plan, f"restored into {target}"]

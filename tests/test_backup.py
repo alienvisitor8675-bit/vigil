@@ -3,6 +3,7 @@ vault rsync, retention, and a read-only restore check."""
 
 from __future__ import annotations
 
+import builtins
 import os
 import sqlite3
 import stat
@@ -33,13 +34,26 @@ def data(tmp_path: Path) -> Path:
     return root
 
 
-def test_backup_file_is_mode_600_and_named_by_time(data: Path, tmp_path: Path) -> None:
+def test_backup_file_is_mode_600_and_named_by_time(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     dest = tmp_path / "dest"
+    real_chmod = os.chmod
+    at_chmod: list[int] = []
+
+    def spy(path: object, mode: int, *a: object, **k: object) -> None:
+        # What the file's mode is the moment before anything chmods it.
+        if Path(str(path)).is_file():
+            at_chmod.append(stat.S_IMODE(Path(str(path)).stat().st_mode))
+        real_chmod(path, mode, *a, **k)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "chmod", spy)
     old = os.umask(0o022)  # a lax caller umask must not leak into the backup
     try:
         made = backup.run_backup(data, dest, now=NOW)
     finally:
         os.umask(old)
+    assert at_chmod and set(at_chmod) == {0o600}  # 600 from the moment it exists
     assert made.db.name == "vigil-20261027T030000Z.db"
     assert stat.S_IMODE(made.db.stat().st_mode) == 0o600
     assert stat.S_IMODE(dest.stat().st_mode) == 0o700
@@ -83,6 +97,8 @@ def test_retention_prunes_only_old_sets_this_tool_made(data: Path, tmp_path: Pat
     (dest / "notes.txt").write_text("mine")
     (dest / "vigil-old.db").write_text("not a dated set")
     (dest / "vigil-20200101T000000Z.db.bak").write_text("not ours")
+    (dest / "vigil-20200101T000000Z.db").write_text("a person's own file, no marker")
+    (dest / "vigil-20200101T000000Z.vault").mkdir()
     (dest / "other").mkdir()
     made = backup.run_backup(data, dest, now=NOW, keep_days=14)
     left = sorted(p.name for p in dest.iterdir())
@@ -91,8 +107,33 @@ def test_retention_prunes_only_old_sets_this_tool_made(data: Path, tmp_path: Pat
     assert "vigil-20261012T030000Z.db" not in left  # 15 days
     assert "vigil-20261014T030000Z.db" in left  # 13 days
     assert made.db.name in left
-    for keep in ("notes.txt", "vigil-old.db", "vigil-20200101T000000Z.db.bak", "other"):
+    for keep in (
+        "notes.txt",
+        "vigil-old.db",
+        "vigil-20200101T000000Z.db.bak",
+        "vigil-20200101T000000Z.db",
+        "vigil-20200101T000000Z.vault",
+        "other",
+    ):
         assert keep in left
+    assert not [n for n in left if n.startswith("vigil-20261007") or n.startswith("vigil-20261012")]
+
+
+def test_leftover_tmp_is_cleaned_only_when_it_carries_the_marker(
+    data: Path, tmp_path: Path
+) -> None:
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    ours = dest / ".vigil-20200101T000000Z.tmp"
+    ours.mkdir()
+    (ours / ".vigil-backup").write_text("run")
+    (ours / "x.db").write_text("half")
+    theirs = dest / ".vigil-mine.tmp"
+    theirs.mkdir()
+    (theirs / "keep").write_text("mine")
+    backup.run_backup(data, dest, now=NOW)
+    assert not ours.exists()
+    assert (theirs / "keep").exists()
 
 
 def test_destination_may_not_sit_in_the_data_dir_or_repo(data: Path) -> None:
@@ -101,6 +142,53 @@ def test_destination_may_not_sit_in_the_data_dir_or_repo(data: Path) -> None:
     repo = Path(backup.__file__).resolve().parents[1]
     with pytest.raises(backup.BackupError):
         backup.run_backup(data, repo / "backups", now=NOW)
+
+
+def test_destination_may_not_contain_the_data_dir_repo_or_secrets(data: Path) -> None:
+    with pytest.raises(backup.BackupError, match="contains"):
+        backup.run_backup(data, data.parent, now=NOW)
+    with pytest.raises(backup.BackupError, match="contains"):
+        backup.run_backup(data, Path.home(), now=NOW)
+    with pytest.raises(backup.BackupError, match="contains"):
+        backup.run_backup(data, Path(backup.__file__).resolve().parents[1].parent, now=NOW)
+
+
+def test_vault_symlink_pointing_outside_is_not_followed(data: Path, tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret").write_text("do not copy")
+    (data / "vault" / "escape").symlink_to(outside)
+    (data / "vault" / "escape-file").symlink_to(outside / "secret")
+    made = backup.run_backup(data, tmp_path / "dest", now=NOW)
+    assert not (made.vault / "escape").exists() and not (made.vault / "escape").is_symlink()
+    assert not (made.vault / "escape-file").is_symlink()
+    assert not list((tmp_path / "dest").rglob("secret"))
+    assert (made.vault / "sub" / "blob").read_text() == "hello"
+
+
+def test_rsync_vanished_files_is_a_warning_other_errors_fail(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    def fake(code: int):  # type: ignore[no-untyped-def]
+        return lambda cmd, **k: subprocess.CompletedProcess(cmd, code, "", "boom")
+
+    dest = tmp_path / "dest"
+    monkeypatch.setattr(backup.subprocess, "run", fake(24))
+    made = backup.run_backup(data, dest, now=NOW)
+    assert made.warnings and made.db.is_file()
+    monkeypatch.setattr(backup.subprocess, "run", fake(23))
+    with pytest.raises(backup.BackupError, match="rsync"):
+        backup.run_backup(data, dest, now=NOW + timedelta(hours=1))
+    assert sorted(p.name for p in dest.iterdir() if "20261027T040000Z" in p.name) == []
+    assert not [p for p in dest.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_backup_leaves_the_data_dir_untouched(data: Path, tmp_path: Path) -> None:
+    before = sorted(p.name for p in data.rglob("*"))
+    backup.run_backup(data, tmp_path / "dest", now=NOW)
+    assert sorted(p.name for p in data.rglob("*")) == before  # no -wal, no -shm
 
 
 def test_missing_database_is_an_error(tmp_path: Path) -> None:
@@ -142,25 +230,6 @@ def test_dry_run_catches_missing_corrupt_and_wrong_version(data: Path, tmp_path:
     assert any("user_version" in p for p in problems)
 
 
-def test_restore_defaults_to_dry_run_and_refuses_the_live_dir(data: Path, tmp_path: Path) -> None:
-    made = backup.run_backup(data, tmp_path / "dest", now=NOW)
-    target = tmp_path / "restored"
-    backup.restore(made.db, target, live_dir=data, dry_run=True)
-    assert not target.exists()
-    with pytest.raises(backup.BackupError, match="live"):
-        backup.restore(made.db, data, live_dir=data, dry_run=False)
-    with pytest.raises(backup.BackupError, match="running"):
-        backup.restore(
-            made.db, data, live_dir=data, dry_run=False, allow_live=True, running=lambda: True
-        )
-    backup.restore(made.db, target, live_dir=data, dry_run=False)
-    assert (target / "vault" / "sub" / "blob").read_text() == "hello"
-    assert backup.verify_backup(target / "vigil.db") == []
-    assert stat.S_IMODE((target / "vigil.db").stat().st_mode) == 0o600
-    with pytest.raises(backup.BackupError, match="exists"):
-        backup.restore(made.db, target, live_dir=data, dry_run=False)
-
-
 def test_cli_backup_and_restore(
     data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -172,9 +241,11 @@ def test_cli_backup_and_restore(
     assert r.exit_code == 0, r.output
     db = next(dest.glob("vigil-*.db"))
     r = CliRunner().invoke(app, ["restore", str(db)])
-    assert r.exit_code == 0 and "dry run" in r.output, r.output
+    assert r.exit_code == 0 and "passes integrity_check" in r.output, r.output
     r = CliRunner().invoke(app, ["restore", str(tmp_path / "missing.db")])
     assert r.exit_code == 1
+    for gone in ("--no-dry-run", "--target", "--allow-live"):
+        assert CliRunner().invoke(app, ["restore", str(db), gone]).exit_code == 2
 
 
 def test_backup_never_reads_the_secrets_dir(
@@ -190,11 +261,25 @@ def test_backup_never_reads_the_secrets_dir(
         return real_open(path, *a, **k)  # type: ignore[arg-type]
 
     monkeypatch.setattr(os, "open", guard)
+    real_builtin_open = builtins.open
+
+    def guard_builtin(file: object, *a: object, **k: object):  # type: ignore[no-untyped-def]
+        if isinstance(file, (str, os.PathLike)) and str(Path(file).resolve()).startswith(
+            str(secrets)
+        ):
+            seen.append(str(file))
+        return real_builtin_open(file, *a, **k)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(builtins, "open", guard_builtin)
     monkeypatch.setattr(Path, "read_text", _guarded(Path.read_text, secrets, seen), raising=True)
     from vigil.main import app
 
     monkeypatch.setenv("VIGIL_DATA_DIR", str(data))
-    CliRunner().invoke(app, ["backup", "--dest", str(tmp_path / "dest")])
+    r = CliRunner().invoke(app, ["backup", "--dest", str(tmp_path / "dest")])
+    assert r.exit_code == 0, r.output
+    db = next((tmp_path / "dest").glob("vigil-*.db"))
+    assert backup.verify_backup(db) == []  # the verify path too
+    CliRunner().invoke(app, ["restore", str(db)])
     assert seen == []
     with pytest.raises(backup.BackupError):
         backup.run_backup(data, secrets / "backups", now=NOW)

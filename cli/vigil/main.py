@@ -5,7 +5,7 @@
   uv run python -m vigil dev-image --repo owner/name [--rebuild]
   uv run python -m vigil hidden show <task>
   uv run python -m vigil backup [--dest DIR] [--keep-days 14]
-  uv run python -m vigil restore <backup.db> [--no-dry-run --target DIR]
+  uv run python -m vigil restore <backup.db>   (verify only)
 """
 
 from __future__ import annotations
@@ -56,19 +56,6 @@ def _data_dir(override: str | None) -> Path:
     return config.load().vigild.data_path
 
 
-def _vigild_listening() -> bool:
-    import socket
-
-    from vigild import config
-
-    try:
-        bind = config.load().vigild.api
-        with socket.create_connection((bind.host, bind.port), timeout=1):
-            return True
-    except Exception:
-        return False
-
-
 @app.command()
 def backup(
     dest: str = typer.Option(
@@ -89,43 +76,26 @@ def backup(
     except BackupError as e:
         typer.echo(f"backup failed: {e}")
         raise typer.Exit(1) from e
+    for w in made.warnings:
+        typer.echo(f"warning: {w}")
     typer.echo(f"backed up {made.db.name} and {made.vault.name}")
 
 
 @app.command()
 def restore(
     backup_file: str = typer.Argument(..., help="a vigil-<stamp>.db from `vigil backup`"),
-    dry_run: bool = typer.Option(
-        True, "--dry-run/--no-dry-run", help="Default: check the backup, write nothing."
-    ),
-    target: str = typer.Option("", "--target", help="Data dir to restore into (empty dir)."),
-    allow_live: bool = typer.Option(False, "--allow-live", help="Permit the live data dir."),
-    data_dir: str = typer.Option("", "--data-dir", help="The live data dir, for the guard."),
 ) -> None:
-    """Verify a backup opens read-only, passes integrity_check and has the
-    expected user_version. With --no-dry-run --target DIR, restore it; refuses
-    while vigild runs, and the live data dir without --allow-live."""
-    from vigild.backup import BackupError
-    from vigild.backup import restore as do_restore
+    """Verify a backup (verify only; writes nothing): it opens read-only,
+    passes integrity_check and has the expected user_version. To restore, see
+    the runbook."""
+    from vigild.backup import verify_backup
+    from vigild.db import MIGRATIONS
 
-    live = _data_dir(data_dir or None)
-    if not dry_run and not target:
-        typer.echo("a real restore needs --target")
-        raise typer.Exit(2)
-    try:
-        lines = do_restore(
-            Path(backup_file),
-            Path(target) if target else live,
-            live_dir=live,
-            dry_run=dry_run,
-            allow_live=allow_live,
-            running=_vigild_listening,
-        )
-    except BackupError as e:
-        typer.echo(f"restore refused: {e}")
-        raise typer.Exit(1) from e
-    for line in lines:
-        typer.echo(line)
+    problems = verify_backup(Path(backup_file))
+    if problems:
+        typer.echo("backup failed verification: " + "; ".join(problems))
+        raise typer.Exit(1)
+    typer.echo(f"{Path(backup_file).name} passes integrity_check, user_version {len(MIGRATIONS)}")
 
 
 @app.command()
