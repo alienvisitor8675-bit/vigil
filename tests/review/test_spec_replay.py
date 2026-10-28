@@ -15,17 +15,20 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
-from tests.conftest import auth
-from tests.jobs.test_coord_loop import SPEC, World, _approve, _request, plan
+from tests.conftest import auth, git
+from tests.jobs.test_coord_loop import REPO, SPEC, World, _approve, _request, plan
 from tests.jobs.test_coord_loop import world as world
-from tests.review.test_replay import ALL_TABLES, PROV_TABLES, _dump
+from tests.review.test_replay import ALL_TABLES, PROV_TABLES, _dump, _ready
+from tests.review.test_replay import _post as _review_post
 from vigild import db
 from vigild.breakers import GLOBAL, Kind
 from vigild.executors.base import SessionSpec
+from vigild.executors.hosts import HostRefused
 from vigild.jobs.model import Role
 from vigild.metering.calls import CallUsage, record_call
 from vigild.metering.prices import PriceTable
 from vigild.packets.assemble import COORD_PACKETS, assemble_coord
+from vigild.provenance import Provenance
 from vigild.repos import set_visibility_source
 from vigild.review.replay import ac_coverage
 
@@ -196,8 +199,92 @@ def test_a_job_from_before_the_event_carried_a_base_uses_the_clone_record(world:
     job = _approved(w)
     w.store.x("UPDATE events SET data=json_remove(data, '$.base_sha') WHERE type='packet'")
     since = len(w.standin.specs)
-    assert _post(w, job).status_code == 200
+    r = _post(w, job)
+    assert r.status_code == 200 and r.json()["base_source"] == "clone_record"
     assert len(_sessions(w, since)) == 1
+
+
+def test_a_later_redrafts_base_is_never_taken_as_the_approved_ones(world: World) -> None:
+    w = world
+    job = _approved(w)
+    w.store.add_event(
+        "packet", {"role": "coord", "attempt": 2, "dropped": [], "base_sha": "f" * 40},
+        Provenance.HUMAN, job_id=job,
+    )  # fmt: skip
+    ev = w.store.q("SELECT data FROM events WHERE job_id=? AND type='packet' ORDER BY id", (job,))
+    original = json.loads(ev[0]["data"])["base_sha"]
+    w.store.x("UPDATE events SET ts='9999-01-01T00:00:00Z' WHERE id=(SELECT MAX(id) FROM events)")
+    out = _post(w, job).json()
+    assert out["base_sha"] == original and out["base_source"] == "packet_event"
+
+
+def _refuse_host(w: World) -> None:
+    def refuse(spec: SessionSpec) -> None:
+        if w.store.is_replay(spec.session_id):
+            raise HostRefused("no host may take it")
+
+    w.standin.on_session = refuse
+
+
+def test_a_host_refusal_in_a_spec_replay_pages_nothing_and_is_refused(world: World) -> None:
+    w = world
+    job = _approved(w)
+    inbox = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()
+    _refuse_host(w)
+    r = _post(w, job)
+    assert r.status_code == 200 and r.json()["status"] == "refused", r.text
+    assert w.client.get("/api/inbox", headers=auth(w.tokens.read)).json() == inbox
+    assert w.store.q("SELECT 1 FROM events WHERE type='host_refused'") == []
+    assert w.budget.open_experiment() == 0.0
+
+
+def test_a_host_refusal_in_a_review_replay_pages_nothing_and_is_refused(
+    world: World, prompts: dict[str, str]
+) -> None:
+    w = world
+    job, task = _ready(w)
+    inbox = w.client.get("/api/inbox", headers=auth(w.tokens.read)).json()
+    _refuse_host(w)
+    r = _review_post(w, job, task, "new")
+    assert r.status_code == 200 and r.json()["status"] == "refused", r.text
+    assert w.client.get("/api/inbox", headers=auth(w.tokens.read)).json() == inbox
+
+
+# --- the gate reads the base, not the tip -------------------------------------------
+
+
+def test_the_replay_gate_reads_files_at_the_base_sha_not_the_branch_tip(
+    world: World, tmp_path: Path
+) -> None:
+    w = world
+    job = _approved(w)
+    ev = w.store.q("SELECT data FROM events WHERE job_id=? AND type='packet' ORDER BY id", (job,))
+    base = json.loads(ev[0]["data"])["base_sha"]
+    ws = w.runner.workspace
+    work = tmp_path / "tipwork"
+    git(tmp_path, "clone", "-q", str(w.bare), str(work))
+    (work / "docs" / "runbook.md").unlink()  # present at the base, gone at the tip
+    (work / "added.txt").write_text("new\n")  # absent at the base, present at the tip
+    git(work, "add", "-A")
+    git(work, "commit", "-q", "-m", "tip moves")
+    git(work, "push", "-q", "origin", "HEAD:main")
+    ws.mirror(REPO)
+    assert ws.mirror_file(REPO, "main", "docs/runbook.md") is None
+    assert ws.mirror_file_at(REPO, base, "docs/runbook.md") is not None
+    assert ws.mirror_file(REPO, "main", "added.txt") is not None
+    assert ws.mirror_file_at(REPO, base, "added.txt") is None
+    assert ws.mirror_is_dir_at(REPO, base, "docs") and not ws.mirror_is_dir_at(REPO, base, "nope")
+    # the gate of a replay consults only the sha-keyed readers
+    seen: list[str] = []
+    jobs = w.runner.jobs
+    assert jobs is not None
+    jobs.files = lambda repo, b: (_ for _ in ()).throw(AssertionError("the tip was read"))
+    jobs.dirs = lambda repo, b: (_ for _ in ()).throw(AssertionError("the tip was read"))
+    orig = ws.mirror_file_at
+    ws.mirror_file_at = lambda repo, sha, path: seen.append(sha) or orig(repo, sha, path)  # type: ignore[method-assign]
+    out = _post(w, job).json()
+    assert out["status"] == "done" and out["gate"]["ok"] is True, out
+    assert set(seen) <= {base}
 
 
 # --- money and effects ---------------------------------------------------------------

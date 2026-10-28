@@ -957,7 +957,7 @@ vault and clone record on disk, and no open breaker.
 - **What it prints:** the replay's id (`rp-...`) and status; the **gate** (ok, or the
   errors; it runs once, with no re-draft); **AC coverage** (the approved spec's ACs found
   in the redraft with the same id and the same test command, whitespace collapsed, and
-  the missing ones); the packet's size in characters; the session's tokens (in, cache
+  the missing ones; a changed wording with the same id and command counts as covered); the packet's size in characters; the session's tokens (in, cache
   read, cache write 5m and 1h, out) and its cost. The same row is in `replays`
   (`kind='spec'`, the report in `result`).
 - **What it costs and where it books:** one coord session, at most `coord_session_usd`

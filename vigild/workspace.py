@@ -412,6 +412,30 @@ class Workspace:
             return False
         return any(e.partition("\t")[0].split()[1:2] == ["tree"] for e in out.split("\0") if e)
 
+    def mirror_file_at(self, repo: str, sha: str, path: str) -> str | None:
+        """A regular file at commit `sha` in the mirror, or None (no mirror, no such file)."""
+        mirror = self._mirror_path(repo)
+        if not mirror.exists() or not SHA.match(sha):
+            return None
+        try:
+            entries = self._tree_entries(repo, sha, [path])
+            if path not in entries:
+                return None
+            return git_bytes(mirror, "cat-file", "blob", entries[path][1]).decode(errors="replace")
+        except WorkspaceError, GitError:
+            return None
+
+    def mirror_is_dir_at(self, repo: str, sha: str, path: str) -> bool:
+        """`path` is a directory at commit `sha` in the mirror (False if unknown)."""
+        mirror = self._mirror_path(repo)
+        if not mirror.exists() or not SHA.match(sha):
+            return False
+        try:
+            out = self._git(mirror, "ls-tree", "-z", sha, "--", path)
+        except WorkspaceError, GitError:
+            return False
+        return any(e.partition("\t")[0].split()[1:2] == ["tree"] for e in out.split("\0") if e)
+
     def tree_paths(self, repo: str, sha: str) -> set[str]:
         """Every file path at `sha` in the vault."""
         if not SHA.match(sha):

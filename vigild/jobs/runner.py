@@ -186,7 +186,16 @@ class Pager(Protocol):
     ) -> Any: ...
     def file_for_approval(self, job_id: str) -> list[str]: ...
     def gate_spec(self, job_id: str) -> list[str]: ...
-    def gate_drafts(self, repo: str, spec_text: str, plan_text: str, base: str) -> list[str]: ...
+    def gate_drafts(
+        self,
+        repo: str,
+        spec_text: str,
+        plan_text: str,
+        base: str,
+        *,
+        read: Callable[[str], str | None] | None = None,
+        is_dir: Callable[[str], bool] | None = None,
+    ) -> list[str]: ...
     def approve_bench(self, job_id: str) -> Any: ...
     def flagged_tasks(self, job_id: str) -> dict[str, list[str]]: ...
     def needs_hidden(self, job_id: str) -> dict[str, list[str]]: ...
@@ -1184,7 +1193,11 @@ class JobRunner:
                         try:
                             out = self.executor.run(spec, token, self._event_sink(s))
                         except HostRefused as e:  # no host may run it: nothing ran
-                            self._host_refused(spec.job_id, e, "the session")
+                            if self.store.is_replay(s.id):
+                                # a replay pages nobody and files nothing on the job it copies
+                                self.store.gate_refuse_replay(s.id, f"host_refused: {e}"[:500])
+                            else:
+                                self._host_refused(spec.job_id, e, "the session")
                             out = ExecOutcome("failed", None, {}, f"sandbox host refused: {e}")
                     tr.set("vigil.status", out.status)
                     if cap is not None:  # a review or audit: did it go past its cap?
@@ -4216,6 +4229,8 @@ class JobRunner:
         except (StaleDevImage, HostRefused) as e:  # DevImages paged a stale image with Rebuild
             self.budget.settle(rid)
             self.store.update_session(s.id, status="failed")
+            if replay is not None:
+                raise ReplayRefused(409, f"the sandbox image isn't ready: {e}"[:300]) from e
             if isinstance(e, HostRefused):
                 self._host_refused(job.id, e, "the review session")
             return None, f"the sandbox image isn't ready: {e}"[:300]
@@ -4412,25 +4427,30 @@ class JobRunner:
 
     # --- spec replay (ADR-0005 part 7) ------------------------------------------------------
 
-    def _spec_replay_base(self, job_id: str, approved_at: str) -> str:
-        """The base sha the approved spec was drafted on: the `base_sha` of the last coord
-        packet event at or before the approval, else the clone record of a coord attempt of
-        a job from before the event carried it. Always vigild's own record."""
+    def _spec_replay_base(self, job_id: str, approved_at: str) -> tuple[str, str]:
+        """The base sha the approved spec was drafted on, and where it came from: the
+        `base_sha` of the last coord packet event at or before the approval
+        (`packet_event`), else, for a job from before the event carried it, the clone record
+        of the coord attempt numbered by the coord sessions begun by the approval
+        (`clone_record`, the last resort). Always vigild's own record."""
         rows = self.store.q(
             "SELECT data, ts FROM events WHERE job_id=? AND type='packet' ORDER BY id", (job_id,)
         )
-        shas = [(str(d.get("base_sha") or ""), str(r["ts"])) for r in rows
-                if (d := json.loads(r["data"])).get("role") == "coord"]  # fmt: skip
-        shas = [x for x in shas if x[0]]
-        early = [sha for sha, ts in shas if ts <= approved_at]
-        if early or shas:
-            return (early or [sha for sha, _ in shas])[-1]
-        for n in (3, 2, 1):
-            try:
-                return self.workspace.base_sha(f"{job_id}-coord{n}")
-            except OSError, ValueError, KeyError, WorkspaceError:
-                continue
-        raise ReplayInvalid(f"no record of the base {job_id}'s spec was drafted on")
+        early = [
+            str(d["base_sha"]) for r in rows
+            if (d := json.loads(r["data"])).get("role") == "coord" and d.get("base_sha")
+            and str(r["ts"]) <= approved_at
+        ]  # fmt: skip
+        if early:
+            return early[-1], "packet_event"
+        n = len(
+            [x for x in self.store.list_sessions(job_id)
+             if x.role is Role.COORD and str(x.created_at) <= approved_at]
+        )  # fmt: skip
+        try:
+            return self.workspace.base_sha(f"{job_id}-coord{max(n, 1)}"), "clone_record"
+        except (OSError, ValueError, KeyError, WorkspaceError) as e:
+            raise ReplayInvalid(f"no record of the base {job_id}'s spec was drafted on") from e
 
     def _session_tokens(self, session_id: str | None) -> dict[str, int]:
         rows = self.store.q(
@@ -4468,7 +4488,7 @@ class JobRunner:
         if before is None:
             raise ReplayInvalid(f"{job.id} has no approved spec")
         approved_spec = spec_body(before.content)
-        base_sha = self._spec_replay_base(job.id, approval.created_at)
+        base_sha, base_source = self._spec_replay_base(job.id, approval.created_at)
         open_ = self.breakers.open_breakers()
         if open_:
             raise ReplayRefused(
@@ -4482,7 +4502,9 @@ class JobRunner:
             raise ReplayRefused(409, "the coord's backend breaker is open")
         rid = self.store.create_replay(job.id, "", base_sha, packet_variant, "", kind="spec")
         try:
-            self._spec_replay_session(job, rid, preset, assemble, base_sha, approved_spec)
+            self._spec_replay_session(
+                job, rid, preset, assemble, base_sha, approved_spec, base_source
+            )
         except ReplayRefused as e:
             self.store.finish_replay(rid, "refused", error=str(e)[:1000])
             raise
@@ -4492,7 +4514,14 @@ class JobRunner:
         return self._spec_replay_result(rid)
 
     def _spec_replay_session(
-        self, job: Any, rid: str, preset: str, assemble: Any, base_sha: str, approved_spec: str
+        self,
+        job: Any,
+        rid: str,
+        preset: str,
+        assemble: Any,
+        base_sha: str,
+        approved_spec: str,
+        base_source: str,
     ) -> None:
         branch = f"vigil/{rid}-spec"
         s = self.store.create_session(
@@ -4543,9 +4572,7 @@ class JobRunner:
         except (StaleDevImage, HostRefused) as e:
             self.budget.settle(res)
             self.store.update_session(s.id, status="failed")
-            why = redact(f"the sandbox isn't ready: {e}")[:1000]
-            self.store.finish_replay(rid, "failed", error=why)
-            return
+            raise ReplayRefused(409, redact(f"the sandbox isn't ready: {e}")[:1000]) from e
         except Exception:
             self.budget.settle(res)
             self.store.update_session(s.id, status="failed")
@@ -4553,6 +4580,7 @@ class JobRunner:
         cost = round(session_cost(self.store, s.id), 6)
         base_result: dict[str, Any] = {
             "packet_chars": len(packet.text), "tokens": self._session_tokens(s.id),
+            "base_source": base_source,
             "gate": None, "ac_coverage": None,
         }  # fmt: skip
         gate_refused = str(self.store.get_replay(rid)["error"] or "").startswith("gate_refused")
@@ -4582,7 +4610,11 @@ class JobRunner:
         if not texts["spec"] or not texts["plan"]:
             errors = ["spec.md and plan.md are both required"]
         else:
-            errors = self.jobs.gate_drafts(job.repo, texts["spec"], texts["plan"], job.base)
+            errors = self.jobs.gate_drafts(
+                job.repo, texts["spec"], texts["plan"], job.base,
+                read=lambda path: self.workspace.mirror_file_at(job.repo, base_sha, path),
+                is_dir=lambda path: self.workspace.mirror_is_dir_at(job.repo, base_sha, path),
+            )  # fmt: skip
         self.store.update_session(s.id, status="done")
         self.store.finish_replay(
             rid, "done", cost_usd=cost,
@@ -4596,7 +4628,8 @@ class JobRunner:
             "id": row["id"], "kind": row["kind"], "job_id": row["job_id"],
             "base_sha": row["head"], "packet": row["prompt_version"], "status": row["status"],
             "cost_usd": row["cost_usd"], "error": row["error"], "provenance": row["provenance"],
-            **{"gate": None, "ac_coverage": None, "packet_chars": 0, "tokens": None},
+            **dict.fromkeys(("gate", "ac_coverage", "tokens", "base_source")),
+            "packet_chars": 0,
             **json.loads(row["result"]),
         }  # fmt: skip
 
