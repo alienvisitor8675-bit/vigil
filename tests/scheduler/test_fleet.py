@@ -139,42 +139,50 @@ def test_a_fifth_pr_waits(world: World) -> None:
     assert len(w.publisher.prs) == 5
 
 
-def test_a_pr_being_recorded_still_holds_its_place(
-    world: World, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """#34. A worker marks its task `pr_open` and, a statement later, records the
-    `pr_open` event with the URL. In that gap the task has no URL and is no longer
-    `running`; the stack must still count it, or a dispatch pass that runs then sees
-    room and starts the fifth task. Forced: w2 stops in the gap, and the pass that
-    follows w1's finish checks the room only once w2 is there."""
+def test_a_pr_being_recorded_still_holds_its_place(world: World) -> None:
+    """#34. A task that is `pr_open` but has no `pr_open` event (no URL) yet still
+    takes its place in the stack, so a dispatch pass that looks then sees no room
+    for it. Checked on the store directly: no threads, no waits."""
     from vigild.scheduler import wip
 
+    s = world.store
+    job = s.create_job(repo="o/r", base="main", title="t", request="r", notes=[])
+    for n, state in ((1, "pr_open"), (2, "running"), (3, "submitted")):
+        s.create_task(job.id, {"task_id": f"{job.id}-w{n}"}, "claude")
+        s.update_task(f"{job.id}-w{n}", state=state)
+    held = [t["task_id"] for t in wip.stack(s, "o/r")]
+    assert held == [f"{job.id}-w1", f"{job.id}-w2"]
+    assert wip.pr_of(s, f"{job.id}-w1") is None  # no URL yet, and still counted
+    assert wip.room(s, "o/r", 4) == 2
+
+
+def test_no_room_check_runs_while_a_pr_is_being_recorded(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#34 at its source (#41): the `pr_open` state and its event are written under
+    the store's lock, so another thread's room check (every store read takes that
+    lock) can't run between them. Checked when the event is written: the lock is
+    not free to another thread. A non-blocking acquire, so nothing waits."""
     w = world
-    in_gap, checked = threading.Event(), threading.Event()
-    real_room = wip.room
-    calls = 0
-
-    def room(store: Any, repo: str, limit: int) -> int:
-        nonlocal calls
-        calls += 1
-        if calls == 2:  # the pass that follows the first worker's finish
-            assert in_gap.wait(30)
-        n = real_room(store, repo, limit)
-        if calls == 2:
-            checked.set()
-        return n
-
-    monkeypatch.setattr(wip, "room", room)
+    free_to_others: list[bool] = []
     real_add = w.store.add_event
 
+    def try_lock() -> None:
+        got = w.store.lock.acquire(blocking=False)
+        if got:
+            w.store.lock.release()
+        free_to_others.append(got)
+
     def add_event(type: str, data: Any, provenance: Any, **kw: Any) -> int:
-        if type == "pr_open" and (kw.get("task_id") or "").endswith("-w2"):
-            in_gap.set()
-            assert checked.wait(30)
+        if type == "pr_open":
+            t = threading.Thread(target=try_lock)
+            t.start()
+            t.join()
         return real_add(type, data, provenance, **kw)
 
     monkeypatch.setattr(w.store, "add_event", add_event)
     job = _run(w, 5)
+    assert free_to_others and not any(free_to_others), free_to_others
     assert w.store.get_job(job).state.value == "blocked"
     assert len(w.publisher.prs) == 4
 
