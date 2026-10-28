@@ -4,9 +4,13 @@
   uv run python -m vigil doctor
   uv run python -m vigil dev-image --repo owner/name [--rebuild]
   uv run python -m vigil hidden show <task>
+  uv run python -m vigil backup [--dest DIR] [--keep-days 14]
+  uv run python -m vigil restore <backup.db>   (verify only)
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import typer
 
@@ -40,6 +44,58 @@ def hidden_show(task: str = typer.Argument(..., help="a task id, e.g. pa-0002-w2
     except HiddenError as e:
         typer.echo(str(e))
         raise typer.Exit(1) from e
+
+
+def _data_dir(override: str | None) -> Path:
+    from vigild import config
+
+    if override:
+        return Path(override).expanduser()
+    if env := config.env_override("VIGIL_DATA_DIR"):
+        return Path(env).expanduser()
+    return config.load().vigild.data_path
+
+
+@app.command()
+def backup(
+    dest: str = typer.Option(
+        "", "--dest", envvar="VIGIL_BACKUP_DIR", help="Outside the repo and the data dir."
+    ),
+    keep_days: int = typer.Option(14, "--keep-days", min=1, help="Prune older dated sets."),
+    data_dir: str = typer.Option("", "--data-dir", help="Default: VIGIL_DATA_DIR or the config."),
+) -> None:
+    """Back up the database (SQLite online backup, mode 600) and the vault
+    (rsync) into a dated set; keep N days. Never reads ~/.config/vigil/."""
+    from vigild.backup import BackupError, run_backup
+
+    if not dest:
+        typer.echo("no destination: pass --dest or set VIGIL_BACKUP_DIR")
+        raise typer.Exit(2)
+    try:
+        made = run_backup(_data_dir(data_dir or None), Path(dest), keep_days=keep_days)
+    except BackupError as e:
+        typer.echo(f"backup failed: {e}")
+        raise typer.Exit(1) from e
+    for w in made.warnings:
+        typer.echo(f"warning: {w}")
+    typer.echo(f"backed up {made.db.name} and {made.vault.name}")
+
+
+@app.command()
+def restore(
+    backup_file: str = typer.Argument(..., help="a vigil-<stamp>.db from `vigil backup`"),
+) -> None:
+    """Verify a backup (verify only; writes nothing): it opens read-only,
+    passes integrity_check and has the expected user_version. To restore, see
+    the runbook."""
+    from vigild.backup import verify_backup
+    from vigild.db import MIGRATIONS
+
+    problems = verify_backup(Path(backup_file))
+    if problems:
+        typer.echo("backup failed verification: " + "; ".join(problems))
+        raise typer.Exit(1)
+    typer.echo(f"{Path(backup_file).name} passes integrity_check, user_version {len(MIGRATIONS)}")
 
 
 @app.command()

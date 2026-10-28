@@ -5,8 +5,12 @@ revoke for each repo in configs/repos.yaml (plus claude-mods, read-only)."""
 
 from __future__ import annotations
 
+import os
+import plistlib
 import socket
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +21,8 @@ from vigild.config import Config, Secrets
 from vigild.repos import JEV, is_bench_repo, live_private, repo_rule_errors
 
 TIMEOUT = 15.0
+BACKUP_PLIST = Path.home() / "Library" / "LaunchAgents" / "dev.vigil.backup.plist"
+BACKUP_PLACEHOLDER = "__BACKUP_DESTINATION__"
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,49 @@ def _experiment_line(cfg: Config) -> Check:
         )
 
     return _safe("experiment budget", spend)
+
+
+def _backup_dest(environ: Mapping[str, str], plist: Path) -> tuple[Path | None, bool | None, str]:
+    """(destination, verdict, note): VIGIL_BACKUP_DIR, else the installed plist's.
+    No destination and verdict None is a skip; a plist that exists but is
+    unusable is a failure (verdict False)."""
+    env = environ.get("VIGIL_BACKUP_DIR")
+    if env:
+        return Path(env).expanduser(), None, ""
+    if not plist.exists():
+        return None, None, "no backup destination (VIGIL_BACKUP_DIR unset, plist not installed)"
+    try:
+        env_vars = plistlib.loads(plist.read_bytes()).get("EnvironmentVariables", {})
+    except Exception as e:  # the kind only, never the content
+        return None, False, f"plist unreadable ({type(e).__name__})"
+    value = env_vars.get("VIGIL_BACKUP_DIR") if isinstance(env_vars, dict) else None
+    if not isinstance(value, str) or not value:
+        return None, False, "plist has no VIGIL_BACKUP_DIR"
+    if BACKUP_PLACEHOLDER in value:
+        return None, False, "plist still holds the template destination"
+    return Path(value).expanduser(), None, ""
+
+
+def backup_freshness_check(
+    *,
+    environ: Mapping[str, str] | None = None,
+    plist: Path | None = None,
+    now: datetime | None = None,
+) -> Check:
+    """The newest complete backup set is at most 36 hours old. Skips only while
+    neither VIGIL_BACKUP_DIR nor the installed plist names a destination."""
+    from vigild.backup import freshness
+
+    name = "backup freshness"
+    try:
+        dest, verdict, note = _backup_dest(
+            os.environ if environ is None else environ, plist or BACKUP_PLIST
+        )
+    except OSError as e:
+        return Check(name, False, f"destination unreadable ({type(e).__name__})")
+    if dest is None:
+        return Check(name, verdict, note)
+    return _safe(name, lambda: freshness(dest, now=now or datetime.now(UTC)))
 
 
 def run_checks(
@@ -345,4 +394,5 @@ def run_checks(
 
             out.append(_safe(f"dev image: {repo}", last_build))
     out.append(_experiment_line(cfg))
+    out.append(backup_freshness_check())
     return out
