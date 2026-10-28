@@ -101,7 +101,9 @@ repos:
     dev_dockerfile: images/dev/vigil.Dockerfile
     dev_lockfiles: [pyproject.toml, uv.lock]
     dev_suites:
-      tests: uv run --offline pytest -q -p no:cacheprovider
+      # -n auto (pytest-xdist, #90): serially the whole suite outgrew the 30-minute
+      # validation limit (record 29 timed out at ~82%, 2026-10-28)
+      tests: uv run --offline pytest -q -p no:cacheprovider -n auto
     dev_excluded:
       docker: >-
         The `-m docker` and `-m live` tests start containers and call the model;
