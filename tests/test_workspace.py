@@ -1,4 +1,4 @@
-"""Per-task clones from a local mirror (B3), never `git worktree`."""
+"""Per-task clones from a local mirror (decision `task-clone`), never `git worktree`."""
 
 from __future__ import annotations
 

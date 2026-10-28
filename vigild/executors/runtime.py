@@ -1,4 +1,5 @@
-"""Container lifecycle (B4, B5, B17, B18): one hardened container per session,
+"""Container lifecycle (decisions `egress-enforcement`, `proxy-topology`,
+`executor-users`, `readonly-overlays`): one hardened container per session,
 on its own internal network, with a smokescreen sidecar as its only way out
 and the OTel collector attached while it runs.
 
@@ -207,7 +208,7 @@ def proxy_kwargs(cfg: Config, spec: SessionSpec, host: SandboxHost | None = None
 # (pytest.xml, vitest-N.xml, regular files only: root never follows a link the
 # test planted) in base64, and END with the exit code. vigild accepts reports
 # only from a trailer that ends the stream. An in-process rewrite of a report
-# stays open (architecture B33), with the draft PR and review as the backstop.
+# stays open (architecture decision `verifier`), with the draft PR and review as the backstop.
 AGENT = "setpriv --reuid={uid} --regid={uid} --clear-groups --inh-caps=-all --"
 
 
@@ -404,7 +405,7 @@ def write_kit(dest: Path) -> Path:
 def deps_kwargs(
     cfg: Config, image: str, work: Path, *, network: str, host: SandboxHost | None = None
 ) -> dict[str, Any]:
-    """A deps job's build container (B39): the repo's dev image, its
+    """A deps job's build container (decision `dependency-changes`): the repo's dev image, its
     manifests and lockfiles at /work (nothing else of the repo, no .git), the
     agent uid with no capabilities, its own internal network whose proxy
     allows the registries only. No secret, no gateway token, no model."""
@@ -803,9 +804,9 @@ class DockerRuntime:
     def run_deps(
         self, image: str, work: Path, command: str, timeout_s: int = 900
     ) -> tuple[int, str]:
-        """A deps job's package-manager run (B39): `deps_kwargs` on its own
-        internal network behind a registry-only proxy. Returns the exit code
-        and the output's tail."""
+        """A deps job's package-manager run (decision `dependency-changes`):
+        `deps_kwargs` on its own internal network behind a registry-only proxy. Returns the
+        exit code and the output's tail."""
         import docker.errors
 
         from vigild.jobs.model import Role

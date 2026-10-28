@@ -110,7 +110,7 @@ def test_session_headroom(budget: Budget, store: Store, cfg: Config) -> None:
 
 
 def test_the_overshoot_bound_is_one_call_per_session(budget: Budget) -> None:
-    """B14's written bound: the day can't exceed its cap by more than the
+    """decision `budget-hard-stop`'s written bound: the day can't exceed its cap by more than the
     in-flight calls, and the gateway's pre-call check makes even that zero
     for any call whose worst case it can price."""
     from vigild import config as config_mod

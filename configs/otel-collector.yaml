@@ -1,5 +1,5 @@
 # The collector stays in front of the trace store so the exporters never
-# change (B23). Workers send OTLP/HTTP here over their session network;
+# change (decision `trace-store`). Workers send OTLP/HTTP here over their session network;
 # vigild sends its own spans to 127.0.0.1:4318. Phoenix ingests traces only;
 # Claude Code's metric and log events are dropped (per-call metering comes
 # from vigild's gateway, P1, not from telemetry).

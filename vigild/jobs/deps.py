@@ -350,8 +350,8 @@ Container = Callable[[str, Path, str], tuple[int, str]]  # (image, work dir, com
 
 
 class DepsExecutor:
-    """No model (B39): the repo's manifests and lockfiles from the base, the
-    package manager's lockfile-only update in a build container with registry
+    """No model (decision `dependency-changes`): the repo's manifests and lockfiles from the
+    base, the package manager's lockfile-only update in a build container with registry
     egress and nothing else, then the checks. The work dir has no `.git` and
     nothing of the repo but those files; vigild reads them back as regular
     files only and commits them itself, in its own clone."""

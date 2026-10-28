@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.28.0@sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b
-# smokescreen egress proxy, one sidecar per session (B4, B5). linux/arm64.
+# smokescreen egress proxy, one sidecar per session (decisions `egress-enforcement`, `proxy-topology`). linux/arm64.
 # Built locally from the release binary (ghcr pulls were denied), checked
 # against the release's published SHA-256.
 FROM python:3.14.8-slim-trixie@sha256:fbecd461fc72d21b2143c6eaba25143738079154a6d0ea3da3aec724f50eed4a AS fetch

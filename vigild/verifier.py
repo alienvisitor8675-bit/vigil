@@ -788,7 +788,8 @@ class Verifier:
     def hidden_summary(run: dict[str, Any]) -> dict[str, Any]:
         """What tests.json keeps of a hidden run: counts, a hash of the ids and
         the failure category. No output tail, no names, no source lines: the
-        code is only in the vault (B40); the full output is a file on the host."""
+        code is only in the vault (decision `hidden-tests-runner-files`); the full output is
+        a file on the host."""
         cases = run["_cases"] if run["_report"] else []
         n = {
             "passing": sum(1 for c in cases if c.status == "pass"),

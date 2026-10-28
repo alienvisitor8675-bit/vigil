@@ -13,7 +13,8 @@ if TYPE_CHECKING:
 
 @dataclass
 class Tokens:
-    """B7's three bearer scopes. None means the scope is off; nothing matches it."""
+    """Decision `api-auth`'s three bearer scopes. None means the scope is off; nothing
+    matches it."""
 
     admin: str | None
     read: str | None

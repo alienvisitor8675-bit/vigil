@@ -1,4 +1,5 @@
-"""Cost is always tokens x the dated price table in configs/prices.yaml (B13)."""
+"""Cost is always tokens x the dated price table in configs/prices.yaml
+(decision `call-metering`)."""
 
 from __future__ import annotations
 

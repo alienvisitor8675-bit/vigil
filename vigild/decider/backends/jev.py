@@ -1,4 +1,4 @@
-"""TypeSafe Jev (B21), on two routes, both checked live (owner, 2026-10-23;
+"""TypeSafe Jev (decision `decider-routes`), on two routes, both checked live (owner, 2026-10-23;
 recorded 2026-10-22, tests/decider/fixtures):
 
 - **Cloudflare Workers AI** (zero retention), the route for private repos:
@@ -210,7 +210,8 @@ class JevCloudflare(_Jev):
         private: bool,
         purpose: str = "decider",
     ) -> Answer:
-        # Cloudflare caps context at 32k: duplicate_of gets titles, not bodies (B21).
+        # Cloudflare caps context at 32k: duplicate_of gets titles, not bodies
+        # (decision `decider-routes`).
         body = {
             "model": self.model,
             "input": {"state": state[:96_000], "questions": {q.name: question(q)}},

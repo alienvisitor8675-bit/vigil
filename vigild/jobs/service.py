@@ -766,8 +766,8 @@ class JobService:
     def file_deps(
         self, job_id: str, deps: list[Any], parent_id: str, parent_tasks: list[str]
     ) -> list[str]:
-        """A deps job's spec (plan 2a, item 5; B39), rendered by vigild from
-        the requests: the deps gate, then Specs to approve. Approving it is the
+        """A deps job's spec (plan 2a, item 5; decision `dependency-changes`), rendered by
+        vigild from the requests: the deps gate, then Specs to approve. Approving it is the
         owner's go-ahead for the package manager to run."""
         from vigild.jobs.deps import check_requests
 

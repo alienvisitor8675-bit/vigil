@@ -1,4 +1,4 @@
-"""The vigil-worker GitHub App (B19): JWT, installation tokens, revoke.
+"""The vigil-worker GitHub App (decision `github-app`): JWT, installation tokens, revoke.
 
 The App is installed on all of the owner's repos and holds contents:write,
 pull_requests:write, issues:write, checks:read, metadata:read and

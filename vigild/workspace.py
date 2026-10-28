@@ -1,4 +1,4 @@
-"""Mirrors, per-task clones, and the vault (B3, B25).
+"""Mirrors, per-task clones, and the vault (decisions `task-clone`, `publishing`).
 
 - **Mirror:** a bare mirror per repo under <data>/mirrors, fetched with a
   read-scoped App token when one is configured, never with ambient host
@@ -205,8 +205,8 @@ class Workspace:
         return path
 
     def overlays(self, clone: Path) -> list[Mount]:
-        """Read-only mounts over /work (B18). Missing dirs are created empty so
-        the agent can't create them either."""
+        """Read-only mounts over /work (decision `readonly-overlays`). Missing dirs are
+        created empty so the agent can't create them either."""
         mounts: list[Mount] = []
         for d in RO_DIRS:
             p = clone / d

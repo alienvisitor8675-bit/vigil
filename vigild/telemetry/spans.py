@@ -1,4 +1,4 @@
-"""vigild's own spans (B23): one trace per session.
+"""vigild's own spans (decision `trace-store`): one trace per session.
 
 `vigil.session` is the root; `vigil.route`, `vigil.spawn`, `vigil.publish`
 nest under it, and the worker's Claude Code spans join the same trace through

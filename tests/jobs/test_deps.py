@@ -1,4 +1,4 @@
-"""Deps jobs (plan 2a, item 5; B39): no model, a lockfile-only update in a
+"""Deps jobs (plan 2a, item 5; decision `dependency-changes`): no model, a lockfile-only update in a
 registry-only container, the 14-day rule on everything the lockfile pulls in,
 manifests changed only in their dependency fields, the dev image rebuilt and
 validated, its own PR, and the parent resumed on the new image once it merges."""

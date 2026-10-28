@@ -9,9 +9,9 @@ success closes it.
 
 | kind | scope | trips when |
 |---|---|---|
-| daily_cap, monthly_cap | global | the day's (month's) metered spend reaches the cap (B14) |
+| daily_cap, monthly_cap | global | metered spend reaches the cap (decision `budget-hard-stop`) |
 | per_task_cap | task:<id> | a task's reservation is exhausted |
-| wip | repo:<name> | four open fleet PRs (B43) |
+| wip | repo:<name> | four open fleet PRs (decision `scheduler-fleet`) |
 | escalations | global | more than `max_escalations_per_day` escalations today (UTC) |
 | fix_depth | tree:<root job> | a child job past depth 3 |
 | backend_errors | backend:<preset> | N 5xx or timeouts in a row; routes fall to the next preset |

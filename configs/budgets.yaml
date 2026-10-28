@@ -1,4 +1,4 @@
-# Hard stops (B14). Every session reserves its max_cost_usd before it
+# Hard stops (decision `budget-hard-stop`). Every session reserves its max_cost_usd before it
 # starts; a start is refused unless spent + open reservations + this one fit
 # under the daily and the monthly cap. The gateway refuses a call that would
 # take a session past its reservation. Days and months are UTC.

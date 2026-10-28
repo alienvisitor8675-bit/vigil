@@ -1,4 +1,4 @@
-"""Auth (B7): bearer tokens with three scopes, plus the web UI's session cookie.
+"""Auth (decision `api-auth`): bearer tokens with three scopes, plus the web UI's session cookie.
 
 admin can do everything; read can GET; heartbeat can only post heartbeats
 (phase 3). A scope whose token is unset matches nothing.

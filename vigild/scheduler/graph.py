@@ -3,7 +3,7 @@
 A task starts as soon as every task it depends on is done, not when a whole
 wave is: a slow task holds up only its own dependents. Tasks that become
 ready together are admitted together (`launch` reserves their budgets as one
-batch, all or none, B14). After a failure, or when `launch` halts (a budget
+batch, all or none, decision `budget-hard-stop`). After a failure, or when `launch` halts (a budget
 refusal, a tripped breaker, the WIP limit), nothing new starts; what's
 running finishes, and the caller decides what the job does next.
 
@@ -69,7 +69,7 @@ def run_graph(deps: Mapping[str, Collection[str]], done: set[str], launch: Launc
 
 class Slots:
     """At most `n` sessions at once, across every job (coord, worker,
-    reviewer, auditor). Verification has its own one-at-a-time slot (B33)."""
+    reviewer, auditor). Verification has its own one-at-a-time slot (decision `verifier`)."""
 
     def __init__(self, n: int) -> None:
         self.n = n

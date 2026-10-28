@@ -6,6 +6,9 @@ is implemented and where the implementation had to depart from it.
 `docs/sources.md` cites every version and fact used here. Architectural
 decisions after phase 1 are ADRs in `docs/decisions/`.
 
+Code comments and docstrings cite a decision here by its slug ID, as
+``decision `sqlite-wal` ``, not by a sequential number.
+
 **Rule:** a PR that changes a flow shown here updates the diagram and the
 matching row in `docs/feature-map.md` in the same PR. CI enforces it:
 `scripts/check-docs-same-pr.py` fails a PR that touches a flow's files

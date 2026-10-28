@@ -287,7 +287,7 @@ def test_a_resumed_session_gets_its_transcript_read_only(cfg: Config, spec: Sess
 
 
 def test_a_deps_container_reaches_the_registries_only(cfg: Config, tmp_path: Path) -> None:
-    """Plan 2a, item 5 (B39): no gateway, no secret, no token, the work dir
+    """Plan 2a, item 5 (decision `dependency-changes`): no gateway, no secret, no token, the work dir
     (manifests and lockfiles) the only mount."""
     from vigild.executors.runtime import deps_kwargs
 

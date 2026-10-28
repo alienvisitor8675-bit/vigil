@@ -1,4 +1,4 @@
-# Per-session egress allowlists for the smokescreen sidecar (B4, B5).
+# Per-session egress allowlists for the smokescreen sidecar (decisions `egress-enforcement`, `proxy-topology`).
 # No model host and no GitHub host is listed: hosted model calls go through
 # vigild's gateway (P1), and vigild pushes and opens PRs from the host (P2), so
 # a worker needs neither. PyPI stays for workers (uploads go to
@@ -25,6 +25,6 @@ roles:
   reviewer: []
   auditor:  []
   hidden_test_author: []
-  # a deps job's build container (B39): the registries and nothing else, not
+  # a deps job's build container (decision `dependency-changes`): the registries and nothing else, not
   # even the gateway; it holds no token and runs no model
   deps:     [pypi.org, files.pythonhosted.org, registry.npmjs.org]

@@ -790,7 +790,9 @@ class JobRunner:
         started, self.deferred = self.deferred, []
         for job_id in started:
             if self.store.get_job(job_id).state in (JobState.BUILDING, JobState.IN_REVIEW):
-                self.on_resume(job_id)  # workers or reviews a restart cut off (item 3, B3)
+                self.on_resume(
+                    job_id
+                )  # workers or reviews a restart cut off (item 3, decision `task-clone`)
             else:
                 self.on_approved(job_id)
         return len(started)
@@ -902,7 +904,7 @@ class JobRunner:
 
     def _spend_check(self) -> Breaker | None:
         """Trip the global daily (monthly) breaker once the day's (month's)
-        metered spend reaches its cap (B14's hard stops; review B1)."""
+        metered spend reaches its cap (decision `budget-hard-stop`'s hard stops; review B1)."""
         b = self.cfg.budgets
         for kind, spent, cap in (
             (Kind.DAILY, self.budget.spent_today(), b.daily_usd),
@@ -3109,7 +3111,7 @@ class JobRunner:
             )
         return True
 
-    # --- deps jobs (phase 2a, item 5; B39) ------------------------------------------------
+    # --- deps jobs (phase 2a, item 5; decision `dependency-changes`) -----------------------
 
     def _spawn_deps(
         self, parent_id: str, tasks: list[str], wanted: list[dict[str, Any]]
@@ -3190,8 +3192,8 @@ class JobRunner:
         self.dispatch(job.id)
 
     def _deps_worker(self, job_id: str, task_id: str, held: dict[str, SessionRow]) -> bool:
-        """The deps executor (B39): no model. The lockfile-only update in a
-        registry-only build container, the checks, vigild's own commit, the
+        """The deps executor (decision `dependency-changes`): no model. The lockfile-only
+        update in a registry-only build container, the checks, vigild's own commit, the
         dev image rebuilt and validated on the new lockfiles, and the PR."""
         from vigild.contract.models import DepRequest
 
@@ -3370,7 +3372,8 @@ class JobRunner:
             )
 
     def _resume_dependents(self, dep_id: str) -> None:
-        """Every job blocked on this (deps) job goes back to work (B39)."""
+        """Every job blocked on this (deps) job goes back to work
+        (decision `dependency-changes`)."""
         for job in self.store.list_jobs():
             if job.state is not JobState.BLOCKED or job.blocked_on != dep_id:
                 continue
@@ -4053,7 +4056,7 @@ class JobRunner:
             task_id=t.id,
         )
         if task.shape is not None and task.shape.value == "deps":
-            # no model wrote it, so no fix round: the owner decides (B39)
+            # no model wrote it, so no fix round: the owner decides (decision `dependency-changes`)
             return "deps_findings", findings
         self._reroute_for_round(job.id, t.id, rnd)
         self.store.update_task(t.id, state="fix")

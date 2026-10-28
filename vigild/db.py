@@ -1,4 +1,4 @@
-"""vigild's SQLite store (B2): stdlib sqlite3, WAL, one writer.
+"""vigild's SQLite store (decision `sqlite-wal`): stdlib sqlite3, WAL, one writer.
 
 Every table that holds an artifact or a record of work carries a
 `provenance` column constrained to claude | local | human | eval-only.

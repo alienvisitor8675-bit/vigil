@@ -121,7 +121,7 @@ def test_forged_reports_count_for_nothing(
 def test_the_test_cannot_read_the_scripts_memory(
     runner: DockerTestRunner, cfg: Config, source: Path
 ) -> None:
-    """Phase 2a, item 0 (architecture B33): the script holding the marker is
+    """Phase 2a, item 0 (architecture decision `verifier`): the script holding the marker is
     root; the test runs as the agent uid and can't open PID 1's memory."""
     cmd = (
         "id -u; stat -c %u /proc/1; "

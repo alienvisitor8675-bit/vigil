@@ -1,6 +1,6 @@
-"""Per-session egress (B4, B5): an allowlist from the session's role, written
-as a smokescreen ACL. The gateway is the only model endpoint, and the only
-private address the proxy will connect to."""
+"""Per-session egress (decisions `egress-enforcement`, `proxy-topology`): an allowlist
+from the session's role, written as a smokescreen ACL. The gateway is the only model
+endpoint, and the only private address the proxy will connect to."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def _gateway(host: SandboxHost) -> tuple[str, int]:
 def allowlist(cfg: Config, role: Role, host: SandboxHost | None = None) -> list[str]:
     hosts = list(cfg.egress.roles.get(role.value, []))
     if role is Role.DEPS:
-        return hosts  # registries only: no gateway, no model (B39)
+        return hosts  # registries only: no gateway, no model (decision `dependency-changes`)
     if host is not None and host.remote:
         return [*hosts, _gateway(host)[0]]  # exactly the host's gateway_url (ADR-0004)
     return [*hosts, cfg.egress.gateway.host]

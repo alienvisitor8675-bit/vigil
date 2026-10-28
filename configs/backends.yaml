@@ -11,7 +11,7 @@ presets:
   tower-fast:    {kind: openai_compatible, base_url: "http://tower:8080/v1", model: gpt-oss-20b, key_ref: TOWER_API_KEY, locality: local, provider: tower, live: false}  # phase 5
   openrouter:    {kind: openrouter, base_url: "https://openrouter.ai/api/v1", model: null, key_ref: OPENROUTER_API_KEY, locality: hosted, provider: openrouter, live: false}  # phase 4
 
-# Decider routes (B21). Same locality rule as backends. A repo lists the
+# Decider routes (decision `decider-routes`). Same locality rule as backends. A repo lists the
 # logical `jev`; vigild resolves it per call from the repo's live GitHub
 # visibility: public -> jev-openrouter, private (or unknown) -> jev-cloudflare
 # (vigild/repos.py `jev_route`). `version_pin` is the exact version each

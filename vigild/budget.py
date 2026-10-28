@@ -1,4 +1,4 @@
-"""Budgets with reservations (B14): daily, per task and monthly hard stops.
+"""Budgets with reservations (decision `budget-hard-stop`): daily, per task and monthly hard stops.
 
 Before any session starts (coord, worker, reviewer, auditor) or vigild makes
 a model call of its own (the decider), it reserves that session's
