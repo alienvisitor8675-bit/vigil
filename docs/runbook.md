@@ -276,7 +276,7 @@ you. There is no timer and no launchd job.
   Dockerfile, vigil's `pyproject.toml` or `uv.lock`, a repo's `dev_suites` or
   `dev_image_tools`, anything under `images/claude-executor/`, the managed
   settings or the worker-report schema. Such a PR must have a body line
-  `Rebuilds images: <repo or layer>` (edit the body, then re-run the job), and
+  `Rebuilds images: <repo or layer>` (editing the body re-runs the check; the job reads the live body), and
   CI builds vigil's dev image and runs its suites offline. It does not build
   the session layer (no claude-mods in CI). **After a labelled PR merges, run**
   `vigil dev-image --repo <repo>` for each repo it names (add `--rebuild` only

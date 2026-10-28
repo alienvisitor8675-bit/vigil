@@ -63,3 +63,36 @@ def test_the_pr_body_must_name_the_repo_or_layer() -> None:
     assert not ik.body_names_rebuild("no line here\n<!-- Rebuilds images: x -->")
     assert not ik.body_names_rebuild("")
     assert not ik.body_names_rebuild(None)
+
+
+def test_the_suite_container_is_hardened_like_the_verifiers() -> None:
+    args = ik.suite_run_args("img", Path("/clean"), "pytest")
+    joined = " ".join(args)
+    for flag in (
+        "--network none",
+        "--read-only",
+        "--security-opt no-new-privileges",
+        "--pids-limit 2048",
+        "--memory 6g",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "/clean:/src:ro",
+        "--cap-drop ALL",
+    ):
+        assert flag in joined, flag
+    assert "10001" in joined and args[-1] == "pytest"
+
+
+def test_a_deleted_layer_file_is_reported() -> None:
+    # the set built from HEAD's disk would miss it; any changed path under the layer counts
+    assert _changed(["images/claude-executor/gone.py"]) == ["images/claude-executor/gone.py"]
+    assert _changed(["images/claude-executor/__pycache__/x.pyc"]) == []
+
+
+def test_a_changed_claude_mods_sha_is_an_input() -> None:
+    cfg = config.load()
+    base = {"github": {"claude_mods_sha": "a" * 40, "other": 1}}
+    head = {"github": {"claude_mods_sha": "b" * 40, "other": 1}}
+    got = ik.changed_inputs(cfg, REPO, ["configs/vigild.yaml"], REPOS, REPOS, base, head)
+    assert got == ["configs/vigild.yaml: github.claude_mods_sha"]
+    same = {"github": {"claude_mods_sha": "a" * 40, "other": 2}}
+    assert ik.changed_inputs(cfg, REPO, ["configs/vigild.yaml"], REPOS, REPOS, base, same) == []
