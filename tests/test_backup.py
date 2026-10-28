@@ -439,6 +439,8 @@ def test_exclusive_create_refuses_a_symlink_that_appears_after_the_precheck(
         backup.run_backup(data, dest, now=NOW)
     assert not target.exists()
     assert not [p for p in dest.iterdir() if p.suffix in (".db", ".vault")]
+    # not ours, so the failure path leaves it where it was
+    assert (dest / "vigil-20261027T030000Z.marker").is_symlink()
 
 
 def _set(

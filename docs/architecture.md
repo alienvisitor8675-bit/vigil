@@ -352,7 +352,8 @@ vigild writes), and `vigil-<stamp>.vault/`, an rsync of `vault/`. It prunes
 sets older than 14 days. Each set has a `vigil-<stamp>.marker` file holding the
 run id (16 hex characters); it is written first in the tmp dir, then copied
 (exclusive create, no hard link, so exFAT works and a planted symlink is never
-written through) into place before the db and vault, so no piece is ever unmarked. Prune removes only
+written through) into place before the db and vault, so no piece is ever
+unmarked; a failed run removes only the pieces it placed. Prune removes only
 sets whose marker holds exactly that format, so a person's own file is never
 touched. The copy is a normal `sqlite3.connect` plus `backup()`, so it is
 consistent under WAL while vigild runs (it may create `-wal`/`-shm` beside the

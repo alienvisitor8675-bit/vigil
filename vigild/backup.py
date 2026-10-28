@@ -109,6 +109,7 @@ def run_backup(
         work = dest / f".vigil-{stamp}.tmp"
         work.mkdir()
         (work / TMP_MARKER).write_text(run_id)
+        placed: list[Path] = []  # what this run put in dest; only these are discarded
         try:
             _copy_db(src, work / "db")
             warnings += _copy_vault(data / "vault", work / "vault")
@@ -117,11 +118,14 @@ def run_backup(
             # A copy, not a hard link (exFAT/FAT have none); "x" never opens an
             # existing file or a symlink at that name.
             with open(final_marker, "x") as f:
+                placed.append(final_marker)
                 f.write(run_id)
             os.rename(work / "db", final_db)
+            placed.append(final_db)
             os.rename(work / "vault", final_vault)
+            placed.append(final_vault)
         except BaseException:
-            _discard([final_db, final_vault, final_marker])
+            _discard(placed)
             raise
         finally:
             shutil.rmtree(work, ignore_errors=True)

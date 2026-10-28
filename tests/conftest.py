@@ -141,3 +141,15 @@ def hold_usd(gw: Any, session_id: str, usd: float, model: str = "claude-sonnet-5
     body = {"model": model, "max_tokens": n}
     amount, _body, _raw = gw._hold_clamped(session_id, model, body, b"")
     return float(amount)
+
+
+@pytest.fixture(autouse=True)
+def no_host_backup_plist(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`vigil doctor` reads the installed launchd plist for the backup
+    destination; tests never see the host's plist or VIGIL_BACKUP_DIR."""
+    from vigild import doctor
+
+    monkeypatch.setattr(doctor, "BACKUP_PLIST", tmp_path_factory.mktemp("la") / "absent.plist")
+    monkeypatch.delenv("VIGIL_BACKUP_DIR", raising=False)

@@ -254,3 +254,7 @@ def test_run_checks_includes_backup_freshness(
     monkeypatch.setenv("VIGIL_BACKUP_DIR", str(d))
     names = {c.name: c for c in run_checks(cfg, Secrets({}), http=http, docker=None, repos=[])}
     assert names["backup freshness"].ok is True
+
+
+def test_tests_never_read_the_hosts_backup_plist() -> None:
+    assert not doctor.BACKUP_PLIST.is_relative_to(Path.home() / "Library")
