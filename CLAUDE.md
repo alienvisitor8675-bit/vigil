@@ -30,8 +30,8 @@ phase 1 are ADRs in `docs/decisions/`; the owner's rulings are indexed in
   layer, pydantic the only schema source (`schemas/*.json` are generated).
 - **Money.** Every hosted model call goes through vigild's gateway
   (`vigild/gateway/`), which meters it and refuses a call that would cross
-  a budget. Nothing else holds a provider key. Caps: $10/day, $2/task,
-  $100/month, all hard stops (`configs/budgets.yaml`).
+  a budget. Nothing else holds a provider key. Caps: $25/day (pacing only), $2/task,
+  $200/month (the real budget), all hard stops (`configs/budgets.yaml`).
 - **GitHub.** Only vigild talks to GitHub, from the host: it checks scope
   and pushes, and opens draft PRs (P2). Workers never hold a GitHub token.
   vigild mints only for repos in `configs/repos.yaml` (plus claude-mods,

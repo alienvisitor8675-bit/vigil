@@ -27,6 +27,7 @@ def cfg(tmp_path: Path) -> Config:
     # The cap-mechanics tests are written against a $5 day (two $2 workers fit,
     # a third queues); the real value is asserted in tests/test_budget.py.
     c.budgets.daily_usd = 5.0
+    c.budgets.monthly_usd = 100.0  # the tests' own month, whatever the real cap
     return c
 
 

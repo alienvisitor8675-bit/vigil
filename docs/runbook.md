@@ -312,7 +312,7 @@ $2 coord reservation (it was $1 until PR 15) before it began. To raise the cap, 
 (minimum 1,024) and restart vigild; vigild refuses a job with a 422 and the
 numbers if a role's worst-case first call no longer fits its reservation, and
 `tests/gateway/test_first_call.py` fails the same way, so raise
-`coord_session_usd` with it and keep a job's reservations under the $5 day. With the coord at $2, an Opus coord is refused only when its request reaches about 600k characters with ~$0.30 spent (at $1 it was 230-270k). A session whose reservation does not fit what is left of the day waits (events `queued`, `dequeued`) rather than failing; a wave of three workers at $2 runs two and the third waits for one to settle. A call refused mid-run (output below the floor, or out of reservation) ends that session with a page naming the cap and the shortfall (a crashed or killed worker, by contrast, resumes from its last checkpoint).
+`coord_session_usd` with it and keep a job's reservations under the $25 day. With the coord at $2, an Opus coord is refused only when its request reaches about 600k characters with ~$0.30 spent (at $1 it was 230-270k). A session whose reservation does not fit what is left of the day waits (events `queued`, `dequeued`) rather than failing; a wave of three workers at $2 runs two and the third waits for one to settle. A call refused mid-run (output below the floor, or out of reservation) ends that session with a page naming the cap and the shortfall (a crashed or killed worker, by contrast, resumes from its last checkpoint).
 A session whose final model call stopped at the cap is marked failed
 ("truncated at the output cap"), not done.
 
@@ -872,7 +872,7 @@ Run by hand only when the launchd agent isn't installed or is booted out
   its work goes to the preset's fallback in `configs/routing.yaml`.
 - **The experiment line (bench; owner, 2026-10-27).** A bench job's money comes from
   `experiment_monthly_usd` in `configs/budgets.yaml` ($30 a UTC month), never from the
-  $5 day; it still counts toward the $100 month, and a bench task's own cap is
+  $25 day; it still counts toward the $200 month, and a bench task's own cap is
   `bench_task_usd` ($1.50). Both are hard stops. A bench reservation with no room is
   refused, not queued, and pages nobody: the run ends with the failure tag `budget`
   (a `bench_failure` event). `vigil doctor` prints the line's spend this month ("experiment
@@ -960,7 +960,7 @@ still on disk, and no open breaker.
   `cost_usd`; the same row is in the `replays` table.
 - **What it costs and where it books:** one reviewer session, at most
   `review_session_usd` ($0.40, a hard cap: a replay gets no over-cap extension), on the
-  experiment line (`experiment_monthly_usd`), never the $5 day, and counted in the $100
+  experiment line (`experiment_monthly_usd`), never the $25 day, and counted in the $200
   month. A full line, or any open breaker, refuses it (409).
 - **What it never does:** change a job, task, review ladder, rung, window or audit; file
   an inbox item; call GitHub; write the job's own `review.json`. Every row it writes is

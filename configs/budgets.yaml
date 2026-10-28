@@ -2,9 +2,9 @@
 # starts; a start is refused unless spent + open reservations + this one fit
 # under the daily and the monthly cap. The gateway refuses a call that would
 # take a session past its reservation. Days and months are UTC.
-daily_usd: 10.00
+daily_usd: 25.00        # pacing only (owner, 2026-10-28)
 per_task_usd: 2.00
-monthly_usd: 100.00      # mandatory (P4, owner 2026-10-22)
+monthly_usd: 200.00      # the real budget, mandatory (P4; owner, 2026-10-28)
 wip_per_repo: 4          # enforced by the phase 2 scheduler
 coord_session_usd: 2.00  # reservation for one coord drafting session
 decider_call_usd: 0.01   # reservation for one Haiku decider call
