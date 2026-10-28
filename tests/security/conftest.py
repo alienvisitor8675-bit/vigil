@@ -142,11 +142,11 @@ def _quietly(fn: Callable[[], object]) -> None:
             raise
 
 
-def _by_label(listing: Any, labels: list[str]) -> list[Any]:
+def _by_label(listing: Any, labels: list[str], **kw: Any) -> list[Any]:
     """Objects carrying any of `labels` ("key=value"), each once, selected by label only."""
     seen: dict[str, Any] = {}
     for label in labels:
-        for obj in listing.list(filters={"label": label}):
+        for obj in listing.list(filters={"label": label}, **kw):
             seen.setdefault(obj.id, obj)
     return list(seen.values())
 
@@ -157,8 +157,8 @@ def _teardown_run(client: Any, *, session_ids: list[str], run_id: str) -> None:
     A container on one of those networks that is not this run's is disconnected, not
     removed. Not-found is ignored, so a second call is a no-op."""
     labels = [f"{SESSION_LABEL}={sid}" for sid in session_ids] + [f"{RUN_LABEL}={run_id}"]
-    mine = {c.id for c in _by_label(client.containers, labels)}
-    for c in _by_label(client.containers, labels):
+    mine = {c.id for c in _by_label(client.containers, labels, all=True)}
+    for c in _by_label(client.containers, labels, all=True):
         _quietly(lambda c=c: c.remove(force=True))
     for net in _by_label(client.networks, labels):
         try:

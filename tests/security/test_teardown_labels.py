@@ -15,6 +15,7 @@ class NotFound(Exception):
 class FakeContainer:
     def __init__(self, world: FakeWorld, cid: str, name: str, labels: dict[str, str]) -> None:
         self.world, self.id, self.name, self.labels = world, cid, name, labels
+        self.running = True
 
     def remove(self, force: bool = False) -> None:
         if self.id not in self.world.containers:
@@ -53,11 +54,13 @@ class _Listing:
     def __init__(self, items: dict[str, Any]) -> None:
         self._items = items
 
-    def list(self, filters: dict[str, str] | None = None, **kw: Any) -> list[Any]:
+    def list(
+        self, filters: dict[str, str] | None = None, all: bool = False, **kw: Any
+    ) -> list[Any]:
         # a name filter would be a bug in teardown: the fake supports labels only
         assert set(filters or {}) <= {"label"}, filters
         label = (filters or {}).get("label")
-        out = list(self._items.values())
+        out = [o for o in self._items.values() if all or getattr(o, "running", True)]
         if label is None:
             return out
         key, _, val = label.partition("=")
@@ -173,3 +176,12 @@ def test_ac4_empty_world_is_a_no_op() -> None:
     w = FakeWorld()
     _teardown_run(FakeClient(w), session_ids=["s-a"], run_id="run1")
     assert w.removed == []
+
+
+def test_ac1_stopped_labelled_container_is_removed() -> None:
+    w, client = _setup()
+    w.containers["c-mine"].running = False
+    w.containers["c-run"].running = False
+    _teardown_run(client, session_ids=["s-a"], run_id="run1")
+    assert "c-mine" not in w.containers
+    assert "c-run" not in w.containers
