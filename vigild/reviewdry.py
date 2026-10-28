@@ -23,16 +23,16 @@ from pathlib import Path
 from typing import Any
 
 from vigild import config
-from vigild.budget import Budget
+from vigild.budget import Budget, BudgetExceeded
 from vigild.config import Config, Secrets
 from vigild.contract.models import ReviewOutput
-from vigild.db import Store
+from vigild.db import Store, utcnow
 from vigild.devimage import DevImages, SessionImages
 from vigild.executors.base import Executor
 from vigild.gateway.service import Gateway
 from vigild.gitsafe import git
 from vigild.jobs.runner import JobRunner, NoPublisher
-from vigild.repos import set_visibility_source
+from vigild.repos import repo_rule_errors, set_visibility_source
 from vigild.telemetry.spans import Telemetry
 from vigild.verifier import Verifier
 from vigild.workspace import SHA, Workspace
@@ -61,7 +61,9 @@ def open_readonly(data_dir: Path) -> sqlite3.Connection:
     db = data_dir / "vigil.db"
     if not db.is_file():
         raise DryRunError(f"no vigil.db in {data_dir}")
-    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    # immutable: sqlite opens no -wal or -shm, so nothing is created beside the
+    # database. Safe because vigild is stopped while the tool runs.
+    conn = sqlite3.connect(f"file:{db}?mode=ro&immutable=1", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -107,6 +109,41 @@ def seed(src: sqlite3.Connection, store: Store, job_id: str, task_id: str) -> di
     _insert(store, "artifacts", arts)
     _insert(store, "dev_images", src.execute("SELECT * FROM dev_images").fetchall())
     return pr
+
+
+def seed_budget(src: sqlite3.Connection, store: Store, task_id: str) -> None:
+    """Copy the production ledger the caps are measured against: this month's
+    spend (so today's and the month's), the task's own spend, and every open
+    reservation. Read only on the source; the scratch ledger then refuses what
+    production would."""
+    month = utcnow().strftime("%Y-%m")
+    store.x("PRAGMA foreign_keys=OFF")
+    for table, where in (
+        ("ledger", "month=? OR task_id=?"),
+        ("reservations", "status='open' OR month=? OR task_id=?"),
+    ):
+        rows = src.execute(f"SELECT * FROM {table} WHERE {where}", (month, task_id)).fetchall()  # noqa: S608
+        for r in rows:
+            cols = [c for c in r.keys() if c != "id"]  # noqa: SIM118
+            store.x(
+                f"INSERT INTO {table} ({','.join(cols)}) VALUES ({','.join('?' for _ in cols)})",  # noqa: S608
+                tuple(r[c] for c in cols),
+            )
+
+
+def preflight(store: Store, cfg: Config, task_id: str) -> None:
+    """Refuse, before any call, a run the production caps would refuse: the
+    run's own cap (`review_session_usd`) must fit the day, the month and the
+    task, as the seeded ledger stands."""
+    amount = cfg.budgets.review_session_usd
+    budget = Budget(store, cfg.budgets)
+    try:
+        rid = budget.reserve(
+            session_id=None, task_id=task_id, amount=amount, purpose="dry-run preflight"
+        )
+    except BudgetExceeded as e:
+        raise DryRunError(f"refused before any call: {e}") from e
+    store.x("DELETE FROM reservations WHERE id=?", (rid,))
 
 
 def _import_head(
@@ -225,6 +262,13 @@ def _run(
     store = Store.open(scratch / "vigil.db")
     pr = seed(src, store, job_id, task_id)
     job = store.get_job(job_id)
+    if not private and not repo_rule_errors(cfg, job.repo, True):
+        raise DryRunError(
+            f"{job.repo} lists only private-safe backends in configs/repos.yaml (private-only):"
+            " --repo-visibility public is refused"
+        )
+    seed_budget(src, store, task_id)
+    preflight(store, cfg, task_id)
     head = head or str(pr["head"])
     base_sha = str(pr.get("base_sha") or "")
     if not SHA.match(head) or not SHA.match(base_sha):
@@ -260,6 +304,7 @@ def _run(
         set_visibility_source(None)
         stop()
     cost = float(store.q("SELECT COALESCE(SUM(cost_usd),0) AS c FROM model_calls")[0]["c"])
+    # (the model_calls table starts empty in the scratch database: this is this run's)
     result: dict[str, Any] = {
         "job": job_id,
         "task": task_id,
@@ -268,6 +313,8 @@ def _run(
         "round": ri.rnd,
         "reviewer": ri.reviewer,
         "cost_usd": round(cost, 6),
+        "run_cap_usd": cfg.budgets.review_session_usd,
+        "cost_recorded_in_production": False,
         "scratch": str(scratch),
         "error": why or None,
         "verdict": None,
@@ -282,6 +329,13 @@ def _run(
     return result
 
 
+def _cost_line(result: dict[str, Any]) -> str:
+    return (
+        f"COST ${result['cost_usd']:.4f}: NOT recorded in the production ledger; "
+        "add it to your records"
+    )
+
+
 def render(result: dict[str, Any]) -> str:
     lines = [
         f"review of {result['task']} at {result['head'][:12]} (round {result['round']}, "
@@ -289,6 +343,7 @@ def render(result: dict[str, Any]) -> str:
     ]
     if result["error"]:
         lines.append(f"no valid review: {result['error']}")
+        lines.append(_cost_line(result))
         return "\n".join(lines)
     lines.append(f"verdict: {result['verdict']}")
     for f in result["findings"]:
@@ -296,4 +351,5 @@ def render(result: dict[str, Any]) -> str:
     if not result["findings"]:
         lines.append("(no findings)")
     lines.append("checklist: " + json.dumps(result["checklist"], sort_keys=True))
+    lines.append(_cost_line(result))
     return "\n".join(lines)

@@ -445,8 +445,16 @@ read through gitsafe, and the run happens in a scratch data dir (default: a new 
 dir) with its own database and gateway. It changes no job or task, makes no inbox item
 or PR, calls no GitHub. It uses the task's existing session image, so run vigild once
 first if the dev image is stale. It needs port 8788 for its gateway: **stop vigild
-first**. Spend is metered in the scratch database, so it does not count toward the
-real day's cap (about $0.10 for a review).
+first**.
+
+**The run's real spend is NOT recorded in the production ledger.** Its calls are
+metered in the scratch database only, so add the printed cost to your own records. The
+tool prints `COST $X.XXXX: NOT recorded in the production ledger; add it to your
+records` and puts `cost_usd` in the JSON. To keep the caps true, it first seeds the
+scratch ledger from the source database (read-only): this month's spend, the task's
+spend and every open reservation. The $5 day, $2 task and $100 month caps then bite as
+in production, and the tool refuses before any call if the run doesn't fit. The run
+itself is capped at `review_session_usd` ($0.40; about $0.10 for a review).
 
 ```sh
 uv run python scripts/review-dry-run.py --data-dir ~/vigil-data --job pa-0003 \
@@ -456,7 +464,8 @@ uv run python scripts/review-dry-run.py --data-dir ~/vigil-data --job pa-0003 \
 
 vigild's own loader reads the env file for the Anthropic key; you pass no secret.
 GitHub isn't asked for the repo's visibility, so you state it (`--repo-visibility`,
-default `private`, which refuses a hosted backend the repo's policy doesn't list).
+default `private`, which refuses a hosted backend the repo's policy doesn't list;
+`public` is refused for a repo whose entry lists only private-safe backends).
 `--head` defaults to the latest `pr_open` event's head. The verdict and findings are
 printed and written to `--out`, which must not be under the data dir.
 

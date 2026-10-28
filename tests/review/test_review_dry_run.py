@@ -82,6 +82,18 @@ def _wiring(reviewer: Reviewer, tmp: Path) -> Wiring:
     return Wiring(reviewer, images, serve_gateway=False)  # type: ignore[arg-type]
 
 
+def _no_github(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Any HTTP request to a GitHub host fails the test, at the transport."""
+    import httpx2
+
+    def refuse(self: Any, request: Any) -> Any:
+        assert "github" not in request.url.host, f"a dry run called {request.url}"
+        raise AssertionError(f"a dry run made an HTTP request: {request.url}")
+
+    monkeypatch.setattr(httpx2.HTTPTransport, "handle_request", refuse)
+    monkeypatch.setattr(httpx2.Client, "send", lambda self, request, **kw: refuse(self, request))
+
+
 def _tool() -> Any:
     spec = importlib.util.spec_from_file_location(
         "review_dry_run", ROOT / "scripts/review-dry-run.py"
@@ -103,14 +115,15 @@ def test_it_builds_the_real_reviews_packet_and_has_no_effects(
     job = _approve(w)
     task = f"{job}-w1"
     (real,) = [s for s in w.standin.specs if s.role is Role.REVIEWER and str(s.task_id) == task]
+    w.store.conn.close()  # vigild is stopped while the tool runs: no -wal is left
     data = tmp_path / "data"
     before = _snapshot(data)
-    total = w.store.conn.total_changes
 
     def no_network(self: socket.socket, address: Any) -> None:
         raise AssertionError(f"a dry run opened a connection to {address}")
 
     monkeypatch.setattr(socket.socket, "connect", no_network)
+    _no_github(monkeypatch)
     reviewer = Reviewer({**CLEAN_REVIEW, "verdict": "clean", "findings": [FINDING]})
     out = tmp_path / "out" / "review.json"
     result = dry_run(
@@ -130,8 +143,10 @@ def test_it_builds_the_real_reviews_packet_and_has_no_effects(
     assert "AC1 lists three rows" in render(result)
     # the source data dir is untouched: the same files, bytes, sizes and times
     assert _snapshot(data) == before
-    assert w.store.conn.total_changes == total
-    assert w.store.get_task(task).state == "reviewed"
+    src_db = sqlite3.connect(f"file:{data / 'vigil.db'}?mode=ro&immutable=1", uri=True)
+    assert src_db.execute("SELECT state FROM tasks WHERE id=?", (task,)).fetchone()[0] == (
+        "reviewed"
+    )
     # the scratch run made no inbox item and no PR event, and left the job as it was
     scratch_db = sqlite3.connect(tmp_path / "scratch" / "vigil.db")
     assert scratch_db.execute("SELECT COUNT(*) FROM inbox_items").fetchone()[0] == 0
@@ -154,6 +169,7 @@ def test_it_never_writes_inside_the_data_dir(filed: None, world: World, tmp_path
 
 def test_a_bad_head_or_task_is_refused(filed: None, world: World, tmp_path: Path) -> None:
     job = _approve(world)
+    world.store.conn.close()
     common: dict[str, Any] = {"data_dir": tmp_path / "data", "out": tmp_path / "o.json",
                               "secrets": Secrets({}), "wiring": _wiring(Reviewer({}), tmp_path)}  # fmt: skip
     with pytest.raises(DryRunError, match="40-hex"):
@@ -166,3 +182,112 @@ def test_the_cli_reports_a_missing_database(tmp_path: Path, capsys: Iterator[Any
     rc = _tool().main(["--data-dir", str(tmp_path), "--job", "x-0001", "--task", "x-0001-w1",
                        "--out", str(tmp_path / "o.json")])  # fmt: skip
     assert rc == 2
+
+
+def _files(root: Path) -> set[str]:
+    return {str(p.relative_to(root)) for p in root.rglob("*")}
+
+
+def test_a_closed_wal_database_gets_no_new_file_in_the_data_dir(
+    filed: None, world: World, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = _approve(world)
+    world.store.conn.close()  # cleanly: no -wal or -shm is left beside vigil.db
+    data = tmp_path / "data"
+    assert (data / "vigil.db").is_file()
+    assert not (data / "vigil.db-wal").exists() and not (data / "vigil.db-shm").exists()
+    before, snap = _files(data), _snapshot(data)
+    _no_github(monkeypatch)
+    dry_run(
+        data_dir=data, job_id=job, task_id=f"{job}-w1", head=None, out=tmp_path / "o.json",
+        cfg=cfg, secrets=Secrets({}), scratch=tmp_path / "scratch", private=False,
+        wiring=_wiring(Reviewer({**CLEAN_REVIEW, "verdict": "clean"}), tmp_path),
+    )  # fmt: skip
+    assert _files(data) == before and _snapshot(data) == snap
+
+
+def _spend(w: World, usd: float, *, day: str | None = None, task: str | None = None) -> None:
+    from vigild.db import utcnow
+
+    now = utcnow()
+    w.store.x(
+        "INSERT INTO ledger (reservation_id, session_id, task_id, amount_usd, day, month, ts)"
+        " VALUES (NULL, NULL, ?, ?, ?, ?, ?)",
+        (task, usd, day or now.strftime("%Y-%m-%d"), now.strftime("%Y-%m"), now.isoformat()),
+    )
+
+
+@pytest.mark.parametrize("cap", ["daily", "monthly", "per_task"])
+def test_the_production_caps_apply_and_refuse_before_any_call(
+    filed: None, world: World, cfg: Config, tmp_path: Path, cap: str
+) -> None:
+    job = _approve(world)
+    task = f"{job}-w1"
+    if cap == "daily":
+        _spend(world, 4.80)
+    elif cap == "monthly":  # earlier this month: the day is clear, the month is not
+        _spend(world, 99.80, day="2000-01-01")
+    else:
+        _spend(world, 1.80, day="2000-01-01", task=task)
+    world.store.conn.close()
+    reviewer = Reviewer({**CLEAN_REVIEW, "verdict": "clean"})
+    with pytest.raises(DryRunError, match=f"{cap} cap"):
+        dry_run(data_dir=tmp_path / "data", job_id=job, task_id=task, head=None,
+                out=tmp_path / "o.json", cfg=cfg, secrets=Secrets({}),
+                scratch=tmp_path / "scratch", private=False,
+                wiring=_wiring(reviewer, tmp_path))  # fmt: skip
+    assert reviewer.specs == []
+
+
+def test_the_dry_run_books_open_reservations_and_stays_under_its_run_cap(
+    filed: None, world: World, cfg: Config, tmp_path: Path
+) -> None:
+    job = _approve(world)
+    world.store.conn.close()
+    reviewer = Reviewer({**CLEAN_REVIEW, "verdict": "clean"})
+    result = dry_run(
+        data_dir=tmp_path / "data", job_id=job, task_id=f"{job}-w1", head=None,
+        out=tmp_path / "o.json", cfg=cfg, secrets=Secrets({}), scratch=tmp_path / "scratch",
+        private=False, wiring=_wiring(reviewer, tmp_path),
+    )  # fmt: skip
+    assert result["run_cap_usd"] == cfg.budgets.review_session_usd == 0.40
+    assert result["cost_recorded_in_production"] is False
+    assert json.loads((tmp_path / "o.json").read_text())["cost_usd"] == result["cost_usd"]
+
+
+def test_the_cost_line_is_printed_and_in_the_json(
+    tmp_path: Path, capsys: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tool = _tool()
+    result = {"job": "j", "task": "j-w1", "head": "a" * 40, "round": 1, "reviewer": "claude-sonnet",
+              "cost_usd": 0.1234, "error": None, "verdict": "clean", "findings": [],
+              "checklist": None, "cost_recorded_in_production": False}  # fmt: skip
+    monkeypatch.setattr(tool, "dry_run", lambda **kw: result)
+    rc = tool.main(["--data-dir", str(tmp_path), "--job", "j", "--task", "j-w1",
+                    "--out", str(tmp_path / "o.json")])  # fmt: skip
+    assert rc == 0
+    assert (
+        "COST $0.1234: NOT recorded in the production ledger; add it to your records"
+        in capsys.readouterr().out.splitlines()
+    )
+
+
+def test_private_refuses_a_hosted_preset_and_public_refuses_a_private_only_repo(
+    filed: None, world: World, cfg: Config, tmp_path: Path
+) -> None:
+    from tests.jobs.test_coord_loop import REPO
+
+    job = _approve(world)
+    world.store.conn.close()
+    common: dict[str, Any] = {"data_dir": tmp_path / "data", "job_id": job,
+                              "task_id": f"{job}-w1", "head": None, "out": tmp_path / "o.json",
+                              "cfg": cfg, "secrets": Secrets({}), "scratch": tmp_path / "s",
+                              "wiring": _wiring(Reviewer({}), tmp_path)}  # fmt: skip
+    # the fixture repo lists hosted Claude backends: a private run refuses them
+    result = dry_run(private=True, **common)
+    assert result["error"] and "hosted backend" in result["error"]
+    # a repo that lists only private-safe entries can't be called public
+    pol = cfg.repos.repos[REPO]
+    pol.backends, pol.decider, pol.worker_overflow = ["tower-fast"], ["jev"], []
+    with pytest.raises(DryRunError, match="private-only"):
+        dry_run(private=False, **common)
