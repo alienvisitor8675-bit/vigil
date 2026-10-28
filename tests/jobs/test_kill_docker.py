@@ -57,8 +57,10 @@ def test_a_running_job_leaves_no_container_network_or_reservation(
     w = world
     real = rt.worker_kwargs
 
-    def sleeping(cfg: Any, spec: SessionSpec, *, network: str) -> dict[str, Any]:
-        return {**real(cfg, spec, network=network), "entrypoint": ["sleep", "600"], "command": []}
+    def sleeping(cfg: Any, spec: SessionSpec, *, network: str, host: Any = None) -> dict[str, Any]:
+        # the real signature, `host` included (ADR-0004): the runtime passes it
+        kw = real(cfg, spec, network=network, host=host)
+        return {**kw, "entrypoint": ["sleep", "600"], "command": []}
 
     monkeypatch.setattr(rt, "worker_kwargs", sleeping)
     runtime = DockerRuntime(w.runner.cfg)
