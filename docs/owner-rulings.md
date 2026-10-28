@@ -55,6 +55,7 @@ applied.
 - **2026-10-23**: ParkAgent stays public until 2a's reruns, the phase 1 run, the 2a merge and the allowlist cleanup (with doctor passing) are done; every repo is designed private-first (#1).
 
 ## Process (reviews, workers, reports)
+- **2026-10-28**: A routing rule's test submits a request through the API and checks the routed task; it never sets the input the rule reads (rule 6 never fired because `has_existing_tests` was never set while its tests set it by hand; #100).
 - **2026-10-28**: After round 1, re-review only the new diff; a bug class found once is fixed everywhere in the PR; after two rounds, bring it to the owner (#1).
 - **2026-10-28**: Coord checks `docs/owner-rulings.md` before asking the owner, and logs which ruling it applied (#1).
 - **2026-10-28**: After #60 and backup (#23) merge, docs-, tests- and fix-shaped work on vigil is submitted as vigild jobs, not built by coord's subagents (#1).
