@@ -1,0 +1,19 @@
+# pa-0002 (ParkAgent), task w3: two things the auditor found and the reviewer missed.
+# The precedingNames first-name-wins finding was found by the reviewer, so it is not here.
+# No code and no diff; the diff comes from vigild's vault. file and line are the
+# auditor's, from its audit.json.
+id: pa-0002-w3
+job_id: pa-0002
+task_id: pa-0002-w3
+head: 9f313ae2b3f115393567fa941c305a6a741478de
+expected:
+  - ac: AC2
+    class: ac-semantics-mismatch
+    description: the mention check needs name as a whole word; the spec says line N must contain name
+    file: scripts/check-feature-map.mjs
+    line: 84
+  - ac: null
+    class: stale-docs
+    description: the script header comment (usage and what FAILS) still describes only the old checks
+    file: scripts/check-feature-map.mjs
+    line: 4

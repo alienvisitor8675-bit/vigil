@@ -42,6 +42,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -103,6 +104,14 @@ from vigild.repos import (
     repo_rule_errors,
 )
 from vigild.review.ladder import Ladder, LadderChange, classify_shape
+from vigild.review.replay import (
+    ReplayInvalid,
+    ReplayNotFound,
+    ReplayRefused,
+    load_cases,
+    resolve_prompt,
+    run_set,
+)
 from vigild.router.rules import RoutingError, route
 from vigild.scheduler import wip
 from vigild.scheduler.graph import Slots, run_graph
@@ -111,6 +120,18 @@ from vigild.verifier import Verifier, runner_like, runner_overlap
 from vigild.workspace import Workspace, WorkspaceError
 
 log = logging.getLogger("vigild.runner")
+
+
+@dataclass(frozen=True)
+class ReviewInputs:
+    """What a reviewer's packet is made of (see `JobRunner._review_inputs`)."""
+
+    rules: str
+    request: dict[str, Any]
+    untrusted: dict[str, str]
+    diff: str
+
+
 # the draft PR title of a runner-file task while hidden tests are off (host policy)
 OWNER_REVIEW_TITLE = "Owner review required: runner file changed; hidden tests disabled"
 COORD_DRAFTS = 3
@@ -1187,7 +1208,8 @@ class JobRunner:
         """Settle a session's reservation (failing closed if that raises), then
         the spend check: a late settle can fill the day too (2a round 9)."""
         self._settle_fail_closed(s, spec, reservation, out)
-        self._spend_check()
+        if not self.store.is_replay(s.id):  # a replay never trips a real breaker (#47)
+            self._spend_check()
 
     def _settle_fail_closed(
         self, s: SessionRow, spec: SessionSpec, reservation: int, out: ExecOutcome | None
@@ -1208,6 +1230,7 @@ class JobRunner:
             (reservation, s.id),
         )
         reserved = float(rows[0]["n"])
+        replay = self.store.is_replay(s.id)  # a replay's record names no job and files no item
         steps: list[Callable[[], Any]] = [
             lambda: self.budget.settle(reservation, reserved),
             lambda: self.store.update_session(s.id, status="failed"),
@@ -1215,21 +1238,25 @@ class JobRunner:
                 "metering_failed",
                 {"session_id": s.id, "error": err, "booked_usd": reserved},
                 Provenance.HUMAN,
-                job_id=spec.job_id,
+                job_id=None if replay else spec.job_id,
                 session_id=s.id,
-                task_id=spec.task_id,
+                task_id=None if replay else spec.task_id,
             ),
-            lambda: self.store.create_inbox_item(
-                "questions",
-                "page",
-                spec.job_id,
-                f"metering failed: {err}; spend for session {s.id} not booked",
-                {
-                    "session_id": s.id,
-                    "booked_usd": reserved,
-                    "note": "the whole reservation was booked as spent; reconcile with provider",
-                    "resumable": False,
-                },
+            lambda: (
+                replay
+                or self.store.create_inbox_item(
+                    "questions",
+                    "page",
+                    spec.job_id,
+                    f"metering failed: {err}; spend for session {s.id} not booked",
+                    {
+                        "session_id": s.id,
+                        "booked_usd": reserved,
+                        "note": "the whole reservation was booked as spent; "
+                        "reconcile with provider",
+                        "resumable": False,
+                    },
+                )
             ),
         ]
         for step in steps:
@@ -3695,22 +3722,21 @@ class JobRunner:
             log.exception("review of %s failed", t.id)
             return "failed", f"vigild error: {type(e).__name__}: {e}"[:1000]
 
-    def _review_one(self, job: Any, t: Any) -> tuple[str, Any]:
-        head = self._task_head(t.id)
-        if head is None:
-            return "failed", "no published head"
+    def _review_setup(self, job: Any, t: Any) -> tuple[Task, Any, bool]:
+        """A task's contract, its review shape, and whether it changes how tests run
+        (the verifier's own record says so): shared by a real review and a replay."""
         task = Task.model_validate(t.contract)
         shape = classify_shape(task, self.cfg)
-        level = task.spec.verify.level
         tests = self.store.get_artifact(job.id, "tests.json", t.id)
-        # the verifier's own record says whether the task changes how tests run
         rf = bool(tests and json.loads(tests.content).get("runner_files"))
-        rung = self.ladder.rung(shape, runner_file=rf)
-        reviewer, auditor = self.ladder.presets(shape, runner_file=rf)
-        rnd = task.review_rounds + 1
-        audit_required = self.ladder.should_audit(shape, level, runner_file=rf)
-        base_sha = self.workspace.base_sha(t.id)
+        return task, shape, rf
+
+    def _review_inputs(self, job: Any, t: Any, head: str, base_sha: str, rnd: int) -> ReviewInputs:
+        """What a reviewer's (and an auditor's) packet is made of, for a task's head:
+        the one place both a real review and a review replay (#47) get it, from
+        vigild's own record and the vault. Nothing here reaches GitHub."""
         diff = self.workspace.full_diff(job.repo, base_sha, head)
+        tests = self.store.get_artifact(job.id, "tests.json", t.id)
         spec_md = self.store.get_artifact(job.id, "spec.md")
         report = self.store.get_artifact(job.id, "worker_report.json", t.id)
         request = {
@@ -3728,6 +3754,26 @@ class JobRunner:
             "the worker's report": report.content if report else "(none)",
         }
         rules = self.workspace.read_blob(job.repo, base_sha, "CLAUDE.md") or ""  # the base's
+        return ReviewInputs(rules=rules, request=request, untrusted=untrusted, diff=diff)
+
+    def _review_one(self, job: Any, t: Any) -> tuple[str, Any]:
+        head = self._task_head(t.id)
+        if head is None:
+            return "failed", "no published head"
+        task, shape, rf = self._review_setup(job, t)
+        level = task.spec.verify.level
+        rung = self.ladder.rung(shape, runner_file=rf)
+        reviewer, auditor = self.ladder.presets(shape, runner_file=rf)
+        rnd = task.review_rounds + 1
+        audit_required = self.ladder.should_audit(shape, level, runner_file=rf)
+        base_sha = self.workspace.base_sha(t.id)
+        inputs = self._review_inputs(job, t, head, base_sha, rnd)
+        rules, request, diff, untrusted = (
+            inputs.rules,
+            inputs.request,
+            inputs.diff,
+            inputs.untrusted,
+        )
         packet = assemble_review(rules, request, diff=diff, untrusted=untrusted)
         out, why = self._read_only_session(
             job, t, Role.REVIEWER, reviewer, head, base_sha, rnd, packet.text, ReviewOutput,
@@ -3907,21 +3953,35 @@ class JobRunner:
         model: type[ReviewOutput] | type[AuditOutput],
         amount: float,
         shape: str = "",
+        *,
+        replay: str | None = None,
     ) -> tuple[ReviewOutput | AuditOutput | None, str]:
         """A reviewer or auditor session on a fresh clone of the task's head:
         read-only tools, its answer as structured output (validated here; an
-        empty or invalid answer fails the stage gate)."""
+        empty or invalid answer fails the stage gate).
+
+        `replay` (a review replay's id, #47) is the one difference: the session belongs to
+        no job or task (`eval-only`, on the experiment line, its cap hard), it draws from
+        no review stage, a refusal raises `ReplayRefused` and trips no breaker, and its
+        clone has its own name. The packet, image, tools and model route are the same."""
         branch = str(t.contract["branch"])
-        parent = [s for s in self.store.list_sessions(job.id) if s.task_id == t.id]
-        s = self.store.create_session(
-            job.id, role, task_id=t.id, parent_session_id=parent[-1].id if parent else None,
-            backend_preset=preset, branch=branch,
-        )  # fmt: skip
+        if replay is not None:
+            s = self.store.create_session(
+                None, role, backend_preset=preset, branch=branch,
+                provenance=Provenance.EVAL_ONLY,
+            )  # fmt: skip
+            self.store.link_replay(replay, s.id)
+        else:
+            parent = [s for s in self.store.list_sessions(job.id) if s.task_id == t.id]
+            s = self.store.create_session(
+                job.id, role, task_id=t.id, parent_session_id=parent[-1].id if parent else None,
+                backend_preset=preset, branch=branch,
+            )  # fmt: skip
         try:
             check_backend(self.cfg, job.repo, preset, private=live_private(job.repo))
             with self._stage_lock:
                 stage = self._review_stage_ids.get(job.id)
-            if stage is not None:  # its cap, drawn from the job's review stage
+            if stage is not None and replay is None:  # its cap, drawn from the job's review stage
                 rid = self.budget.draw(stage, session_id=s.id, amount=amount, purpose=role.value)
             else:
                 rid = self.budget.reserve(
@@ -3929,10 +3989,12 @@ class JobRunner:
                 )
         except (RepoPolicyError, BudgetExceeded) as e:
             self.store.update_session(s.id, status="refused")
+            if replay is not None:
+                raise ReplayRefused(403 if isinstance(e, RepoPolicyError) else 409, str(e)) from e
             if isinstance(e, BudgetExceeded):
                 self._refused_budget(job.id, e, None)  # a cap metered spend reached trips
             return None, str(e)
-        clone_id = f"{t.id}-{role.value}{rnd}"
+        clone_id = f"{replay}-{role.value}" if replay else f"{t.id}-{role.value}{rnd}"
         try:
             clone = self.workspace.clone(
                 job.repo, clone_id, branch=branch, base=job.base, start=head, record_as=base_sha
@@ -4018,7 +4080,7 @@ class JobRunner:
         model: type[ReviewOutput] | type[AuditOutput],
     ) -> tuple[ReviewOutput | AuditOutput | None, str]:
         cost = session_cost(self.store, s.id)
-        if cost > amount + 1e-9:
+        if cost > amount + 1e-9 and not self.store.is_replay(s.id):
             self._note_over_cap(shape, role, job.id, t.id, cap=amount, cost=cost)
         if out.status != "done":
             self.store.update_session(s.id, status="failed")
@@ -4030,6 +4092,113 @@ class JobRunner:
             return None, str(e)[:1000]
         self.store.update_session(s.id, status="done")
         return parsed, ""
+
+    # --- review replay (#47) ----------------------------------------------------------------
+
+    def _task_heads(self, task_id: str) -> list[str]:
+        """Every head the task's PR was published at, oldest first, from vigild's own record."""
+        rows = self.store.q(
+            "SELECT data FROM events WHERE task_id=? AND type='pr_open' ORDER BY id", (task_id,)
+        )
+        heads: list[str] = []
+        for r in rows:
+            head = str(json.loads(r["data"]).get("head") or "")
+            if head and head not in heads:
+                heads.append(head)
+        return heads
+
+    def replay_review(
+        self, job_id: str, task_id: str, prompt_version: str, head: str | None = None
+    ) -> dict[str, Any]:
+        """Run one reviewer session on a past task head with a chosen reviewer prompt
+        (`POST /api/review/replay`). It is the live review path (`_review_inputs`,
+        `assemble_review`, `_read_only_session`: same packet assembly, image, read-only
+        tools and model route, through vigild's own gateway) with these differences,
+        and only these: the prompt is the named version's; the session books to the
+        experiment line (cap: `review_session_usd`, hard) and every row is `eval-only`;
+        there is no audit, no ladder record, no job or task change, no inbox item, no
+        GitHub call (the head and the diff come from the vault); and it refuses while
+        any breaker is open. The repo's backends and privacy are the real review's."""
+        try:
+            job = self.store.get_job(job_id)
+            t = self.store.get_task(task_id)
+        except KeyError as e:
+            raise ReplayNotFound(f"no such job or task: {e}") from e
+        if t.job_id != job.id:
+            raise ReplayNotFound(f"task {task_id} is not a task of job {job_id}")
+        prompt = resolve_prompt(prompt_version)
+        heads = self._task_heads(t.id)
+        if head is None and heads:
+            head = heads[-1]
+        if head is None or head not in heads:
+            raise ReplayInvalid(f"{head or 'the task'} is not a head this task published")
+        open_ = self.breakers.open_breakers()
+        if open_:
+            raise ReplayRefused(
+                409, "a breaker is open: " + ", ".join(f"{b.kind.value}:{b.scope}" for b in open_)
+            )
+        errors = repo_rule_errors(self.cfg, job.repo, live_private(job.repo))
+        if errors:
+            raise ReplayRefused(403, "the private-repo rule: " + "; ".join(errors)[:300])
+        _task, shape, rf = self._review_setup(job, t)
+        reviewer, _auditor = self.ladder.presets(shape, runner_file=rf)
+        rnd = heads.index(head) + 1  # the round that head was reviewed in
+        try:
+            base_sha = self.workspace.base_sha(t.id)
+            inputs = self._review_inputs(job, t, head, base_sha, rnd)
+        except (WorkspaceError, OSError, ValueError) as e:
+            raise ReplayInvalid(f"the vault can't serve {head}: {type(e).__name__}") from e
+        packet = assemble_review(
+            inputs.rules, inputs.request, diff=inputs.diff, untrusted=inputs.untrusted,
+            prompt=prompt.text,
+        )  # fmt: skip
+        rid = self.store.create_replay(job.id, t.id, head, prompt_version, prompt.sha256)
+        try:
+            out, why = self._read_only_session(
+                job, t, Role.REVIEWER, reviewer, head, base_sha, rnd, packet.text, ReviewOutput,
+                self.cfg.budgets.review_session_usd, shape.value, replay=rid,
+            )  # fmt: skip
+        except ReplayRefused as e:
+            self.store.finish_replay(rid, "refused", error=str(e)[:1000])
+            raise
+        except Exception as e:
+            log.exception("replay %s failed", rid)
+            self.store.finish_replay(rid, "failed", error=f"vigild error: {type(e).__name__}")
+            return self._replay_result(rid, rnd)
+        row = self.store.get_replay(rid)
+        sid = row["session_id"]
+        cost = round(session_cost(self.store, sid), 6) if sid else 0.0
+        if str(row["error"] or "").startswith("gate_refused"):  # a breaker wasn't closed
+            self.store.finish_replay(rid, "refused", cost_usd=cost, error=row["error"])
+        elif out is None:
+            self.store.finish_replay(rid, "failed", cost_usd=cost, error=redact(why)[:1000])
+        else:
+            assert isinstance(out, ReviewOutput)
+            self.store.finish_replay(
+                rid, "done", verdict=out.verdict, cost_usd=cost,
+                findings=redact([f.model_dump(mode="json") for f in out.findings]),
+            )  # fmt: skip
+        return self._replay_result(rid, rnd)
+
+    def _replay_result(self, replay_id: str, rnd: int) -> dict[str, Any]:
+        row = self.store.get_replay(replay_id)
+        return {
+            "id": row["id"], "job_id": row["job_id"], "task_id": row["task_id"],
+            "head": row["head"], "round": rnd, "prompt_version": row["prompt_version"],
+            "prompt_sha256": row["prompt_sha256"], "status": row["status"],
+            "verdict": row["verdict"], "findings": json.loads(row["findings"]),
+            "cost_usd": row["cost_usd"], "error": row["error"], "provenance": row["provenance"],
+        }  # fmt: skip
+
+    def replay_set(self, prompt_version: str) -> dict[str, Any]:
+        """Replay every case of the regression set (`tests/fixtures/review_cases/`) with a
+        prompt version; report recall and the total cost (`POST /api/review/replay-set`)."""
+        prompt = resolve_prompt(prompt_version)
+        report = run_set(
+            lambda c: self.replay_review(c.job_id, c.task_id, prompt_version, head=c.head),
+            load_cases(),
+        )
+        return {"prompt_version": prompt_version, "prompt_sha256": prompt.sha256, **report}
 
 
 # --- wiring for the real daemon ------------------------------------------------------------

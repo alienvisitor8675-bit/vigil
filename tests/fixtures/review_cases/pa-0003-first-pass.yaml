@@ -1,0 +1,18 @@
+# The first-pass head of pa-0003 (ParkAgent #320): two findings the reviewer missed and
+# the auditor caught. No code and no diff here; the diff comes from vigild's vault.
+# file and line are the auditor's, from its audit.json.
+id: pa-0003-first-pass
+job_id: pa-0003
+task_id: pa-0003-w1
+head: c902b32b3f9f252f325f1c8d1738cd031f019790
+expected:
+  - ac: AC7
+    class: count-out-of-bound
+    description: 5 classifyPlace cases against a bound of 2-4
+    file: server/test/placeClassification.test.ts
+    line: 293
+  - ac: AC1
+    class: missing-case
+    description: no non-charging-street row with empty understood
+    file: server/test/placeClassification.test.ts
+    line: 72

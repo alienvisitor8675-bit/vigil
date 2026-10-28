@@ -11,6 +11,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field
 
 from vigild.api.auth import (
     COOKIE,
@@ -353,6 +354,55 @@ def review_ladder(request: Request) -> dict[str, Any]:
 
     svc = _svc(request)
     return Ladder(svc.store, svc.cfg).state()
+
+
+class ReplayBody(BaseModel):
+    """`POST /api/review/replay`. No visibility field (and no other): a repo's privacy and
+    backends come from configs/repos.yaml and vigild/repos.py, as for a real review."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(min_length=1, max_length=64)
+    task_id: str = Field(min_length=1, max_length=64)
+    prompt_version: str = Field(min_length=1, max_length=200)
+    # one of the task's published heads (default: the latest); it picks the case's round
+    head: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+
+
+class ReplaySetBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_version: str = Field(min_length=1, max_length=200)
+
+
+def _replayed(call: Any) -> dict[str, Any]:
+    from vigild.review.replay import ReplayError
+
+    try:
+        out: dict[str, Any] = call()
+    except ReplayError as e:
+        raise HTTPException(e.status, str(e)) from e
+    except RuntimeError as e:  # no runner attached
+        raise HTTPException(503, str(e)) from e
+    return out
+
+
+@router.post("/api/review/replay", dependencies=[ADMIN])
+def review_replay(request: Request, body: ReplayBody) -> dict[str, Any]:
+    """Run one reviewer session on a past task head with a chosen reviewer prompt, on the
+    experiment line and `eval-only`; it changes no job, task, ladder or inbox (#47)."""
+    runner = _svc(request).jobs.runner
+    return _replayed(
+        lambda: runner.replay_review(body.job_id, body.task_id, body.prompt_version, body.head)
+    )
+
+
+@router.post("/api/review/replay-set", dependencies=[ADMIN])
+def review_replay_set(request: Request, body: ReplaySetBody) -> dict[str, Any]:
+    """Replay every case of the review regression set with a prompt version; report recall
+    and the total cost (#47)."""
+    runner = _svc(request).jobs.runner
+    return _replayed(lambda: runner.replay_set(body.prompt_version))
 
 
 # --- sessions -----------------------------------------------------------------------

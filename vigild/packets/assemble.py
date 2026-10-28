@@ -85,8 +85,11 @@ def _read(repo: Path, rel: str) -> str | None:
         return None
 
 
-def _role_and_rules(role: Role, repo: Path | None, rules: str | None = None) -> str:
-    prompt = (PROMPTS_DIR / f"{role.value}.md").read_text()
+def _role_and_rules(
+    role: Role, repo: Path | None, rules: str | None = None, prompt: str | None = None
+) -> str:
+    """`prompt` is a role prompt other than the shipped file, for a review replay (#47)."""
+    prompt = prompt if prompt is not None else (PROMPTS_DIR / f"{role.value}.md").read_text()
     if rules is None and repo is not None:
         rules = _read(repo, "CLAUDE.md") or _read(repo, "AGENTS.md")
     rules = rules or "(no CLAUDE.md in this repo)"
@@ -303,6 +306,7 @@ def _review_parts(
     request: dict[str, Any],
     untrusted: dict[str, str],
     schema: dict[str, Any],
+    prompt: str | None = None,
 ) -> dict[str, str]:
     from vigild.contract.models import CHECKLIST
 
@@ -331,7 +335,7 @@ def _review_parts(
         "`false_findings` lists the indexes of reviewer findings that are wrong."
     )
     return {
-        "role_and_rules": _role_and_rules(role, None, rules),
+        "role_and_rules": _role_and_rules(role, None, rules, prompt),
         "context_pack": "Read any file in the repo you need (the tree is the worker's head). "
         "Nothing else is provided.",
         "contract": contract,
@@ -342,12 +346,18 @@ def _review_parts(
 
 
 def assemble_review(
-    rules: str, request: dict[str, Any], *, diff: str, untrusted: dict[str, str]
+    rules: str,
+    request: dict[str, Any],
+    *,
+    diff: str,
+    untrusted: dict[str, str],
+    prompt: str | None = None,
 ) -> Packet:
     """The reviewer's packet (stage 5): the diff, the issue, the spec and the
     checklist, in a fresh context. The diff and anything the worker wrote are
     fenced: they're the work under review, not instructions. `rules` is the
-    base's CLAUDE.md, never the worker's copy."""
+    base's CLAUDE.md, never the worker's copy. `prompt` replaces `prompts/reviewer.md`
+    for a review replay (#47) and nothing else."""
     from vigild.contract.models import ReviewOutput
 
     dropped: list[str] = []
@@ -357,7 +367,9 @@ def assemble_review(
     fenced = {"diff": diff, **untrusted}
     schema = ReviewOutput.model_json_schema()
     return Packet(
-        Role.REVIEWER, _review_parts(rules, Role.REVIEWER, dict(request), fenced, schema), dropped
+        Role.REVIEWER,
+        _review_parts(rules, Role.REVIEWER, dict(request), fenced, schema, prompt),
+        dropped,
     )
 
 

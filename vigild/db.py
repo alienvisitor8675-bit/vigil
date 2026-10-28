@@ -66,6 +66,15 @@ BREAKER_DDL = """CREATE TABLE IF NOT EXISTS breakers (
   item_id INTEGER, held TEXT NOT NULL, detail TEXT NOT NULL, reopen_at TEXT,
   updated_at TEXT NOT NULL, UNIQUE (kind, scope))"""
 
+# Review replay (#47): one row per replay, always `eval-only`. Its result lives here and
+# never in the job's own artifacts; its session is linked by `session_id`.
+REPLAY_DDL = f"""CREATE TABLE IF NOT EXISTS replays (
+  id TEXT PRIMARY KEY, job_id TEXT NOT NULL, task_id TEXT NOT NULL, head TEXT NOT NULL,
+  prompt_version TEXT NOT NULL, prompt_sha256 TEXT NOT NULL, session_id TEXT,
+  status TEXT NOT NULL CHECK (status IN ('running','done','failed','refused')),
+  verdict TEXT, findings TEXT NOT NULL DEFAULT '[]', cost_usd REAL NOT NULL DEFAULT 0,
+  error TEXT, created_at TEXT NOT NULL, finished_at TEXT, {PROV})"""
+
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY, repo TEXT NOT NULL, base TEXT NOT NULL, title TEXT NOT NULL,
@@ -130,6 +139,8 @@ CREATE TABLE IF NOT EXISTS ui_sessions (
 {INTAKE_DDL};
 {TRANSCRIPT_DDL};
 {BREAKER_DDL};
+{REPLAY_DDL};
+CREATE INDEX IF NOT EXISTS replays_session ON replays(session_id);
 CREATE INDEX IF NOT EXISTS events_job ON events(job_id, id);
 CREATE INDEX IF NOT EXISTS calls_session ON model_calls(session_id);
 CREATE INDEX IF NOT EXISTS res_day ON reservations(day, status);
@@ -446,6 +457,12 @@ def _m14_experiment_pool(conn: sqlite3.Connection) -> None:
         _add_columns(conn, table, {"pool": "TEXT NOT NULL DEFAULT 'ops'"})
 
 
+def _m15_replays(conn: sqlite3.Connection) -> None:
+    """Review replay (#47): the replays table, whose session rows run on the experiment line."""
+    _create(conn, REPLAY_DDL)
+    conn.execute("CREATE INDEX IF NOT EXISTS replays_session ON replays(session_id)")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
@@ -461,6 +478,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m12_issue_link,
     _m13_eval_only,
     _m14_experiment_pool,
+    _m15_replays,
 ]
 
 
@@ -575,6 +593,59 @@ class Store:
         rows = self.q("SELECT source FROM jobs WHERE id=?", (job_id,))
         return bool(rows) and rows[0][0] == "bench"
 
+    # --- review replays (#47) ---------------------------------------------------------------
+
+    def is_replay(self, session_id: str | None) -> bool:
+        """Whether a session is a review replay's: it books to the experiment line and
+        every row it writes is `eval-only`."""
+        if not session_id:
+            return False
+        return bool(self.q("SELECT 1 FROM replays WHERE session_id=?", (session_id,)))
+
+    def create_replay(
+        self, job_id: str, task_id: str, head: str, prompt_version: str, prompt_sha256: str
+    ) -> str:
+        rid = "rp-" + uuid.uuid4().hex[:10]
+        self.x(
+            "INSERT INTO replays (id, job_id, task_id, head, prompt_version, prompt_sha256,"
+            " status, created_at, provenance) VALUES (?,?,?,?,?,?,?,?,?)",
+            (rid, job_id, task_id, head, prompt_version, prompt_sha256, "running", iso(),
+             Provenance.EVAL_ONLY.value),
+        )  # fmt: skip
+        return rid
+
+    def gate_refuse_replay(self, session_id: str | None, reason: str) -> None:
+        """The gateway refused a replay's call at a breaker that isn't closed: mark it,
+        so the replay reports `refused` rather than a review that found nothing."""
+        self.x(
+            "UPDATE replays SET error=? WHERE session_id=?", (f"gate_refused: {reason}", session_id)
+        )
+
+    def link_replay(self, replay_id: str, session_id: str) -> None:
+        self.x("UPDATE replays SET session_id=? WHERE id=?", (session_id, replay_id))
+
+    def finish_replay(
+        self,
+        replay_id: str,
+        status: str,
+        *,
+        verdict: str | None = None,
+        findings: list[Any] | None = None,
+        cost_usd: float = 0.0,
+        error: str | None = None,
+    ) -> None:
+        self.x(
+            "UPDATE replays SET status=?, verdict=?, findings=?, cost_usd=?, error=?,"
+            " finished_at=? WHERE id=?",
+            (status, verdict, _j(findings or []), cost_usd, error, iso(), replay_id),
+        )
+
+    def get_replay(self, replay_id: str) -> dict[str, Any]:
+        rows = self.q("SELECT * FROM replays WHERE id=?", (replay_id,))
+        if not rows:
+            raise KeyError(replay_id)
+        return dict(rows[0])
+
     def row_provenance(
         self,
         provenance: Provenance | str,
@@ -583,9 +654,11 @@ class Store:
         session_id: str | None = None,
         task_id: str | None = None,
     ) -> str:
-        """The tag a row is stored with: every row of a bench job is `eval-only`,
-        whatever made it (the one place that decides), else the caller's own."""
-        if self.is_bench(job_id=job_id, session_id=session_id, task_id=task_id):
+        """The tag a row is stored with: every row of a bench job or a review replay is
+        `eval-only`, whatever made it (the one place that decides), else the caller's own."""
+        if self.is_replay(session_id) or self.is_bench(
+            job_id=job_id, session_id=session_id, task_id=task_id
+        ):
             return Provenance.EVAL_ONLY.value
         return require(provenance).value
 

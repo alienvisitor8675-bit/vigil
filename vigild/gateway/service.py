@@ -253,11 +253,13 @@ class Gateway:
         # counts for or against the preset's backend breaker
         self.breakers: Any = None
 
-    def _backend_gate(self, preset_name: str) -> str | None:
+    def _backend_gate(self, preset_name: str, session_id: str | None = None) -> str | None:
         """An open backend breaker refuses the call before it is sent, unless
         it has cooled down and this call claims its one half-open probe
         (review B6, A11). Returns the claimed scope, to release if the call
-        never reaches upstream."""
+        never reaches upstream. A review replay (#47) never claims the probe: its
+        result wouldn't count, so the breaker could stay half-open. It is refused,
+        and the replay records that the gate refused it (owner, #49 round 2)."""
         if self.breakers is None:
             return None
         from vigild.breakers import Kind
@@ -265,6 +267,13 @@ class Gateway:
         scope = f"backend:{preset_name}"
         if not self.breakers.is_open(Kind.BACKEND, scope):
             return None
+        if self.store.is_replay(session_id):
+            self.store.gate_refuse_replay(session_id, f"{preset_name}: backend breaker not closed")
+            raise GatewayError(
+                529,
+                "overloaded_error",
+                f"{preset_name}: backend breaker not closed (replay refused)",
+            )
         if self.breakers.claim_probe(Kind.BACKEND, scope):
             return scope
         raise GatewayError(529, "overloaded_error", f"{preset_name}: its backend breaker is open")
@@ -275,10 +284,13 @@ class Gateway:
 
             self.breakers.release_probe(Kind.BACKEND, scope)
 
-    def _upstream(self, preset_name: str, ok: bool, detail: str = "") -> None:
+    def _upstream(
+        self, preset_name: str, ok: bool, detail: str = "", session_id: str | None = None
+    ) -> None:
         """N 5xx or timeouts in a row trip the preset's backend breaker; any
-        other answer ends the run (and closes a half-open one)."""
-        if self.breakers is None:
+        other answer ends the run (and closes a half-open one). A review replay
+        (#47) never touches real breaker state, either way."""
+        if self.breakers is None or self.store.is_replay(session_id):
             return
         from vigild.breakers import Kind
 
@@ -488,6 +500,8 @@ class Gateway:
         cap. Raises GatewayError when the day or month can't take it."""
         from vigild.jobs.model import Role
 
+        if self.store.is_replay(session_id):
+            return False  # a replay's cap (review_session_usd) is hard (#47)
         try:
             role = self.store.get_session(session_id).role
         except KeyError:
@@ -552,6 +566,7 @@ class Gateway:
         log.error("metering failed for session %s: %s", gs.session_id, err)
         call_id = f"{gs.session_id}:{secrets.token_hex(4)}"
         reason = redact(f"{type(err).__name__}: {err}")
+        replay = self.store.is_replay(gs.session_id)  # a replay files no inbox item (#47)
         steps: list[Callable[[], Any]] = [
             lambda: self.revoke(gs.session_id),  # no further call is forwarded
             lambda: self.budget.book_unmetered(gs.session_id, gs.task_id, hold.amount),
@@ -564,25 +579,28 @@ class Gateway:
                 session_id=gs.session_id,
                 task_id=gs.task_id,
             ),
-            lambda: self.store.create_inbox_item(
-                "questions",
-                "page",
-                gs.job_id,
-                f"metering failed: {reason}; spend for call {call_id} not booked",
-                {
-                    "session_id": gs.session_id,
-                    "call_id": call_id,
-                    "model": model,
-                    "tokens_in": usage.tokens_in,
-                    "tokens_out": usage.tokens_out,
-                    "tokens_cache_read": usage.tokens_cache_read,
-                    "tokens_cache_write_5m": usage.tokens_cache_write_5m,
-                    "tokens_cache_write_1h": usage.tokens_cache_write_1h,
-                    "booked_usd": hold.amount,
-                    "note": "the call's worst-case reservation was booked as spent; "
-                    "reconcile with the provider's usage",
-                    "resumable": False,
-                },
+            lambda: (
+                replay
+                or self.store.create_inbox_item(
+                    "questions",
+                    "page",
+                    gs.job_id,
+                    f"metering failed: {reason}; spend for call {call_id} not booked",
+                    {
+                        "session_id": gs.session_id,
+                        "call_id": call_id,
+                        "model": model,
+                        "tokens_in": usage.tokens_in,
+                        "tokens_out": usage.tokens_out,
+                        "tokens_cache_read": usage.tokens_cache_read,
+                        "tokens_cache_write_5m": usage.tokens_cache_write_5m,
+                        "tokens_cache_write_1h": usage.tokens_cache_write_1h,
+                        "booked_usd": hold.amount,
+                        "note": "the call's worst-case reservation was booked as spent; "
+                        "reconcile with the provider's usage",
+                        "resumable": False,
+                    },
+                )
             ),
             lambda: self.stop_session(gs.session_id) if self.stop_session else None,
         ]
@@ -628,7 +646,9 @@ class Gateway:
             if path in METERED_PATHS:
                 amount, body, raw = self._hold_clamped(gs.session_id, model, body, raw)
             try:
-                probe = self._backend_gate(gs.preset)  # last: nothing refuses after a claim
+                probe = self._backend_gate(
+                    gs.preset, gs.session_id
+                )  # last: nothing refuses after a claim
             except GatewayError:
                 if amount:
                     self.release(Hold(gs.session_id, amount, preset, body, raw))
@@ -710,13 +730,13 @@ class Gateway:
             resp = await self.async_client.send(req, stream=True)
         except httpx2.TransportError as e:  # a timeout or a dropped connection
             self.release(hold)
-            self._upstream(gs.preset, False, type(e).__name__)
+            self._upstream(gs.preset, False, type(e).__name__, gs.session_id)
             raise
         except BaseException:
             self.release(hold)
             self._release_probe(hold.probe)  # the call never reached upstream
             raise
-        self._upstream(gs.preset, resp.status_code < 500, f"HTTP {resp.status_code}")
+        self._upstream(gs.preset, resp.status_code < 500, f"HTTP {resp.status_code}", gs.session_id)
         ctype = resp.headers.get("content-type", "")
         out_headers = {"content-type": ctype} if ctype else {}
         if path in FREE_PATHS:

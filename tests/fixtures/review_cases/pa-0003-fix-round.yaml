@@ -1,0 +1,18 @@
+# The fix-round head of pa-0003 (ParkAgent #320): two findings the reviewer missed and
+# the auditor caught. No code and no diff here; the diff comes from vigild's vault.
+# file and line are the auditor's, from its audit.json.
+id: pa-0003-fix-round
+job_id: pa-0003
+task_id: pa-0003-w1
+head: 5e57b155fdef46d266fd768492fd6094f3c1da89
+expected:
+  - ac: AC7
+    class: missing-assertion
+    description: two cases lack the located and source assertions
+    file: server/test/placeClassification.test.ts
+    line: 306
+  - ac: AC1
+    class: missing-case
+    description: no charging lot when not located, with empty understood
+    file: server/test/placeClassification.test.ts
+    line: 163

@@ -860,3 +860,42 @@ Run by hand only when the launchd agent isn't installed or is booted out
   the field carry none). An issue intake took itself stays claimed even
   after its job is abandoned; to redo it, submit a new job through the API.
 - Running it under launchd arrives with phase 2b, together with the CLI.
+
+## Review replays and the regression set
+
+A replay asks "what would this reviewer prompt have said about that PR?" without
+touching anything real. It needs vigild running, the job's vault and clone record
+still on disk, and no open breaker.
+
+- **One replay:** `POST /api/review/replay` with the admin credential and
+  `{"job_id": "pa-0003", "task_id": "pa-0003-w1", "prompt_version": "<ref or hash>"}`.
+  `prompt_version` is a git ref of this repo (a branch, tag or commit) or the sha256 of
+  `prompts/reviewer.md` at some commit, but only one **shipped** on `origin/main`: a
+  commit not reachable from it (a feature branch, a stash) is refused, and the repo vigild
+  runs from needs a fetched `origin/main`. Add `"head": "<sha>"` to replay an earlier head of the task (one its PR was
+  published at); the default is the latest. There is no visibility option: a private
+  repo reaches only the backends its real review may, and is refused (403) otherwise.
+  The answer has the replay's id (`rp-…`), `status`, `verdict`, `findings` and
+  `cost_usd`; the same row is in the `replays` table.
+- **What it costs and where it books:** one reviewer session, at most
+  `review_session_usd` ($0.40, a hard cap: a replay gets no over-cap extension), on the
+  experiment line (`experiment_monthly_usd`), never the $5 day, and counted in the $100
+  month. A full line, or any open breaker, refuses it (409).
+- **What it never does:** change a job, task, review ladder, rung, window or audit; file
+  an inbox item; call GitHub; write the job's own `review.json`. Every row it writes is
+  `eval-only`.
+- **The regression set:** `tests/fixtures/review_cases/`, one file per case, no code. Run
+  it on a prompt version with
+  `uv run python cli/vigil review replay-set --prompt-version <ref>`
+  (or `POST /api/review/replay-set`). It prints **recall**, expected findings found
+  divided by expected, three ways (pa-0003's 4, the 5 AC-only findings, all 6), per case,
+  and the total cost. A case whose head the
+  vault no longer has is reported as an error, not a miss. To compare two prompts, run it
+  once on each (the current one: `main`; a candidate: a commit or tag already on main). Five cases
+  cost at most $2.00 a run, usually $0.75-$1.50.
+- **Adding a case:** a YAML file with `id`, `job_id`, `task_id`, `head` (40 hex) and
+  `expected` (each with `ac` like `AC7`, `class`, a short `description`, and `file` and
+  `line` where the miss was). Never paste code or diff text into one. A finding counts as
+  found only if it names the AC (or, with `ac: null`, the file) and sits on that file within
+  15 lines of `line`; the class only breaks ties (its terms are `CLASS_TERMS` in
+  `vigild/review/replay.py`).

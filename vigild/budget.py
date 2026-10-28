@@ -16,7 +16,8 @@ to the day: they draw from the experiment line instead,
         + this one <= experiment_monthly_usd,
 
 never count against the daily cap, but do count toward the month, and a bench
-task's own cap is bench_task_usd. A bench reservation the line has no room for
+task's own cap is bench_task_usd. A review replay (#47) is the same: its session draws
+from the experiment line. A bench reservation the line has no room for
 is refused, never queued. Every reservation and ledger row says which pool it
 belongs to (`ops` or `experiment`), worked out here from the session, task or job
 it is for, so a caller can't forget it.
@@ -70,7 +71,10 @@ class Budget:
         task_id: str | None = None,
         job_id: str | None = None,
     ) -> str:
-        """`experiment` for a bench job's session, task or job; else `ops`."""
+        """`experiment` for a bench job's session, task or job, or a review replay's
+        session; else `ops`."""
+        if self.store.is_replay(session_id):
+            return EXPERIMENT
         bench = self.store.is_bench(job_id=job_id, session_id=session_id, task_id=task_id)
         return EXPERIMENT if bench else OPS
 

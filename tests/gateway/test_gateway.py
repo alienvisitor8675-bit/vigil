@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from collections.abc import Iterator
 from typing import Any
@@ -877,3 +878,74 @@ def test_a_metered_call_costing_more_than_reserved_trips_the_daily_breaker(
     assert gw.budget.spent_today() <= cfg.budgets.decider_call_usd + 1e-9  # booked: the reservation
     assert gw.breakers.is_open(Kind.DAILY, GLOBAL)
     assert [e for e in store.events() if e.type == "settle_excess"]
+
+
+# --- a review replay never touches real breaker state (#47) ------------------------------
+
+
+def _calls_failing(
+    gw: Gateway, client: TestClient, store: Store, budget: Budget, upstream: Upstream,
+    cfg: Config, *, replay: bool, timeout: bool,
+) -> Any:  # fmt: skip
+    from vigild.breakers import Breakers
+
+    gw.breakers = Breakers(store, cfg)
+    sid, tok = _session(store, budget, gw)
+    if replay:
+        rid = store.create_replay("j", "t", "a" * 40, "main", "0" * 64)
+        store.link_replay(rid, sid)
+    if timeout:
+
+        def boom(req: httpx2.Request) -> httpx2.Response:
+            raise httpx2.ReadTimeout("slow", request=req)
+
+        gw.async_client = httpx2.AsyncClient(transport=httpx2.MockTransport(boom))
+    else:
+        upstream.status = 529
+    for _ in range(cfg.vigild.breakers.backend_errors + 2):
+        with contextlib.suppress(httpx2.TransportError):
+            client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
+    return gw.breakers
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_a_replays_upstream_failures_leave_every_breaker_closed(
+    gw: Gateway, client: TestClient, store: Store, budget: Budget, upstream: Upstream,
+    cfg: Config, timeout: bool,
+) -> None:  # fmt: skip
+    b = _calls_failing(gw, client, store, budget, upstream, cfg, replay=True, timeout=timeout)
+    assert b.open_breakers() == []
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_a_normal_sessions_upstream_failures_still_count(
+    gw: Gateway, client: TestClient, store: Store, budget: Budget, upstream: Upstream,
+    cfg: Config, timeout: bool,
+) -> None:  # fmt: skip
+    from vigild.breakers import Kind
+
+    b = _calls_failing(gw, client, store, budget, upstream, cfg, replay=False, timeout=timeout)
+    assert b.is_open(Kind.BACKEND, "backend:claude-sonnet")
+
+
+def test_a_replay_never_claims_a_half_open_probe(
+    gw: Gateway, client: TestClient, store: Store, budget: Budget, upstream: Upstream,
+    cfg: Config, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """#49 round 2 (owner): a replay whose backend breaker isn't closed is refused at
+    the gate without claiming the half-open probe, so real work can still claim it,
+    and the replay records that the gate refused it."""
+    from vigild.breakers import Kind
+
+    b = _calls_failing(gw, client, store, budget, upstream, cfg, replay=False, timeout=False)
+    assert b.is_open(Kind.BACKEND, "backend:claude-sonnet")
+    claimed: list[str] = []
+    monkeypatch.setattr(b, "claim_probe", lambda kind, scope: claimed.append(scope) or True)
+    upstream.status = 200
+    sid, tok = _session(store, budget, gw)
+    rid = store.create_replay("j", "t", "a" * 40, "main", "0" * 64)
+    store.link_replay(rid, sid)
+    r = client.post("/v1/messages", json=_msg(), headers={"x-api-key": tok})
+    assert r.status_code == 529 and "replay" in r.text
+    assert claimed == []  # the probe is still free for real work
+    assert str(store.get_replay(rid)["error"] or "").startswith("gate_refused")

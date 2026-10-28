@@ -17,6 +17,44 @@ import typer
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 hidden_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Hidden tests.")
 app.add_typer(hidden_app, name="hidden")
+review_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Review tools.")
+app.add_typer(review_app, name="review")
+
+
+@review_app.command("replay-set")
+def review_replay_set(
+    prompt_version: str = typer.Option(
+        ..., "--prompt-version", help="A git ref of this repo, or the hash of prompts/reviewer.md."
+    ),
+) -> None:
+    """Replay the review regression set (tests/fixtures/review_cases/) with a reviewer
+    prompt through the running vigild. Each case is one reviewer session, booked to the
+    experiment line (cap $0.40 each); prints recall and the total cost."""
+    import httpx2
+
+    from vigild import config
+    from vigild.review.replay import render_report
+
+    cfg = config.load()
+    admin = config.load_secrets().get("VIGIL_API_TOKEN")
+    if not admin:
+        typer.echo("the admin API credential is not set")
+        raise typer.Exit(1)
+    api = cfg.vigild.api
+    try:
+        r = httpx2.post(
+            f"http://{api.host}:{api.port}/api/review/replay-set",
+            headers={"Authorization": f"Bearer {admin}"},
+            json={"prompt_version": prompt_version},
+            timeout=3600,
+        )
+    except httpx2.HTTPError as e:
+        typer.echo(f"vigild is not answering: {type(e).__name__}")
+        raise typer.Exit(1) from e
+    if r.status_code != 200:
+        typer.echo(f"refused ({r.status_code}): {r.json().get('detail', r.text)}"[:500])
+        raise typer.Exit(1)
+    typer.echo(render_report(r.json()))
 
 
 @hidden_app.command("show")
