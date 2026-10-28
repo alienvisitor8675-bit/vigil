@@ -121,3 +121,76 @@ def test_a_current_database_migrates_cleanly_twice(tmp_path: Path) -> None:
     db.migrate(again.conn)
     db.migrate(again.conn)
     assert again.q("PRAGMA integrity_check")[0][0] == "ok"
+
+
+def test_a_broken_rewrite_raises_and_leaves_the_old_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Migration 13 checks its own result: a rewrite that leaves a table without
+    'eval-only' raises, and the step's transaction rolls back."""
+    path = tmp_path / "vigil.db"
+    _old_database(path)
+    conn = sqlite3.connect(path, isolation_level=None)
+    monkeypatch.setattr(db, "NEW_PROV_CHECK", "'claude','local','human','evalonly')")
+    conn.execute("BEGIN IMMEDIATE")
+    with pytest.raises(sqlite3.DatabaseError, match="eval-only"):
+        db._m13_eval_only(conn)
+    conn.execute("ROLLBACK")
+    sql = conn.execute("SELECT sql FROM sqlite_schema WHERE name='jobs'").fetchone()[0]
+    assert "eval-only" not in sql and "evalonly" not in sql
+    conn.close()
+
+
+def _backups(path: Path) -> list[Path]:
+    return sorted(path.parent.glob(f"{path.name}.pre-m13-*.bak"))
+
+
+def test_an_old_file_database_is_backed_up_once_before_the_rewrite(tmp_path: Path) -> None:
+    path = tmp_path / "vigil.db"
+    _old_database(path)
+    Store.open(path).conn.close()
+    baks = _backups(path)
+    assert len(baks) == 1
+    old = sqlite3.connect(baks[0])  # the backup is the pre-rewrite database, rows and all
+    assert (
+        "eval-only"
+        not in old.execute("SELECT sql FROM sqlite_schema WHERE name='jobs'").fetchone()[0]
+    )
+    assert old.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+    old.close()
+    Store.open(path).conn.close()  # the second start has nothing to rewrite
+    assert _backups(path) == baks
+
+
+def test_a_new_or_memory_database_makes_no_backup(tmp_path: Path) -> None:
+    Store.open(tmp_path / "new.db").conn.close()
+    assert _backups(tmp_path / "new.db") == []
+    Store.open(":memory:").conn.close()
+    assert list(tmp_path.glob("*.bak")) == []
+
+
+def test_a_connection_opened_before_the_migration_can_store_it_after(tmp_path: Path) -> None:
+    path = tmp_path / "vigil.db"
+    _old_database(path)
+    early = sqlite3.connect(path, isolation_level=None)
+    assert early.execute("SELECT count(*) FROM events").fetchone()[0] == 0  # schema cached
+    Store.open(path).conn.close()  # migrates
+    early.execute(
+        "INSERT INTO events (ts, type, data, provenance) VALUES ('t','x','{}','eval-only')"
+    )
+    assert early.execute("SELECT provenance FROM events").fetchone()[0] == "eval-only"
+    early.close()
+
+
+def test_the_probe_names_a_table_that_refuses_it(tmp_path: Path) -> None:
+    path = tmp_path / "vigil.db"
+    _old_database(path)
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("BEGIN")
+    assert "events" in db.probe_eval_only(conn) and "jobs" in db.probe_eval_only(conn)
+    conn.execute("ROLLBACK")
+    assert db.verify_fresh_connection(str(path)) != []
+    Store.open(path).conn.close()
+    assert db.verify_fresh_connection(str(path)) == []
+    mode = oct(next(path.parent.glob("*.bak")).stat().st_mode & 0o777)
+    assert mode == "0o600"

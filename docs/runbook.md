@@ -535,6 +535,13 @@ uv run python -m vigild
   budget"). At about $0.50-1.50 a task that is 2-6 Smoke runs a month and no Core run;
   raising the line is your edit of that file. Bench rows are `eval-only`, which the
   training exporter refuses.
+- **Migration 13 backup (bench 1a).** The first start that finds a database without
+  `eval-only` in its provenance CHECKs writes a copy beside it,
+  `vigil.db.pre-m13-<UTC stamp>.bak` (mode 600), and logs the path. If the start fails
+  after that, or you want to go back: stop vigild, move `vigil.db`, `vigil.db-wal` and
+  `vigil.db-shm` aside, copy the `.bak` to `vigil.db`, start the previous build. The
+  `.bak` is a whole database (every row, including secrets-adjacent text); keep it at
+  mode 600 and delete it once the new build has run well.
 - **Midnight.** Work still running at UTC midnight counts against the new
   day (and month) until it settles, since its whole cost books to the day it
   settles; the new day's room is $5 less that.

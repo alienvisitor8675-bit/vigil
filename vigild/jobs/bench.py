@@ -56,6 +56,7 @@ class BenchPublisher:
         body: str,
         scope: Sequence[str],
         existing: str | None = None,
+        job_id: str | None = None,
     ) -> str:
         url = publish(
             self.workspace,
@@ -77,5 +78,5 @@ class BenchPublisher:
         )
         return url
 
-    def close(self, repo: str, url: str) -> None:
+    def close(self, repo: str, url: str, job_id: str | None = None) -> None:
         self.records.append({"op": "close", "repo": repo, "reason": self.reason})

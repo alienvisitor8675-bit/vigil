@@ -143,9 +143,10 @@ class Publisher(Protocol):
         body: str,
         scope: list[str],
         existing: str | None = None,
+        job_id: str | None = None,
     ) -> str: ...
 
-    def close(self, repo: str, url: str) -> None: ...
+    def close(self, repo: str, url: str, job_id: str | None = None) -> None: ...
 
 
 class Pager(Protocol):
@@ -890,7 +891,7 @@ class JobRunner:
                 Provenance.HUMAN, job_id=job.id,
             )  # fmt: skip
             return url
-        return self.publisher.publish(**kw)
+        return self.publisher.publish(**kw, job_id=job.id)
 
     def _healthy(self, preset: str) -> str | None:
         """The preset itself, or while its backend breaker is open the first
@@ -2141,9 +2142,12 @@ class JobRunner:
     def remaining(self, task_id: str) -> tuple[float, float, float]:
         """(cap, spent, left) for a task: a retry gets what's left, never a fresh cap."""
         # the contract's cap, and never more than the task cap in budgets.yaml
+        task = self.store.get_task(task_id)
         cap = min(
-            float(self.store.get_task(task_id).contract["limits"]["max_cost_usd"]),
-            self.cfg.budgets.per_task_usd,
+            float(task.contract["limits"]["max_cost_usd"]),
+            self.cfg.budgets.bench_task_usd
+            if self.store.is_bench(task_id=task_id)
+            else self.cfg.budgets.per_task_usd,
         )
         spent = self.budget.task_spent(task_id)
         return cap, spent, max(0.0, cap - spent)
@@ -3511,7 +3515,7 @@ class JobRunner:
             if url:
                 try:
                     (self.bench_publisher if job.source == "bench" else self.publisher).close(
-                        job.repo, url
+                        job.repo, url, job.id
                     )
                 except PublishError as e:
                     self._page(
@@ -3956,11 +3960,12 @@ class GitHubPublisher:
         body: str,
         scope: list[str],
         existing: str | None = None,
+        job_id: str | None = None,
     ) -> str:
         from vigild.github.app import WORKER_PERMISSIONS
         from vigild.github.publish import RestPulls, publish
 
-        with self.app.lease(repo, WORKER_PERMISSIONS) as tok:
+        with self.app.lease(repo, WORKER_PERMISSIONS, job_id=job_id) as tok:
             return publish(
                 self.workspace,
                 repo=repo,
@@ -3976,7 +3981,7 @@ class GitHubPublisher:
                 existing=existing,
             )
 
-    def close(self, repo: str, url: str) -> None:
+    def close(self, repo: str, url: str, job_id: str | None = None) -> None:
         """Close one of vigild's PRs, with a one-repo `pull_requests: write`
         token, revoked after (a deps PR whose review failed, owner ruling 3)."""
         from vigild.github.publish import RestPulls
@@ -3984,7 +3989,7 @@ class GitHubPublisher:
         prefix = f"https://github.com/{repo}/pull/"
         if not url.startswith(prefix) or not url[len(prefix) :].isdigit():
             raise PublishError(f"{url} isn't a PR of {repo}")
-        with self.app.lease(repo, {"pull_requests": "write"}) as tok:
+        with self.app.lease(repo, {"pull_requests": "write"}, job_id=job_id) as tok:
             RestPulls(self.http, tok.token).close(repo, int(url[len(prefix) :]))
 
 
@@ -4018,8 +4023,9 @@ class NoPublisher:
         body: str,
         scope: list[str],
         existing: str | None = None,
+        job_id: str | None = None,
     ) -> str:
         raise PublishError("the GitHub App is not configured (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)")
 
-    def close(self, repo: str, url: str) -> None:
+    def close(self, repo: str, url: str, job_id: str | None = None) -> None:
         raise PublishError("the GitHub App is not configured (GITHUB_APP_ID, GITHUB_APP_KEY_PATH)")

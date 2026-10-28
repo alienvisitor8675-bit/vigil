@@ -252,3 +252,19 @@ def test_a_runner_file_task_is_rung_zero_and_never_counts_toward_graduation(
     for _ in range(need):
         change = ladder.record(_audit(Shape.DOCS, 1), verify_level=1)
     assert change is not None and (change.frm, change.to) == (1, 2)
+
+
+def test_a_bench_audit_moves_no_rung_and_no_window(ladder: Ladder, store: Store) -> None:
+    """A bench run measures vigil; its audits are stored `eval-only` and change
+    nothing in the production ladder, whatever they missed."""
+    job = store.create_job(
+        repo="bench/fixture", base="main", title="t", request="r", notes=[], source="bench"
+    )
+    for missed in ("high", "medium"):
+        a = _audit(Shape.FEATURE, 2, missed=missed).model_copy(update={"job_id": job.id})
+        assert ladder.record(a, verify_level=3) is None
+    rows = store.q("SELECT provenance FROM audits")
+    assert {r["provenance"] for r in rows} == {"eval-only"}  # stored, tagged
+    assert store.q("SELECT * FROM ladder") == []  # no rung, no window restart
+    assert _changes(store, Shape.FEATURE) == []
+    assert store.q("SELECT * FROM ladder_changes WHERE provenance='eval-only'") == []

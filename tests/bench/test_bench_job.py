@@ -162,3 +162,15 @@ def test_a_full_experiment_line_ends_the_run_with_the_budget_tag(world: dict[str
     assert store.list_inbox() == []  # a bench run pages nobody
     assert [e for e in store.events(job_id=job.id) if e.type in ("queued", "dequeued")] == []
     assert world["standin"].calls == []  # no session started
+
+
+def test_a_bench_task_stopped_by_its_cap_is_tagged_budget(world: dict[str, Any]) -> None:
+    from vigild.budget import BudgetExceeded
+
+    store: Store = world["store"]
+    job = store.create_job(
+        repo=BENCH_REPO, base="main", title="t", request="r", notes=[], source="bench"
+    )
+    world["runner"]._budget_page(job.id, BudgetExceeded("bench_task", "1.50 of 1.50"), ["t-w1"])
+    tags = [e for e in store.events(job_id=job.id) if e.type == "bench_failure"]
+    assert [t.data["tag"] for t in tags] == ["budget"] and tags[0].data["cap"] == "bench_task"

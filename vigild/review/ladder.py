@@ -275,8 +275,7 @@ class Ladder:
         never counts toward a shape's graduation (finding #2)."""
         if runner_file:
             return None
-        if self.store.is_bench(job_id=audit.job_id):
-            return None  # a bench run measures vigil; it does not move a repo's rung
+        bench = self.store.is_bench(job_id=audit.job_id)
         missed = audit.missed()
         high = sum(1 for f in missed if f.severity is Severity.HIGH)
         medium = sum(1 for f in missed if f.severity is Severity.MEDIUM)
@@ -295,9 +294,12 @@ class Ladder:
                 medium,
                 len(audit.false_findings),
                 iso(),
-                Provenance.HUMAN.value,  # vigild's own tally of the auditor's output
+                # vigild's own tally of the auditor's output; a bench job's is eval-only
+                self.store.row_provenance(Provenance.HUMAN, job_id=audit.job_id),
             ),
         )
+        if bench:
+            return None  # a bench run measures vigil; it moves no rung and no window
         shape, now = audit.shape, self.rung(audit.shape)
         rate = audit.match_rate()
         if high:
@@ -320,7 +322,7 @@ class Ladder:
         if now == 0 or pol.promote_after is None or now >= self._cap(shape):
             return None  # rung 0 never graduates; past rung 1 only after the eval
         rows = self.store.q(
-            "SELECT * FROM audits WHERE shape=? AND id > COALESCE("
+            "SELECT * FROM audits WHERE shape=? AND provenance != 'eval-only' AND id > COALESCE("
             "(SELECT window_from FROM ladder WHERE shape=?), 0) ORDER BY id",
             (shape.value, shape.value),
         )

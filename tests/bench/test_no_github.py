@@ -18,21 +18,71 @@ from vigild.jobs.service import JobService, SubmitError
 from vigild.workspace import Workspace, WorkspaceError
 
 
-def _bench_job(store: Store) -> str:
-    return store.create_job(
-        repo=BENCH_REPO, base="main", title="t", request="r", notes=[], source="bench"
-    ).id
-
-
-def test_minting_for_a_bench_job_refuses(app: GitHubApp, store: Store, net: NoGitHub) -> None:
-    job = _bench_job(store)
+def test_minting_for_a_bench_repo_refuses(app: GitHubApp, net: NoGitHub) -> None:
+    """The guard is the repo: a bench job lives only on `bench/`, and mint refuses
+    that prefix before any HTTP, whatever the caller forgot to check."""
     perms = {"contents": "write", "pull_requests": "write", "metadata": "read"}
     with pytest.raises(BenchGitHubRefused, match="bench"):
-        app.mint("o/real", perms, job_id=job)  # even a real repo, asked for by a bench job
-    with pytest.raises(BenchGitHubRefused), app.lease("o/real", perms, job_id=job):
+        app.mint(BENCH_REPO, perms)
+    with pytest.raises(BenchGitHubRefused), app.lease(BENCH_REPO, perms):
         pass
     with pytest.raises(BenchGitHubRefused):  # the visibility check
+        app.is_private(BENCH_REPO)
+    assert net.requests == []
+
+
+def test_minting_for_a_bench_job_refuses_at_the_lease(
+    app: GitHubApp, store: Store, net: NoGitHub
+) -> None:
+    """Guard 2, the job kind: whatever repo is named, a lease for a bench job gets no
+    token (and a job it can't read fails closed)."""
+    job = store.create_job(
+        repo=BENCH_REPO, base="main", title="t", request="r", notes=[], source="bench"
+    ).id
+    perms = {"contents": "write", "pull_requests": "write", "metadata": "read"}
+    with pytest.raises(BenchGitHubRefused, match="bench job"):
+        app.mint("o/real", perms, job_id=job)
+    with pytest.raises(BenchGitHubRefused), app.lease("o/real", perms, job_id=job):
+        pass
+    with pytest.raises(BenchGitHubRefused):
         app.is_private("o/real", job_id=job)
+    with pytest.raises(BenchGitHubRefused):
+        app.mint("o/real", {"contents": "read"}, job_id="nope-0001")
+    assert net.requests == []
+
+
+def test_the_real_publisher_refuses_a_bench_job_on_any_repo(
+    app: GitHubApp, store: Store, net: NoGitHub, tmp_path: Path
+) -> None:
+    from vigild.jobs.runner import GitHubPublisher
+
+    job = store.create_job(
+        repo=BENCH_REPO, base="main", title="t", request="r", notes=[], source="bench"
+    ).id
+    pub = GitHubPublisher(app, app.http, Workspace(tmp_path / "d", remote_url=lambda r: ""))
+    with pytest.raises(BenchGitHubRefused):
+        pub.publish(
+            repo="o/real", head="a" * 40, base_sha="b" * 40, branch="vigil/x", base="main",
+            title="t", body="b", scope=["a.py"], job_id=job,
+        )  # fmt: skip
+    with pytest.raises(BenchGitHubRefused):
+        pub.close("o/real", "https://github.com/o/real/pull/1", job_id=job)
+    assert net.requests == []
+
+
+def test_the_real_publisher_makes_no_request_for_a_bench_repo(
+    app: GitHubApp, net: NoGitHub, tmp_path: Path
+) -> None:
+    from vigild.jobs.runner import GitHubPublisher
+
+    pub = GitHubPublisher(app, app.http, Workspace(tmp_path / "d", remote_url=lambda r: ""))
+    with pytest.raises(BenchGitHubRefused):
+        pub.publish(
+            repo=BENCH_REPO, head="a" * 40, base_sha="b" * 40, branch="vigil/x", base="main",
+            title="t", body="b", scope=["a.py"],
+        )  # fmt: skip
+    with pytest.raises(BenchGitHubRefused):
+        pub.close(BENCH_REPO, f"https://github.com/{BENCH_REPO}/pull/1")
     assert net.requests == []
 
 
@@ -43,12 +93,6 @@ def test_a_bench_repo_never_mints_whoever_asks(app: GitHubApp, net: NoGitHub) ->
         app.is_private(BENCH_REPO)
     with pytest.raises(TokenPolicyError), app.lease(BENCH_REPO, {"issues": "read"}):
         pass
-    assert net.requests == []
-
-
-def test_an_unknown_job_fails_closed(app: GitHubApp, net: NoGitHub) -> None:
-    with pytest.raises(BenchGitHubRefused):
-        app.mint("o/real", {"contents": "read"}, job_id="nope-0001")
     assert net.requests == []
 
 

@@ -45,8 +45,8 @@ class TokenPolicyError(ValueError):
 
 
 class BenchGitHubRefused(TokenPolicyError):
-    """A bench job (or a `bench/` repo) asked for a GitHub token. Bench mode makes
-    no GitHub call at all (owner, 2026-10-27; issue #8)."""
+    """A bench job, or a `bench/` repo, asked for a GitHub token. Bench mode makes no
+    GitHub call at all (owner, 2026-10-27; issue #8)."""
 
 
 JobSource = Callable[[str], str | None]
@@ -105,13 +105,19 @@ class GitHubApp:
         self._job_source = job_source
 
     def bind_jobs(self, job_source: JobSource) -> None:
-        """Where the lease learns a job's source (`Store.get_job(id).source`), so a
-        bench job is refused here whatever the caller forgot to check."""
+        """Where the lease learns a job's source (`Store.get_job(id).source`)."""
         self._job_source = job_source
 
-    def refuse_bench(self, repo: str, permissions: Mapping[str, str], job_id: str | None) -> None:
-        """The lowest layer of "no GitHub for bench": a job whose source is `bench`,
-        one we can't look up, or any `bench/` repo gets no token (before any HTTP)."""
+    def refuse_bench(
+        self, repo: str, permissions: Mapping[str, str], job_id: str | None = None
+    ) -> None:
+        """The lowest layer of "no GitHub for bench": two guards, each enough alone,
+        both raised before any HTTP.
+        1. Repo: a `bench/` repo gets no token (a bench job lives only on one;
+           `Store.create_job` refuses any other pairing).
+        2. Job kind: a lease asked for on behalf of a bench job (the publisher
+           passes its `job_id`) gets none, whatever repo it names. A job whose
+           source can't be read fails closed."""
         from vigild.repos import is_bench_repo
 
         why: str | None = None
@@ -121,7 +127,7 @@ class GitHubApp:
             except Exception:  # an unknown job: fail closed
                 source = None
             if source is None:
-                why = f"job {job_id}'s source can't be read; no token"
+                why = f"job {job_id}'s source can't be read"
             elif source == "bench":
                 why = f"job {job_id} is a bench job"
         if why is None and is_bench_repo(repo):

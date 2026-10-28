@@ -152,3 +152,48 @@ def test_doctor_shows_the_lines_spend(cfg: Config) -> None:
     check = _experiment_line(cfg)
     assert check.name == "experiment budget" and check.ok is True
     assert "$1.25 spent" in check.note and "$30.00" in check.note
+
+
+def test_a_bench_jobs_own_call_books_to_the_experiment_line(
+    cfg: Config, store: Store, budget: Budget
+) -> None:
+    """The decider and every call vigild makes with no session or task: given the
+    job, it is the experiment line's, never the $5 day."""
+    from vigild.config import Secrets
+    from vigild.gateway.service import Gateway
+
+    gw = Gateway(cfg, store, budget, Secrets({}))
+    job = store.create_job(
+        repo="bench/fixture", base="main", title="t", request="r", notes=[], source="bench"
+    )
+    day = budget.spent_today()
+    with gw._own_call(0.4, "decider", job_id=job.id) as cost:
+        assert budget.open_experiment() == 0.4
+        assert budget.open_today() == 0.0
+        cost[0] = 0.3
+    assert budget.spent_experiment_month() == 0.3
+    assert budget.spent_today() == day
+    ops = store.create_job(repo="o/r", base="main", title="t", request="r", notes=[])
+    with gw._own_call(0.4, "decider", job_id=ops.id) as cost:
+        assert budget.open_today() == 0.4
+        cost[0] = 0.1
+    assert budget.spent_today() == day + 0.1
+
+
+def test_remaining_caps_a_bench_task_at_the_bench_cap(world: dict[str, object]) -> None:
+    store = world["store"]
+    runner = world["runner"]
+    assert isinstance(store, Store)
+    job = store.create_job(
+        repo="bench/fixture", base="main", title="t", request="r", notes=[], source="bench"
+    )
+    task = store.create_task(
+        job.id, {"task_id": f"{job.id}-w1", "limits": {"max_cost_usd": 9.0}}, "claude"
+    )
+    cap, _, _ = runner.remaining(task.id)  # type: ignore[attr-defined]
+    assert cap == 1.5
+    ops = store.create_job(repo="o/r", base="main", title="t", request="r", notes=[])
+    t2 = store.create_task(
+        ops.id, {"task_id": f"{ops.id}-w1", "limits": {"max_cost_usd": 9.0}}, "claude"
+    )
+    assert runner.remaining(t2.id)[0] == 2.0  # type: ignore[attr-defined]

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import re
 import sqlite3
 import threading
@@ -33,6 +35,8 @@ from vigild.jobs.model import (
 from vigild.provenance import Provenance, require
 from vigild.redact import redact
 from vigild.repos import is_bench_repo
+
+log = logging.getLogger(__name__)
 
 PROV = "provenance TEXT NOT NULL CHECK (provenance IN ('claude','local','human','eval-only'))"
 
@@ -278,6 +282,34 @@ OLD_PROV_CHECK = "'claude','local','human')"
 NEW_PROV_CHECK = "'claude','local','human','eval-only')"
 
 
+def _needs_widening(conn: sqlite3.Connection) -> list[sqlite3.Row | tuple[str, str]]:
+    """The tables whose stored CREATE statement still has the old provenance CHECK."""
+    return conn.execute(
+        "SELECT name, sql FROM sqlite_schema WHERE type='table' AND sql LIKE ?",
+        (f"%{OLD_PROV_CHECK}%",),
+    ).fetchall()
+
+
+def _db_file(conn: sqlite3.Connection) -> str:
+    return next((str(r[2]) for r in conn.execute("PRAGMA database_list") if r[1] == "main"), "")
+
+
+def _backup_before_rewrite(conn: sqlite3.Connection, tag: str) -> Path | None:
+    """`VACUUM INTO '<db>.<tag>-<utc stamp>.bak'` beside a file-backed database
+    (never in the repo), mode 600, before a schema-rewriting migration. None for
+    `:memory:`, which has nothing to restore."""
+    file = _db_file(conn)
+    if not file:
+        log.info("no backup before %s: the database is in memory", tag)
+        return None
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    dest = f"{file}.{tag}-{stamp}.bak"
+    conn.execute("VACUUM INTO ?", (dest,))
+    os.chmod(dest, 0o600)
+    log.warning("about to rewrite the schema (%s); backup at %s", tag, dest)
+    return Path(dest)
+
+
 def _m13_eval_only(conn: sqlite3.Connection) -> None:
     """Bench 1a: `eval-only` joins the provenance CHECK (owner, 2026-10-27).
 
@@ -292,10 +324,7 @@ def _m13_eval_only(conn: sqlite3.Connection) -> None:
     result. Widening a CHECK can't make an existing row invalid, so no row is
     rewritten. Idempotent: a table whose statement already lists `eval-only` is not
     touched, and the SQL replaced is the exact text SCHEMA and PROV_ADDED write."""
-    rows = conn.execute(
-        "SELECT name, sql FROM sqlite_schema WHERE type='table' AND sql LIKE ?",
-        (f"%{OLD_PROV_CHECK}%",),
-    ).fetchall()
+    rows = _needs_widening(conn)
     if not rows:
         return
     version = int(conn.execute("PRAGMA schema_version").fetchone()[0])
@@ -306,12 +335,85 @@ def _m13_eval_only(conn: sqlite3.Connection) -> None:
                 "UPDATE sqlite_schema SET sql=? WHERE type='table' AND name=?",
                 (sql.replace(OLD_PROV_CHECK, NEW_PROV_CHECK), name),
             )
-        conn.execute(f"PRAGMA schema_version={version + 1}")
     finally:
         conn.execute("PRAGMA writable_schema=OFF")
+    # after the edit, so every connection (and this one) re-reads the schema
+    conn.execute(f"PRAGMA schema_version={version + 1}")
     problems = conn.execute("PRAGMA integrity_check").fetchall()
     if [tuple(r) for r in problems] != [("ok",)]:
         raise sqlite3.DatabaseError(f"integrity_check after widening provenance: {problems}")
+    refused = probe_eval_only(conn)
+    if refused:  # raising rolls the step's transaction back: the old schema stays
+        raise sqlite3.DatabaseError(f"provenance CHECK still refuses 'eval-only' in: {refused}")
+
+
+def _provenance_tables(conn: sqlite3.Connection) -> list[str]:
+    return [
+        str(r[0])
+        for r in conn.execute(
+            "SELECT name FROM sqlite_schema WHERE type='table' AND sql LIKE '%provenance%'"
+            " AND sql LIKE '%CHECK (provenance IN (%'"
+        )
+    ]
+
+
+def probe_eval_only(conn: sqlite3.Connection) -> list[str]:
+    """The tables (those with a provenance CHECK) that refuse an `eval-only` row.
+    Each gets one inserted inside a savepoint that is rolled back, so nothing
+    stays. Must run inside a transaction. Other constraints are met with dummy
+    values (foreign keys deferred); a failure of any other kind counts as a refusal
+    too, since the table then can't be shown to accept the value."""
+    conn.execute("PRAGMA defer_foreign_keys=ON")
+    refused: list[str] = []
+    for table in _provenance_tables(conn):
+        sql = str(
+            conn.execute("SELECT sql FROM sqlite_schema WHERE name=?", (table,)).fetchone()[0]
+        )
+        # another column's `CHECK (col IN ('a', ...))` is met with its first value
+        enums = dict(re.findall(r"CHECK \((\w+) IN \('([^']*)'", sql))
+        cols = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+        pks = sum(1 for c in cols if c[5])
+        names: list[str] = []
+        vals: list[object] = []
+        for c in cols:
+            name, typ, notnull, default, pk = c[1], str(c[2]).upper(), c[3], c[4], c[5]
+            if name == "provenance":
+                names.append(name)
+                vals.append("eval-only")
+            elif notnull and default is None and not (pk and pks == 1 and "INT" in typ):
+                names.append(name)
+                if name in enums:
+                    vals.append(enums[name])
+                elif "INT" in typ or "REAL" in typ:
+                    vals.append(0)
+                else:
+                    vals.append("{}" if name == "data" else "x")
+        conn.execute("SAVEPOINT probe")
+        try:
+            insert = (
+                f'INSERT INTO "{table}" ({",".join(names)}) VALUES ({",".join("?" * len(names))})'  # noqa: S608
+            )
+            conn.execute(insert, vals)
+        except sqlite3.Error:
+            refused.append(table)
+        finally:
+            conn.execute("ROLLBACK TO probe")
+            conn.execute("RELEASE probe")
+    return refused
+
+
+def verify_fresh_connection(path: str) -> list[str]:
+    """After m13 commits: a second, new connection (its own view of the schema,
+    nothing cached) must be able to store `eval-only` in every provenance table."""
+    fresh = sqlite3.connect(path, isolation_level=None)
+    try:
+        fresh.execute("BEGIN")
+        try:
+            return probe_eval_only(fresh)
+        finally:
+            fresh.execute("ROLLBACK")
+    finally:
+        fresh.close()
 
 
 def _m14_experiment_pool(conn: sqlite3.Connection) -> None:
@@ -344,6 +446,12 @@ def migrate(conn: sqlite3.Connection) -> int:
     branch's build may have raised it past steps this build has never run, so
     it never decides to skip one. Each step is idempotent, so a re-run is free."""
     for step in MIGRATIONS:
+        backup: Path | None = None
+        if step is _m13_eval_only:
+            if _needs_widening(conn):
+                backup = _backup_before_rewrite(conn, "pre-m13")  # not inside the step's tx
+            else:
+                log.info("no backup before migration 13: no table needs rewriting")
         conn.execute("BEGIN IMMEDIATE")
         try:
             step(conn)
@@ -351,6 +459,14 @@ def migrate(conn: sqlite3.Connection) -> int:
         except BaseException:
             conn.execute("ROLLBACK")
             raise
+        if step is _m13_eval_only and backup is not None:
+            file = _db_file(conn)
+            refused = verify_fresh_connection(file) if file else []
+            if refused:  # committed, so it can't roll back: stop the start, point at the copy
+                raise sqlite3.DatabaseError(
+                    f"after migration 13 a new connection can't store 'eval-only' in {refused};"
+                    f" restore the backup {backup}"
+                )
     conn.execute(f"PRAGMA user_version = {len(MIGRATIONS)}")
     return len(MIGRATIONS)
 
