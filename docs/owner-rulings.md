@@ -28,6 +28,7 @@ applied.
 - **2026-10-23**: Author spend for a flagged hidden-test task is capped at $1, outside the $2 task cap (#19).
 
 ## Models and routing
+- **2026-10-28**: Pin exception: llama.cpp b11739 (9 days old when adopted) is allowed until 2026-11-04, when the tower is rebuilt on a pin at least 14 days old (`docs/sources.md`) (#68).
 - **2026-10-28**: Routing rule 3 fires on labels only; `architecture_paths` is removed (#61, #64).
 - **2026-10-28**: Per-repo `ladder_pinned_paths` keep money-adjacent PRs at rung 0 with an Opus audit; `money_paths` and rule 2 are unchanged (#59).
 - **2026-10-28**: Sonnet for delegated work, Opus for coord's own reviews (#1).
