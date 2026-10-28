@@ -539,8 +539,11 @@ uv run python -m vigild
   `eval-only` in its provenance CHECKs writes a copy beside it,
   `vigil.db.pre-m13-<UTC stamp>.bak`. The file is created private (umask 077, mode 600),
   and vigild logs the path. **Every start** then checks, on a new connection and inside
-  a transaction it rolls back, that each provenance table stores `eval-only`. If one
-  doesn't, vigild **refuses to start**, names the table and the newest backup, and
+  a transaction it rolls back, that each provenance table stores `eval-only`. Only a
+  failed CHECK on provenance counts as a refusal. Any other error (a test value that
+  clashes) is inconclusive: the table passes if its stored CHECK lists `eval-only`,
+  with a warning in the log. On a real refusal vigild **refuses to start**, names the
+  table and the newest backup, and
   repairs nothing. To go back: stop vigild, move `vigil.db`, `vigil.db-wal` and
   `vigil.db-shm` aside, copy the `.bak` to `vigil.db`, start the previous build. The
   `.bak` is a whole database (every row, including secrets-adjacent text); keep it at

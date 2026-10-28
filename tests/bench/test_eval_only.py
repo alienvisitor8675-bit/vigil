@@ -203,24 +203,50 @@ def test_every_start_refuses_when_a_table_rejects_eval_only(tmp_path: Path) -> N
     _old_database(path)
     Store.open(path).conn.close()  # migrates and makes the backup
     (bak,) = _backups(path)
-    # something later makes a table refuse the value (here a trigger; the CHECK is fine,
-    # so nothing needs rewriting and no new backup is made)
-    conn = sqlite3.connect(path)
-    conn.execute(
-        "CREATE TRIGGER no_eval BEFORE INSERT ON events WHEN NEW.provenance = 'eval-only' "
-        "BEGIN SELECT RAISE(ABORT, 'no'); END"
-    )
-    conn.commit()
-    conn.close()
+    # something later makes a table's provenance CHECK refuse the value, while the
+    # stored CHECK still lists it (so nothing needs rewriting, and no new backup)
+    _add_check(path, "events", "CHECK (provenance <> 'eval-only')")
     for _ in range(2):  # the second start refuses too
         with pytest.raises(sqlite3.DatabaseError) as e:
             Store.open(path)
         assert "events" in str(e.value) and str(bak) in str(e.value)
     assert _backups(path) == [bak]  # repairs nothing, copies nothing
     conn = sqlite3.connect(path)
-    names = [r[0] for r in conn.execute("SELECT name FROM sqlite_schema WHERE type='trigger'")]
+    sql = conn.execute("SELECT sql FROM sqlite_schema WHERE name='events'").fetchone()[0]
     conn.close()
-    assert names == ["no_eval"]
+    assert "provenance <> 'eval-only'" in sql
+
+
+def _add_check(path: Path, table: str, check: str) -> None:
+    """Append a table constraint to a table's stored CREATE statement."""
+    conn = sqlite3.connect(path, isolation_level=None)
+    sql = conn.execute("SELECT sql FROM sqlite_schema WHERE name=?", (table,)).fetchone()[0]
+    assert sql.rstrip().endswith(")")
+    new = sql.rstrip()[:-1] + f", {check})"
+    version = conn.execute("PRAGMA schema_version").fetchone()[0]
+    conn.execute("PRAGMA writable_schema=ON")
+    conn.execute("UPDATE sqlite_schema SET sql=? WHERE name=?", (new, table))
+    conn.execute("PRAGMA writable_schema=OFF")
+    conn.execute(f"PRAGMA schema_version={version + 1}")
+    conn.close()
+
+
+def test_an_inconclusive_probe_falls_back_to_the_stored_check(tmp_path: Path) -> None:
+    """Owner, 2026-10-27: only a provenance CHECK failure is a refusal. A table whose
+    UNIQUE NOT NULL column makes the probe's dummy row collide is inconclusive; its
+    stored CHECK lists eval-only, so the start goes ahead."""
+    path = tmp_path / "vigil.db"
+    Store.open(path).conn.close()
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE extra (name TEXT NOT NULL UNIQUE, provenance TEXT NOT NULL"
+        " CHECK (provenance IN ('claude','local','human','eval-only')))"
+    )
+    conn.execute("INSERT INTO extra VALUES ('x', 'human')")  # the probe's dummy value
+    conn.commit()
+    conn.close()
+    Store.open(path).conn.close()  # starts
+    assert db.verify_fresh_connection(str(path)) == []
 
 
 def test_the_backup_is_private_from_the_moment_it_exists(

@@ -361,12 +361,16 @@ def _provenance_tables(conn: sqlite3.Connection) -> list[str]:
     ]
 
 
-def probe_eval_only(conn: sqlite3.Connection) -> list[str]:
+def probe_eval_only(conn: sqlite3.Connection, kinds: dict[str, str] | None = None) -> list[str]:
     """The tables (those with a provenance CHECK) that refuse an `eval-only` row.
     Each gets one inserted inside a savepoint that is rolled back, so nothing
     stays. Must run inside a transaction. Other constraints are met with dummy
-    values (foreign keys deferred); a failure of any other kind counts as a refusal
-    too, since the table then can't be shown to accept the value."""
+    values (foreign keys deferred). Only an IntegrityError naming a failed CHECK on
+    provenance is a refusal (`kinds[table] = 'check'`). Any other error is
+    inconclusive: the table counts as refused only if its stored CHECK lacks
+    `eval-only` (`kinds[table] = 'schema'`), and a warning is logged either way.
+    (Owner, 2026-10-27: a dummy value that clashes, say on a UNIQUE column, must
+    not block a start.)"""
     conn.execute("PRAGMA defer_foreign_keys=ON")
     refused: list[str] = []
     for table in _provenance_tables(conn):
@@ -398,22 +402,37 @@ def probe_eval_only(conn: sqlite3.Connection) -> list[str]:
                 f'INSERT INTO "{table}" ({",".join(names)}) VALUES ({",".join("?" * len(names))})'  # noqa: S608
             )
             conn.execute(insert, vals)
-        except sqlite3.Error:
-            refused.append(table)
+        except sqlite3.Error as e:
+            msg = str(e).lower()
+            if (
+                isinstance(e, sqlite3.IntegrityError)
+                and "check constraint failed" in msg
+                and "provenance" in msg
+            ):
+                refused.append(table)  # a real provenance refusal
+                if kinds is not None:
+                    kinds[table] = "check"
+            elif NEW_PROV_CHECK not in sql:
+                log.warning("eval-only probe of %s inconclusive (%s); its CHECK lacks it", table, e)
+                refused.append(table)  # inconclusive, and the stored CHECK lacks it
+                if kinds is not None:
+                    kinds[table] = "schema"
+            else:  # inconclusive (a dummy value clashed): the stored CHECK lists it
+                log.warning("eval-only probe of %s inconclusive (%s); its CHECK lists it", table, e)
         finally:
             conn.execute("ROLLBACK TO probe")
             conn.execute("RELEASE probe")
     return refused
 
 
-def verify_fresh_connection(path: str) -> list[str]:
+def verify_fresh_connection(path: str, kinds: dict[str, str] | None = None) -> list[str]:
     """After m13 commits: a second, new connection (its own view of the schema,
     nothing cached) must be able to store `eval-only` in every provenance table."""
     fresh = sqlite3.connect(path, isolation_level=None)
     try:
         fresh.execute("BEGIN")
         try:
-            return probe_eval_only(fresh)
+            return probe_eval_only(fresh, kinds)
         finally:
             fresh.execute("ROLLBACK")
     finally:
@@ -466,10 +485,14 @@ def migrate(conn: sqlite3.Connection) -> int:
     # connection must store `eval-only` in every provenance table, inside a transaction
     # it rolls back. Fails closed: names the tables and the backup, repairs nothing.
     file = _db_file(conn)
-    refused = verify_fresh_connection(file) if file else []
+    kinds: dict[str, str] = {}
+    refused = verify_fresh_connection(file, kinds) if file else []
     if refused:
         baks = sorted(Path(file).parent.glob(f"{Path(file).name}.pre-m13-*.bak"))
-        where = f"restore the backup {baks[-1]}" if baks else "no pre-m13 backup is beside it"
+        if "check" not in kinds.values():  # no real provenance refusal: no backup to name
+            where = "the probe was inconclusive and the stored CHECK lacks 'eval-only'"
+        else:
+            where = f"restore the backup {baks[-1]}" if baks else "no pre-m13 backup is beside it"
         raise sqlite3.DatabaseError(
             f"a new connection can't store 'eval-only' in {refused} of {file}; vigild won't"
             f" start and repairs nothing: {where}"
