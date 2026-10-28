@@ -219,7 +219,7 @@ Rules run top to bottom; the first match wins and its name is written to `tier_r
 | --- | --- | --- | --- |
 | 1 | Task has no `test_cmd` or `done_when` | claude | Sonnet (spec-writing only, no code) |
 | 2 | Paths touch `src/billing/**`, `src/auth/**`, `**/payments/**`, `**/consent/**`, Stripe/Fly config | claude | Opus |
-| 3 | Label `architecture`, `migration`, or touches `docs/architecture.md` structure | claude | Opus |
+| 3 | Label `architecture` or `migration` (labels only; a path in scope never triggers it, owner ruling 2026-10-28) | claude | Opus |
 | 4 | New feature with no existing tests in scope | claude | Sonnet (first pass) |
 | 5 | `attempt` ≥ 3, or two review rounds with findings | claude | Sonnet (escalated) |
 | 6 | Label `tests`, `docs`, `deps`, `lint`, `copy`, `ui-small`; size S or M; ≥1 existing test in scope | local | Qwen3.6-35B-A3B |

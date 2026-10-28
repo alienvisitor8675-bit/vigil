@@ -505,7 +505,8 @@ your Max plan and aren't counted.
   - tasks, jobs, sessions and health;
   - bearer scopes, and the UI's login cookie (P7 no).
 - **Routing and decider:**
-  - rules 1–9 and presets;
+  - rules 1–9 and presets; rule 3 fires on the `architecture` and
+    `migration` labels only, never on a path in scope (#61);
   - the private-repo rule (Q2);
   - the decider with Haiku through the gateway, and Jev on fixtures.
 - **Gateway, budgets, metering (P1):**

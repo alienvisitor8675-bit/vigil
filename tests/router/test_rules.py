@@ -58,9 +58,38 @@ def test_rule2_is_not_overridable(cfg: Config) -> None:
         route(_t(labels=["vigil:local-ok"], spec={"files_in_scope": ["src/auth/x.py"]}), cfg)
 
 
-def test_rule3_architecture(cfg: Config) -> None:
-    assert route(_t(labels=["migration"]), cfg).tier_reason.startswith("rule3")
-    assert route(_t(spec={"files_in_scope": ["docs/architecture.md"]}), cfg).tier == "claude-opus"
+def test_rule3_fires_on_architecture_labels_only(cfg: Config) -> None:
+    for label in ("architecture", "migration"):
+        r = route(_t(labels=[label]), cfg)
+        assert (r.tier, r.tier_reason) == ("claude-opus", "rule3:architecture")
+
+
+def test_rule3_ignores_architecture_md_in_scope(cfg: Config) -> None:
+    r = route(_t(spec={"files_in_scope": ["docs/architecture.md"]}), cfg)
+    assert (r.tier, r.preset, r.tier_reason) == ("claude-sonnet", "claude-sonnet", "rule9:default")
+    assert not hasattr(cfg.routing, "architecture_paths")
+
+
+def test_rule2_beats_rule3(cfg: Config) -> None:
+    t = _t(labels=["architecture"], spec={"files_in_scope": ["src/auth/x.py"]})
+    assert route(t, cfg).tier_reason.startswith("rule2")
+
+
+def test_a_vigil_job_touching_architecture_md_does_not_route_by_rule3(cfg: Config) -> None:
+    """vi-0001's shape: gateway, metering, db and docs, labelled needs-review."""
+    t = _t(
+        repo="thomasbardhi01/vigil",
+        labels=["needs-review"],
+        spec={
+            "files_in_scope": [
+                "vigild/gateway/service.py",
+                "vigild/metering/meter.py",
+                "vigild/db.py",
+                "docs/architecture.md",
+            ]
+        },
+    )
+    assert route(t, cfg).tier_reason == "rule9:default"
 
 
 def test_rule4_new_feature_without_tests(cfg: Config) -> None:

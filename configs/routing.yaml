@@ -24,7 +24,6 @@ money_paths:
   - fly.toml
   - "*Config.xcconfig"
 architecture_labels: [architecture, migration]
-architecture_paths: [docs/architecture.md]
 local_labels: [tests, docs, deps, lint, copy, ui-small]
 xs_labels: [docs, lint]
 escalate_attempt: 3

@@ -36,7 +36,7 @@ def _rule(task: Task, cfg: Config) -> tuple[str, str]:
     money = [f for f in files if matches_any(f, r.money_paths)]
     if money:
         return "claude-opus", f"rule2:money-path:{money[0]}"
-    if labels & set(r.architecture_labels) or any(f in r.architecture_paths for f in files):
+    if labels & set(r.architecture_labels):
         return "claude-opus", "rule3:architecture"
     if "feature" in labels and task.has_existing_tests is False:
         return "claude-sonnet", "rule4:new-feature-no-tests"

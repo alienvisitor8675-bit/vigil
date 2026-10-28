@@ -107,7 +107,6 @@ class Routing(_M):
     auditor: str
     money_paths: list[str]
     architecture_labels: list[str]
-    architecture_paths: list[str]
     local_labels: list[str]
     xs_labels: list[str]
     escalate_attempt: int = 3
