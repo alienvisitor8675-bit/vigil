@@ -271,6 +271,18 @@ you. There is no timer and no launchd job.
   uv run python cli/vigil dev-image --repo thomasbardhi01/vigil --rebuild
   ```
 
+- **The `rebuilds-images` label.** CI's `image-key` job puts it on a PR that
+  changes an input of a dev-image key or of the executor layer: a repo's dev
+  Dockerfile, vigil's `pyproject.toml` or `uv.lock`, a repo's `dev_suites` or
+  `dev_image_tools`, anything under `images/claude-executor/`, the managed
+  settings or the worker-report schema. Such a PR must have a body line
+  `Rebuilds images: <repo or layer>` (edit the body, then re-run the job), and
+  CI builds vigil's dev image and runs its suites offline. It does not build
+  the session layer (no claude-mods in CI). **After a labelled PR merges, run**
+  `vigil dev-image --repo <repo>` for each repo it names (add `--rebuild` only
+  to force one); until then `vigil doctor` fails `dev image fresh` or
+  `session image fresh` with both keys, and the next job is refused with
+  `build <image> first`.
 - **Session images.** A repo's coord and worker sessions run in its session
   image: the executor layer (`images/claude-executor/Dockerfile`) built over
   its dev image, so workers can run the real suite offline. `vigil dev-image` builds it

@@ -166,6 +166,14 @@ class DevImages:
         name = re.sub(r"[^a-z0-9._-]", "-", repo.split("/")[-1].lower())
         return f"vigil-dev/{name}:{key[:16]}"
 
+    def newest_validated(self, repo: str, stages: tuple[str, ...]) -> dict[str, Any] | None:
+        """The newest passing record of these stages (`validate` is a dev image,
+        `session-validate` a session image); doctor compares its key to main's."""
+        rows = self.store.q(
+            "SELECT * FROM dev_images WHERE repo=? AND ok=1 ORDER BY id DESC", (repo,)
+        )
+        return next((dict(r) for r in rows if r["stage"] in stages), None)
+
     def latest(self, repo: str, key: str | None = None) -> dict[str, Any] | None:
         sql, args = "SELECT * FROM dev_images WHERE repo=?", [repo]
         if key is not None:
@@ -349,13 +357,46 @@ SESSION_CHECK = (
 )
 
 
-def layer_digest() -> str:
-    """The executor layer's identity: every file it's built from."""
-    h = hashlib.sha256()
+def layer_files() -> list[Path]:
+    """Every file the executor layer's digest hashes, in hash order."""
     files = sorted(
         f for f in EXECUTOR_LAYER.rglob("*") if f.is_file() and "__pycache__" not in f.parts
     )
-    for f in [*files, MANAGED_SETTINGS, REPORT_SCHEMA]:
+    return [*files, MANAGED_SETTINGS, REPORT_SCHEMA]
+
+
+def key_input_paths(cfg: Config, repo: str | None = None) -> list[str]:
+    """Checkout-relative files whose change changes a dev-image key or the layer
+    digest: every repo's dev Dockerfile, the layer's files, and the lockfiles of
+    `repo` (the repo this checkout is; other repos' lockfiles are in their trees).
+    The CI `image-key` job (scripts/image-key-check.py) uses this one list."""
+    paths = {cfg.repo(r).dev_dockerfile for r in cfg.repos.repos}
+    paths |= {str(f.relative_to(ROOT)) for f in layer_files()}
+    if repo is not None:
+        paths |= set(cfg.repo(repo).dev_lockfiles)
+    return sorted(paths)
+
+
+# Fields of a repo's entry in configs/repos.yaml that its key hashes (the suites)
+# or its image provides (the tools a test_cmd may use).
+KEY_CONFIG_FIELDS = ("dev_dockerfile", "dev_lockfiles", "dev_suites", "dev_image_tools")
+
+
+def config_input_changes(base: dict[str, Any], head: dict[str, Any]) -> list[str]:
+    """`repo: field` for each key-relevant field of repos.yaml that differs."""
+    out: list[str] = []
+    for name in sorted(head):
+        if name not in base:
+            out.append(f"{name}: new repo")
+            continue
+        out += [f"{name}: {f}" for f in KEY_CONFIG_FIELDS if base[name].get(f) != head[name].get(f)]
+    return out
+
+
+def layer_digest() -> str:
+    """The executor layer's identity: every file it's built from."""
+    h = hashlib.sha256()
+    for f in layer_files():
         h.update(str(f.relative_to(ROOT)).encode() + b"\0" + f.read_bytes() + b"\0")
     return h.hexdigest()
 

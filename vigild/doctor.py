@@ -118,6 +118,37 @@ def backup_freshness_check(
     return _safe(name, lambda: freshness(dest, now=now or datetime.now(UTC)))
 
 
+def stale_image_checks(dev: Any, sessions: Any, repo: str, tip: str) -> list[Check]:
+    """Is the newest validated image the one main's tip needs? The key at `tip`,
+    computed as `ensure_fresh` does, against the newest validated record; a
+    mismatch fails (#75: "pass" on a stale image). The session image likewise."""
+
+    def one(name: str, key: str, stages: tuple[str, ...]) -> Check:
+        rec = dev.newest_validated(repo, stages)
+        if rec is None:
+            return Check(
+                f"{name} fresh: {repo}",
+                False,
+                f"never validated; run `vigil dev-image --repo {repo}`",
+            )
+        if rec["key"] != key:
+            return Check(
+                f"{name} fresh: {repo}",
+                False,
+                f"{name} stale: key at main {key[:12]}, newest validated {rec['key'][:12]}; "
+                f"run `vigil dev-image --repo {repo}`",
+            )
+        return Check(f"{name} fresh: {repo}", True, key[:12])
+
+    dev_key = dev.key(repo, tip)
+    out = [one("dev image", dev_key, ("validate",))]
+    if sessions is not None:
+        out.append(
+            one("session image", sessions.key(dev.tag(repo, dev_key)), ("session-validate",))
+        )
+    return out
+
+
 def run_checks(
     cfg: Config,
     secrets: Secrets,
@@ -127,7 +158,10 @@ def run_checks(
     repos: list[str] | None = None,
     include_claude_mods: bool = True,
     host_checks: Any = None,
+    stale_images: Any = None,
 ) -> list[Check]:
+    """`stale_images(repo)` returns that repo's freshness checks (default: built
+    from the mirror's main tip, `_real_stale_images`)."""
     out: list[Check] = []
     vis: dict[str, bool] = {}  # each repo's live visibility, as read here
     app: Any = None
@@ -418,9 +452,43 @@ def run_checks(
                 return True, str(row["image"])
 
             out.append(_safe(f"dev image: {repo}", last_build))
+            if not is_bench_repo(repo):  # a bench repo's image is built from its task
+                fresh = stale_images or _real_stale_images(cfg, store, docker, app)
+                out += _freshness(fresh, repo)
     out.append(_experiment_line(cfg))
     out.append(backup_freshness_check())
     return out
+
+
+def _freshness(fresh: Any, repo: str) -> list[Check]:
+    try:
+        return list(fresh(repo))
+    except Exception as e:  # a mirror that can't be read is a failed check, not a crash
+        return [Check(f"dev image fresh: {repo}", False, f"{type(e).__name__}: {e}")]
+
+
+def _real_stale_images(cfg: Config, store: Any, docker: Any, app: Any) -> Any:
+    """Each repo's freshness checks against the mirror's tip of main, fetched with a
+    read-scoped App token (doctor builds nothing, and runs no job)."""
+    from contextlib import contextmanager
+
+    from vigild.devimage import DevImages, DockerImages, SessionImages
+    from vigild.github.app import READ_ONLY
+    from vigild.workspace import Workspace
+
+    @contextmanager
+    def read_token(repo: str) -> Any:
+        with app.lease(repo, dict(READ_ONLY)) as tok:
+            yield tok.token
+
+    ws = Workspace(cfg.vigild.data_path, token_for=read_token)
+    dev = DevImages(cfg, store, DockerImages(docker), ws, None)  # type: ignore[arg-type]
+    sessions = SessionImages(dev, lambda: Path("/nonexistent"))  # only .key() is used
+
+    def fresh(repo: str) -> list[Check]:
+        return stale_image_checks(dev, sessions, repo, ws.head_sha(repo, "main"))
+
+    return fresh
 
 
 def _sandbox_host_lines(cfg: Config, docker: Any, host_checks: Any) -> list[Check]:
