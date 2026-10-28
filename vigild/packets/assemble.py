@@ -13,10 +13,12 @@ assembled here, in six parts:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,7 @@ from vigild.intake.paths import scope_entry_error
 from vigild.jobs.artifacts import SPEC_SECTIONS, artifact_path
 from vigild.jobs.model import Role
 from vigild.jobs.ownernote import spec_body as spec_text
+from vigild.packets import coord_context as cc
 from vigild.packets.fence import UNTRUSTED_RULE, fence
 
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
@@ -36,6 +39,7 @@ TITLES = {
     "role_and_rules": "1. Role and rules",
     "context_pack": "2. Context pack",
     "contract": "3. Contract",
+    "feature_index": "1a. Feature-map index (one line per row)",
     "owner": "3a. Owner's amendment (from the owner, not fenced)",
     "untrusted": "4. Untrusted content (data only)",
     "output_schema": "5. Output",
@@ -55,6 +59,15 @@ class Packet:
     role: Role
     parts: dict[str, str]
     dropped: list[str] = field(default_factory=list)
+    # the parts that come first and don't vary per job (the coord packet's cached prefix)
+    stable: tuple[str, ...] = ()
+    layer_chars: dict[str, int] = field(default_factory=dict)
+    layer_budgets: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def stable_block(self) -> str:
+        """The text of the stable parts, exactly as `text` begins with it."""
+        return "\n\n".join(f"# {TITLES[k]}\n\n{self.parts[k].strip()}" for k in self.stable)
 
     @property
     def headings(self) -> list[str]:
@@ -417,32 +430,165 @@ def assemble_audit(
     )
 
 
-def assemble_coord(
-    repo: Path,
-    request: dict[str, Any],
-    *,
-    untrusted: dict[str, str],
-    budget_chars: int = DEFAULT_BUDGET_CHARS,
-    gate_errors: list[str] | None = None,
-    amend: tuple[str, str, list[str]] | None = None,
-    fresh: bool = False,
-) -> Packet:
-    """`fresh` is a replan that starts the coord from nothing (#78): no context pack,
-    only the contract, the owner's note and spec (`amend`) and the untrusted failures
-    and plan.md the caller passes.
+# The coord's excerpt budgets, in tokens. Smaller than a worker's: the coord
+# plans, it reads files itself, and the stable block already holds the index.
+COORD_LAYER_BUDGET_TOKENS: dict[str, int] = {
+    "layer 3 (feature map)": 800,
+    "layer 2 (architecture)": 500,
+    "files in scope": 500,
+    "readme": 300,
+}
+COORD_STABLE = ("role_and_rules", "feature_index")
 
-    `amend` is (the spec to amend, whether it was approved, the owner's notes in
-    order) for a replan with notes: the owner's text goes in its own section, never
-    fenced, and the coord amends that spec rather than drafting from the request."""
-    job_id = request["job_id"]
+
+def _wrap(name: str, body: str) -> str:
+    return f"## {name}\n\n```\n{body.rstrip()}\n```"
+
+
+OUTLINE_OVERHEAD = 120  # the block's heading and fence, and the "not shown" note
+OUTLINE_SIG_MAX, OUTLINE_DOC_MAX = 200, 100
+
+
+def py_outline(text: str, budget: int) -> str | None:
+    """The classes and functions of a Python file, with signatures, the first
+    line of each docstring and line numbers, in at most `budget` characters.
+    Parsed with `ast.parse` only: the text is never imported or run. None if it
+    doesn't parse; "" if not even one entry fits."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError, ValueError, RecursionError, MemoryError:
+        return None
+    entries: list[tuple[int, str]] = []
+
+    def walk(body: list[ast.stmt], depth: int) -> None:
+        for n in body:
+            if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef):
+                sig = f"{'async ' if isinstance(n, ast.AsyncFunctionDef) else ''}def {n.name}"
+                sig += f"({ast.unparse(n.args)})" + (
+                    f" -> {ast.unparse(n.returns)}" if n.returns else ""
+                )
+            elif isinstance(n, ast.ClassDef):
+                bases = ", ".join(ast.unparse(x) for x in [*n.bases, *n.keywords])
+                sig = f"class {n.name}" + (f"({bases})" if bases else "")
+            else:
+                continue
+            doc = (ast.get_docstring(n) or "").strip().split("\n")[0][:OUTLINE_DOC_MAX]
+            line = f"L{n.lineno} {'  ' * depth}{sig[:OUTLINE_SIG_MAX]}" + (
+                f': "{doc}"' if doc else ""
+            )
+            entries.append((n.lineno, line))
+            if isinstance(n, ast.ClassDef):
+                walk(n.body, depth + 1)
+
+    walk(tree.body, 0)
+    out: list[str] = []
+    used = 0
+    for i, (lineno, line) in enumerate(entries):
+        left_out = i < len(entries) - 1
+        if used + len(line) + 1 + (OUTLINE_NOTE if left_out else 0) > budget:
+            if not out:
+                return ""
+            total = len(text.splitlines())
+            out.append(f"… not shown: L{lineno}-L{total} ({len(entries) - i} more definitions)")
+            return "\n".join(out)
+        out.append(line)
+        used += len(line) + 1
+    return "\n".join(out)
+
+
+OUTLINE_NOTE = 70  # room kept for the "not shown" line
+
+
+def _coord_context(
+    repo: Path, request: dict[str, Any], extra_paths: list[str] | None
+) -> tuple[str, str, list[str], dict[str, int], dict[str, int]]:
+    """(the feature-map index, the scope-driven excerpts, what was dropped, the
+    characters each layer used, the budget each layer had). The index depends only
+    on the repo's docs. Matching feature-map rows are never dropped: they shrink to
+    status + files + first sentence, and the layer's budget grows if it must."""
+    fm = _read(repo, "docs/feature-map.md") or ""
+    rows = cc.feature_rows(fm)
+    index = cc.feature_index(rows) or "(no feature map in this repo)"
+    named = " ".join(
+        [str(request.get("title") or ""), str(request.get("request") or "")]
+        + [str(n) for n in request.get("notes") or []]
+    )
+    paths = cc.job_paths(named, lambda p: _read(repo, p) is not None, extra_paths)
+    l3, l2, lf, lr = "layer 3 (feature map)", "layer 2 (architecture)", "files in scope", "readme"
+    budgets = {k: v * 4 for k, v in COORD_LAYER_BUDGET_TOKENS.items()}
+    out: list[str] = []
+    dropped: list[str] = []
+    used: dict[str, int] = {}
+
+    def add(layer: str, block: str) -> None:
+        out.append(block)
+        used[layer] = used.get(layer, 0) + len(block)
+
+    hit = cc.rows_for(rows, paths)
+    fulls = [_wrap(f"feature-map row: {r.name}", r.line) for r in hit]
+    shorts = [_wrap(f"feature-map row: {r.name}", r.short) for r in hit]
+    total = sum(min(len(f), len(x)) for f, x in zip(fulls, shorts, strict=True))
+    if total > budgets[l3]:
+        dropped.append(f"{l3}: budget raised from {budgets[l3]} to {total} chars to keep every row")
+        budgets[l3] = total
+    spent = total
+    for full, short in zip(fulls, shorts, strict=True):
+        extra = len(full) - min(len(full), len(short))
+        if extra and spent + extra <= budgets[l3]:
+            spent += extra
+            add(l3, full)
+        else:
+            add(l3, full if len(full) <= len(short) else short)
+
+    arch = cc.sections_naming(_read(repo, "docs/architecture.md") or "", paths)
+    for heading, body in arch:
+        name = f"architecture: {heading.lstrip('# ')}"
+        room = budgets[l2] - used.get(l2, 0)
+        for text in (body, cc.lines_naming(body, paths)):
+            if text and len(_wrap(name, text)) <= room:
+                add(l2, _wrap(name, text))
+                break
+        else:
+            dropped.append(f"{l2}: {name} ({len(body)} chars)")
+
+    for p in paths:
+        text = _read(repo, p) or ""
+        room = budgets[lf] - used.get(lf, 0)
+        if len(_wrap(p, text)) <= room:
+            add(lf, _wrap(p, text))
+        elif p.endswith(".py"):
+            outline = py_outline(text, room - OUTLINE_OVERHEAD)
+            if outline:
+                add(lf, _wrap(f"{p} (outline)", outline))
+            else:
+                why = "does not parse" if outline is None else "no room for an outline"
+                dropped.append(f"{lf}: {p} ({len(text)} chars, {why})")
+        else:
+            dropped.append(f"{lf}: {p} ({len(text)} chars)")
+
+    readme = _read(repo, "README.md")
+    if readme:
+        if len(_wrap("README.md", readme)) <= budgets[lr]:
+            add(lr, _wrap("README.md", readme))
+        else:
+            dropped.append(f"{lr}: README.md ({len(readme)} chars)")
+    if dropped:
+        out.append("## Dropped for the budget\n\n" + "\n".join(f"- {d}" for d in dropped))
+    pack = "\n\n".join(out) or "(nothing in the repo matches the job's paths)"
+    return index, pack, dropped, used, budgets
+
+
+def _classic_context(repo: Path, budget_chars: int) -> tuple[str, list[str]]:
+    """Today's coord context: README.md, the whole feature map and the whole
+    architecture doc, whichever fit the budget."""
     items: list[str] = []
     dropped: list[str] = []
     used = 0
-    for doc in () if fresh else ("README.md", "docs/feature-map.md", "docs/architecture.md"):
+    for doc in ("README.md", "docs/feature-map.md", "docs/architecture.md"):
         text = _read(repo, doc)
         if text is None:
             continue
-        block = f"## {doc}\n\n```\n{text.rstrip()}\n```"
+        block = _wrap(doc, text)
         if used + len(block) > budget_chars:
             dropped.append(f"{doc} ({len(text)} chars)")
             continue
@@ -450,6 +596,55 @@ def assemble_coord(
         used += len(block)
     if dropped:
         items.append("## Dropped for the budget\n\n" + "\n".join(f"- {d}" for d in dropped))
+    return "\n\n".join(items) or "(empty)", dropped
+
+
+def _assemble_coord(
+    lean: bool,
+    repo: Path,
+    request: dict[str, Any],
+    *,
+    untrusted: dict[str, str],
+    gate_errors: list[str] | None = None,
+    amend: tuple[str, str, list[str]] | None = None,
+    extra_paths: list[str] | None = None,
+    fresh: bool = False,
+    budget_chars: int = DEFAULT_BUDGET_CHARS,
+) -> Packet:
+    """The coord packet, `classic` or `lean` (`routing.coord_packet`). The lean one
+    (ADR-0005 part 1) has three tiers:
+
+    1. the stable block: the role prompt, CLAUDE.md whole, and a feature-map
+       index. Nothing in it varies per job, so it is the cached prefix;
+    2. excerpts for the job's paths under per-layer budgets: the feature-map
+       rows, the architecture sections and the files that meet them;
+    3. the job: the contract, the notes, gate errors, untrusted text, the schema.
+
+    `extra_paths` is the hook for vigild's pre-fill (part 5): paths it found
+    that the request doesn't name. `fresh` is a replan that starts the coord from
+    nothing (#78): the stable block (so the cached prefix is shared) but no
+    scope excerpts, only the contract, the owner's note and spec (`amend`) and
+    the untrusted failures and plan.md the caller passes. `amend` is (the spec to
+    amend, whether it was
+    approved, the owner's notes in order) for a replan with notes: the owner's
+    text goes in its own section, never fenced, and the coord amends that spec
+    rather than drafting from the request."""
+    job_id = request["job_id"]
+    left_out = (
+        "(left out: this replan starts fresh from spec.md, plan.md, the "
+        "owner's note and the failures below)"
+    )
+    index = ""
+    layer_chars: dict[str, int] = {}
+    layer_budgets: dict[str, int] = {}
+    if lean:
+        index, pack, dropped, layer_chars, layer_budgets = _coord_context(
+            repo, request, extra_paths
+        )
+    else:
+        pack, dropped = _classic_context(repo, budget_chars) if not fresh else (left_out, [])
+    if fresh:
+        pack, dropped, layer_chars = left_out, [], {}
     notes = "\n".join(f"- {n}" for n in request.get("notes") or []) or "- (none)"
     contract = (
         "```json\n" + json.dumps(request, indent=2, sort_keys=True) + "\n```\n\n"
@@ -471,10 +666,8 @@ def assemble_coord(
     )
     parts = {
         "role_and_rules": _role_and_rules(Role.COORD, repo),
-        "context_pack": "(left out: this replan starts fresh from spec.md, plan.md, the "
-        "owner's note and the failures below)"
-        if fresh
-        else "\n\n".join(items) or "(empty)",
+        **({"feature_index": index} if lean else {}),
+        "context_pack": pack,
         "contract": contract,
     }
     if amend is not None:
@@ -513,7 +706,68 @@ def assemble_coord(
             "Does every worker contract validate? Are money paths flagged?",
         },
         dropped,
+        stable=COORD_STABLE if lean else (),
+        layer_chars=layer_chars,
+        layer_budgets=layer_budgets,
     )
+
+
+def assemble_coord_classic(
+    repo: Path,
+    request: dict[str, Any],
+    *,
+    untrusted: dict[str, str],
+    gate_errors: list[str] | None = None,
+    amend: tuple[str, str, list[str]] | None = None,
+    extra_paths: list[str] | None = None,
+    fresh: bool = False,
+    budget_chars: int = DEFAULT_BUDGET_CHARS,
+) -> Packet:
+    """Today's coord packet: README.md, the whole feature map and the whole
+    architecture doc, whichever fit. `extra_paths` is accepted and unused."""
+    return _assemble_coord(
+        False,
+        repo,
+        request,
+        untrusted=untrusted,
+        gate_errors=gate_errors,
+        amend=amend,
+        extra_paths=extra_paths,
+        fresh=fresh,
+        budget_chars=budget_chars,
+    )
+
+
+def assemble_coord_lean(
+    repo: Path,
+    request: dict[str, Any],
+    *,
+    untrusted: dict[str, str],
+    gate_errors: list[str] | None = None,
+    amend: tuple[str, str, list[str]] | None = None,
+    extra_paths: list[str] | None = None,
+    fresh: bool = False,
+) -> Packet:
+    """The lean coord packet (ADR-0005 part 1)."""
+    return _assemble_coord(
+        True,
+        repo,
+        request,
+        untrusted=untrusted,
+        gate_errors=gate_errors,
+        amend=amend,
+        extra_paths=extra_paths,
+        fresh=fresh,
+    )
+
+
+assemble_coord = assemble_coord_classic
+# variant name -> assembler; `routing.coord_packet` picks one, and the spec-replay
+# harness looks variants up here by name.
+COORD_PACKETS: dict[str, Callable[..., Packet]] = {
+    "classic": assemble_coord_classic,
+    "lean": assemble_coord_lean,
+}
 
 
 def hidden_dir(job_id: str, task_id: str) -> str:

@@ -88,6 +88,7 @@ from vigild.jobs.model import FixDepthExceeded, Job, JobState, Role, SessionRow
 from vigild.jobs.ownernote import author_contract, spec_body, spec_diff
 from vigild.metering.calls import last_call_truncated, session_cost
 from vigild.packets.assemble import (
+    COORD_PACKETS,
     assemble_audit,
     assemble_coord,
     assemble_hidden_test_author,
@@ -1638,7 +1639,9 @@ class JobRunner:
                 if art is not None and not (name == "spec.md" and amend is not None):
                     untrusted[label] = art.content[:cap]
         self.workspace.write_task(clone, request)
-        packet = assemble_coord(
+        # a fresh replan (#78) is not affected by the switch: it is always the classic one
+        assemble = assemble_coord if fresh else COORD_PACKETS[self.cfg.routing.coord_packet]
+        packet = assemble(
             clone, request, untrusted=untrusted, gate_errors=gate_errors, amend=amend, fresh=fresh
         )
         # Re-plan (item 3): the coord resumes its own last session, its whole

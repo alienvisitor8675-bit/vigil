@@ -120,6 +120,8 @@ class Routing(_M):
     tiers: dict[str, str]
     fallback: str
     coord: str
+    # Which coord packet a first draft gets: today's, or the lean one (ADR-0005 part 1).
+    coord_packet: Literal["classic", "lean"] = "classic"
     reviewer: str
     auditor: str
     money_paths: list[str]

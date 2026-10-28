@@ -10,6 +10,7 @@ tiers:
   local-fast: tower-fast
 fallback: claude-sonnet
 coord: claude-opus             # the coord is the one place to spend quality
+coord_packet: classic          # classic | lean (ADR-0005 part 1): lean once the spec replay passes
 reviewer: claude-sonnet
 auditor: claude-opus
 
