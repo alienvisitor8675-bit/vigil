@@ -128,3 +128,16 @@ def test_per_call_rows_sum_to_the_session_total(cfg: Config, store: Store) -> No
     assert total == pytest.approx(
         pt.cost("claude-sonnet-5-5", CallUsage(tokens_in=6000, tokens_out=600))
     )
+
+
+def test_the_same_call_key_recorded_twice_is_one_row(cfg: Config) -> None:
+    store = Store.open(":memory:")
+    pt = PriceTable(cfg.prices)
+    kw: dict = dict(
+        session_id=None, task_id=None, job_id=None, purpose="decider", provider="anthropic",
+        backend_preset="claude-haiku", model="claude-haiku-5-5", call_key="k-1",
+    )  # fmt: skip
+    first = record_call(store, pt, usage=CallUsage(tokens_in=1000, tokens_out=10), **kw)
+    again = record_call(store, pt, usage=CallUsage(tokens_in=5000, tokens_out=99), **kw)
+    assert again == first > 0
+    assert store.q("SELECT COUNT(*) n FROM model_calls WHERE call_key='k-1'")[0]["n"] == 1

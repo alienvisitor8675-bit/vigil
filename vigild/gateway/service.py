@@ -25,6 +25,7 @@ import re
 import secrets
 import threading
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -36,7 +37,13 @@ import httpx2
 from vigild.budget import Budget, BudgetExceeded
 from vigild.config import Config, Preset, Secrets
 from vigild.db import Store, iso, utcnow
-from vigild.metering.calls import CallUsage, SSEUsageTap, record_call, usage_from_anthropic
+from vigild.metering.calls import (
+    CallUsage,
+    SSEUsageTap,
+    call_cost_by_key,
+    record_call,
+    usage_from_anthropic,
+)
 from vigild.metering.prices import PriceTable
 from vigild.provenance import Provenance
 from vigild.redact import redact
@@ -701,6 +708,7 @@ class Gateway:
         provider_cost: float | None = None,
         stop_reason: str | None = None,
         repo: str | None = None,
+        call_key: str | None = None,
     ) -> float:
         truncated = stop_reason == "max_tokens"
         if truncated and gs:
@@ -734,6 +742,7 @@ class Gateway:
             provenance=Provenance.LOCAL if preset.locality == "local" else Provenance.CLAUDE,
             truncated=truncated,
             repo=gs.repo if gs else repo,
+            call_key=call_key,
         )
 
     async def forward(
@@ -857,6 +866,7 @@ class Gateway:
                              tokens_in=math.ceil(body_chars / CHARS_PER_TOKEN), tokens_out=1024)
         ) if self.prices.has(model) else 0.0  # fmt: skip
         amount = max(self.cfg.budgets.decider_call_usd, worst)
+        call_key = uuid.uuid4().hex
         with self._own_call(amount, purpose, job_id) as cost:
             started = time.monotonic()
             payload = run()
@@ -888,39 +898,58 @@ class Gateway:
                     latency_ms=int((time.monotonic() - started) * 1000),
                     provenance=Provenance.CLAUDE,
                     repo=repo,
+                    call_key=call_key,
                 ),
+                call_key,
             )
             return payload
 
     def _own_record(
-        self, amount: float, purpose: str, job_id: str | None, record: Callable[[], float]
+        self,
+        amount: float,
+        purpose: str,
+        job_id: str | None,
+        record: Callable[[], float],
+        call_key: str,
     ) -> float:
-        """Record one of vigild's own calls and return its cost. If recording fails the
-        cost is unknown (#16's rule, here too): book the call's reservation (`amount`,
-        never more) and page. The call may also have been recorded, so it may be counted
-        twice: that errs on the safe side (exactly-once settle: #29)."""
+        """Record one of vigild's own calls and return its cost, exactly once by
+        `call_key` (#29). If recording fails, look the row up by key: found, its
+        cost is booked once; not found, the cost is unknown (#16's rule): book the
+        call's reservation (`amount`, never more). Either way, page."""
         try:
             return record()
         except Exception as e:
             reason = redact(f"{type(e).__name__}: {e}")
+            written: float | None = None
+            try:
+                written = call_cost_by_key(self.store, call_key)
+            except Exception:
+                log.exception("call_key lookup failed for %s", call_key)
+            booked = amount if written is None else written
             log.error("metering failed for vigild's own %s call: %s", purpose, reason)
             try:
                 self.store.add_event(
                     "metering_failed",
-                    {"purpose": purpose, "error": reason, "booked_usd": amount},
+                    {"purpose": purpose, "error": reason, "booked_usd": booked,
+                     "call_key": call_key, "row_written": written is not None},
                     Provenance.HUMAN, job_id=job_id,
                 )  # fmt: skip
                 self.store.create_inbox_item(
                     "questions", "page", job_id,
+                    f"metering failed after the record was written: {reason}; {purpose} "
+                    f"call booked at its recorded cost" if written is not None else
                     f"metering failed: {reason}; {purpose} call booked at its reservation",
-                    {"purpose": purpose, "booked_usd": amount,
-                     "note": f"Metering failed for this call; its cost was booked at its "
-                     f"reservation (${amount:.4f}). The call may also have been recorded, "
-                     "so it may be counted twice.", "resumable": False},
+                    {"purpose": purpose, "booked_usd": booked, "call_key": call_key,
+                     "row_written": written is not None,
+                     "note": f"The call's row was written; its recorded cost (${booked:.4f}) "
+                     "was booked once." if written is not None else
+                     f"Metering failed for this call; its cost was booked at its "
+                     f"reservation (${amount:.4f}). No row carries its key: not counted twice.",
+                     "resumable": False},
                 )  # fmt: skip
             except Exception:
                 log.exception("metering-failure page failed")
-            return amount
+            return booked
 
     @contextmanager
     def _own_call(
@@ -1044,6 +1073,7 @@ class Gateway:
         purpose: str,
         job_id: str | None,
     ) -> dict[str, Any]:
+        call_key = uuid.uuid4().hex
         with self._own_call(amount, purpose, job_id) as cost:
             started = time.monotonic()
             try:
@@ -1077,6 +1107,8 @@ class Gateway:
                     purpose=purpose,
                     job_id=job_id,
                     repo=repo,
+                    call_key=call_key,
                 ),
+                call_key,
             )
             return payload

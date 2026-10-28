@@ -4,6 +4,7 @@ from the price table; the provider's own cost when it reports one."""
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
@@ -104,13 +105,64 @@ def record_call(
     provenance: Provenance = Provenance.CLAUDE,
     truncated: bool = False,
     repo: str | None = None,
+    call_key: str | None = None,
 ) -> float:
+    """Insert the call's row. With a `call_key`, at most one row exists per key:
+    a second record of the same key writes nothing and returns the stored cost."""
+    if call_key is not None:
+        stored = call_cost_by_key(store, call_key)
+        if stored is not None:
+            return stored
     cost = prices.cost(model, usage)
+    try:
+        _insert_call(
+            store, cost, session_id, task_id, job_id, purpose, provider, backend_preset, model,
+            usage, provider_cost_usd, status, latency_ms, timings, provenance, truncated, repo,
+            call_key,
+        )  # fmt: skip
+    except sqlite3.IntegrityError:
+        stored = call_cost_by_key(store, call_key) if call_key is not None else None
+        if stored is None:
+            raise
+        return stored
+    if session_id:
+        prompt = usage.tokens_in + usage.tokens_cache_read + usage.tokens_cache_write_5m
+        prompt += usage.tokens_cache_write_1h
+        store.add_session_usage(session_id, cost, prompt, usage.tokens_out)
+    return cost
+
+
+def call_cost_by_key(store: Store, call_key: str) -> float | None:
+    rows = store.q("SELECT cost_usd FROM model_calls WHERE call_key=?", (call_key,))
+    return float(rows[0]["cost_usd"]) if rows else None
+
+
+def _insert_call(
+    store: Store,
+    cost: float,
+    session_id: str | None,
+    task_id: str | None,
+    job_id: str | None,
+    purpose: str,
+    provider: str,
+    backend_preset: str | None,
+    model: str,
+    usage: CallUsage,
+    provider_cost_usd: float | None,
+    status: int | None,
+    latency_ms: int | None,
+    timings: dict[str, Any] | None,
+    provenance: Provenance,
+    truncated: bool,
+    repo: str | None,
+    call_key: str | None,
+) -> None:
     store.x(
         "INSERT INTO model_calls (session_id, task_id, job_id, purpose, provider, backend_preset,"
         " model, tokens_in, tokens_out, tokens_cache_read, tokens_cache_write_5m,"
         " tokens_cache_write_1h, cost_usd, provider_cost_usd, status, latency_ms, timings, ts,"
-        " provenance, truncated, repo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " provenance, truncated, repo, call_key)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             session_id,
             task_id,
@@ -133,13 +185,9 @@ def record_call(
             store.row_provenance(provenance, job_id=job_id, session_id=session_id, task_id=task_id),
             int(truncated),
             repo,
+            call_key,
         ),
     )
-    if session_id:
-        prompt = usage.tokens_in + usage.tokens_cache_read + usage.tokens_cache_write_5m
-        prompt += usage.tokens_cache_write_1h
-        store.add_session_usage(session_id, cost, prompt, usage.tokens_out)
-    return cost
 
 
 def session_cost(store: Store, session_id: str) -> float:

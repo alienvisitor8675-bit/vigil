@@ -226,7 +226,7 @@ def test_one_live_job_per_issue_is_a_unique_index(tmp_path: Path) -> None:
 def test_the_batch_step_is_the_last_one_and_idempotent(tmp_path: Path) -> None:
     """Batch (#54): the step is appended last, adds `jobs.batch_id` and the batches table to
     a database from before, keeps its rows, and runs twice."""
-    assert db.MIGRATIONS[-1].__name__ == "_m16_batches"
+    assert db.MIGRATIONS[15].__name__ == "_m16_batches"
     path = tmp_path / "batch.db"
     conn = sqlite3.connect(path)
     conn.executescript(db.SCHEMA)
@@ -240,3 +240,23 @@ def test_the_batch_step_is_the_last_one_and_idempotent(tmp_path: Path) -> None:
     assert store.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)
     job = store.create_job(repo="o/r", base="main", title="t", request="r", notes=[])
     assert store.get_job(job.id).batch_id is None  # a job from before is in no batch
+
+
+def test_the_call_key_step_is_last_and_idempotent(tmp_path: Path) -> None:
+    """#29: the step is appended last, adds `model_calls.call_key` and a unique index."""
+    assert db.MIGRATIONS[-1].__name__ == "_m17_call_key"
+    path = tmp_path / "ck.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db.SCHEMA)
+    for step in db.MIGRATIONS[:16]:
+        step(conn)
+    conn.execute("DROP INDEX IF EXISTS calls_call_key")
+    conn.commit()
+    conn.close()
+    store = Store.open(path)
+    db.migrate(store.conn)
+    db.migrate(store.conn)
+    assert "call_key" in _cols(store, "model_calls")
+    uniq = {r["name"] for r in store.q("PRAGMA index_list(model_calls)") if r["unique"]}
+    assert "calls_call_key" in uniq
+    assert store.q("PRAGMA user_version")[0][0] == len(db.MIGRATIONS)

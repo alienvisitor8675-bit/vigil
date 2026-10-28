@@ -475,6 +475,12 @@ def _m16_batches(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS jobs_batch ON jobs(batch_id)")
 
 
+def _m17_call_key(conn: sqlite3.Connection) -> None:
+    """vigild's own calls settle exactly once by call_key (#29): one row per key."""
+    _add_columns(conn, "model_calls", {"call_key": "TEXT"})
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS calls_call_key ON model_calls(call_key)")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m1_gateway_token_binding,
     _m2_dev_image_keys,
@@ -492,6 +498,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m14_experiment_pool,
     _m15_replays,
     _m16_batches,
+    _m17_call_key,
 ]
 
 
