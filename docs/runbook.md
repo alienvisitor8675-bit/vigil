@@ -449,6 +449,108 @@ any other repo (no token, no visibility read), and lists each of them as
 `decider: <repo> (not checked: not selected)`. A build session always passes
 `--repo thomasbardhi01/vigil`.
 
+### Back up and restore
+
+This is the durability story until there is a second machine. `vigil backup`
+writes a dated set to a destination you choose (an external drive, or a
+mount of the tower over Tailscale): `vigil-<UTC stamp>.db` (SQLite online
+backup, mode 600) and `vigil-<stamp>.vault/` (rsync). It keeps 14 days.
+It is safe to run while vigild is running (SQLite's backup API gives a
+consistent snapshot; it may create `vigil.db-wal` and `-shm` beside the
+database), and it checks the copy with `integrity_check` before keeping it.
+Any filesystem works for the destination, exFAT included (the marker is a
+plain copy, not a hard link); mode 600 is not enforced on FAT or exFAT. The
+destination must be outside the repo and the data dir. It never reads
+`~/.config/vigil/`: back that directory up separately, encrypted, with a
+key only you hold.
+
+**Install the nightly job** (the owner does this; a build session does not):
+
+1. Copy `deploy/launchd/dev.vigil.backup.plist` to
+   `~/Library/LaunchAgents/dev.vigil.backup.plist`.
+2. Replace `__REPO_CHECKOUT__` (the checkout vigild runs from),
+   `__UV_PATH__` (`command -v uv`) and `__BACKUP_DESTINATION__` (an absolute
+   path on the drive or mount).
+3. `plutil -lint ~/Library/LaunchAgents/dev.vigil.backup.plist`
+4. Load it with `launchctl bootstrap gui/501 ~/Library/LaunchAgents/dev.vigil.backup.plist`
+   (501 is your uid; `id -u` prints it).
+5. Test once with `launchctl kickstart gui/501/dev.vigil.backup`, then read
+   `/tmp/dev.vigil.backup.log` and check a new set appeared. Docker Desktop
+   is not needed. Then `vigil doctor` should show `pass  backup freshness`.
+   The job runs at 03:15; the issue's done-when is two nights with old sets
+   pruned.
+
+`vigil doctor` checks freshness: it fails when the newest complete set (marker,
+db and vault) is more than 36 hours old, when there is none, or when the
+destination can't be listed. It reads the destination from `VIGIL_BACKUP_DIR`,
+else from the installed plist's `EnvironmentVariables`; it skips only while
+neither exists, and once the plist is installed an unparseable plist, a missing
+key, the `__BACKUP_DESTINATION__` placeholder or an unreachable destination all
+fail.
+
+Run by hand: `VIGIL_BACKUP_DIR=/path/to/dest uv run python cli/vigil backup`
+(`--keep-days N`, `--data-dir DIR`).
+
+**Check a backup** (verify only, writes nothing):
+`uv run python cli/vigil restore /path/to/dest/vigil-<stamp>.db`. It opens
+the file read-only, runs `PRAGMA integrity_check` and compares
+`user_version` with the code's migration count; it exits 1 and says why on a
+missing, corrupt or wrong-version file.
+
+**Restore** (manual; there is no automated restore):
+
+1. Stop vigild.
+2. Move `vigil.db`, `vigil.db-wal`, `vigil.db-shm` and `vault/` out of the
+   data dir to a safe place (do not delete them).
+3. Copy the backup's `vigil-<stamp>.db` to `<data>/vigil.db` (mode 600) and
+   `vigil-<stamp>.vault/` to `<data>/vault`.
+4. Run `uv run python cli/vigil restore <data>/vigil.db` to verify the copy.
+5. Start vigild.
+
+**The drill** (run on a scratch copy, never on `~/vigil-data`). Recorded run,
+2026-10-28, scratch dirs only (`$DRILL`); the manual restore is steps 2 and 3
+into a second scratch dir. The last step truncates a copy of the db.
+
+```
+$ vigil backup
+backed up vigil-20261028T101303Z.db and vigil-20261028T101303Z.vault
+[exit 0]
+$ ls -l dest
+total 336
+-rw-------  1 owner group  167936 Oct 28 06:13 vigil-20261028T101303Z.db
+-rw-------  1 owner group      16 Oct 28 06:13 vigil-20261028T101303Z.marker
+drwxr-xr-x  4 owner group     128 Oct 28 06:13 vigil-20261028T101303Z.vault
+[exit 0]
+$ vigil restore <dest db>
+vigil-20261028T101303Z.db passes integrity_check, user_version 14
+[exit 0]
+$ cp <db> restored/vigil.db; cp -R dest/vigil-*.vault restored/vault
+[exit 0]
+$ vigil restore restored/vigil.db
+vigil.db passes integrity_check, user_version 14
+[exit 0]
+$ sqlite3 restored/vigil.db "PRAGMA integrity_check; PRAGMA user_version; SELECT count(*) FROM jobs"
+ok
+14
+3
+[exit 0]
+$ diff -r src/vault restored/vault && echo identical
+identical
+[exit 0]
+$ freshness(dest, now=now)
+(True, 'newest set 20261028T101303Z, 0h old')
+[exit 0]
+$ freshness(dest, now=now + 37h)
+(False, 'newest set 20261028T101303Z, 37h old')
+[exit 0]
+$ vigil restore truncated.db
+backup failed verification: not a readable database: database disk image is malformed
+[exit 1]
+```
+
+`vigil doctor` has no `--data-dir`: it checks credentials and dependencies,
+not a data dir, so it can't be pointed at the restored copy.
+
 ### Keep development off the production data
 
 Only the owner's production vigild uses `~/vigil-data`. Build sessions and

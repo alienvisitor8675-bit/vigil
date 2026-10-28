@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template. Replace the three __PLACEHOLDERS__ (see docs/runbook.md, "Back up
+     and restore"); keep the filled copy out of the repo. No address lives here. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.vigil.backup</string>
+  <key>WorkingDirectory</key>
+  <string>__REPO_CHECKOUT__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UV_PATH__</string>
+    <string>run</string>
+    <string>--locked</string>
+    <string>python</string>
+    <string>cli/vigil</string>
+    <string>backup</string>
+    <string>--keep-days</string>
+    <string>14</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>VIGIL_BACKUP_DIR</key>
+    <string>__BACKUP_DESTINATION__</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>15</integer>
+  </dict>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/dev.vigil.backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/dev.vigil.backup.log</string>
+</dict>
+</plist>

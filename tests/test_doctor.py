@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import plistlib
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx2
+import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from vigild import doctor
 from vigild.config import Config, Secrets
 from vigild.doctor import Check, render, run_checks
 
@@ -166,3 +171,90 @@ def test_doctor_reports_the_hidden_tests_switch_per_repo(cfg: Config) -> None:
     names = {c.name: c for c in run_checks(cfg, Secrets({}), http=http, docker=None, repos=[])}
     assert names[f"hidden tests: {some}"].note == "on (host policy)"
     assert names["VIGIL_HOST_KEY"].ok is False  # needed now
+
+
+# --- backup freshness ---------------------------------------------------------
+
+
+BNOW = datetime(2026, 10, 28, 12, 0, 0, tzinfo=UTC)
+
+
+def _bset(dest: Path, when: datetime) -> None:
+    stamp = when.strftime("%Y%m%dT%H%M%SZ")
+    dest.mkdir(exist_ok=True)
+    (dest / f"vigil-{stamp}.marker").write_text("b" * 16)
+    (dest / f"vigil-{stamp}.db").write_bytes(b"x")
+    (dest / f"vigil-{stamp}.vault").mkdir()
+
+
+def _plist(path: Path, value: str | None) -> Path:
+    env = {} if value is None else {"VIGIL_BACKUP_DIR": value}
+    path.write_bytes(plistlib.dumps({"Label": "dev.vigil.backup", "EnvironmentVariables": env}))
+    return path
+
+
+def _bcheck(env: dict[str, str], plist: Path) -> Check:
+    return doctor.backup_freshness_check(environ=env, plist=plist, now=BNOW)
+
+
+def test_env_var_wins_over_the_plist(tmp_path: Path) -> None:
+    good, stale = tmp_path / "good", tmp_path / "stale"
+    _bset(good, BNOW - timedelta(hours=1))
+    _bset(stale, BNOW - timedelta(hours=90))
+    plist = _plist(tmp_path / "p.plist", str(stale))
+    c = _bcheck({"VIGIL_BACKUP_DIR": str(good)}, plist)
+    assert c.name == "backup freshness" and c.ok is True
+    assert str(good) not in c.note
+
+
+def test_plist_value_is_used_when_the_env_var_is_unset(tmp_path: Path) -> None:
+    stale = tmp_path / "stale"
+    _bset(stale, BNOW - timedelta(hours=90))
+    assert _bcheck({}, _plist(tmp_path / "p.plist", str(stale))).ok is False
+    good = tmp_path / "good"
+    _bset(good, BNOW - timedelta(hours=1))
+    assert _bcheck({}, _plist(tmp_path / "p.plist", str(good))).ok is True
+
+
+def test_no_env_var_and_no_plist_skips(tmp_path: Path) -> None:
+    c = _bcheck({}, tmp_path / "absent.plist")
+    assert c.ok is None
+    assert c.note == "no backup destination (VIGIL_BACKUP_DIR unset, plist not installed)"
+
+
+def test_an_installed_plist_with_a_problem_fails_not_skips(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.plist"
+    bad.write_text("not a plist")
+    cases = [
+        _plist(tmp_path / "a.plist", "__BACKUP_DESTINATION__"),
+        _plist(tmp_path / "b.plist", None),
+        bad,
+        _plist(tmp_path / "c.plist", str(tmp_path / "nowhere")),
+    ]
+    for p in cases:
+        c = _bcheck({}, p)
+        assert c.ok is False, p.name
+        assert str(tmp_path) not in c.note
+
+
+def test_env_var_is_checked_even_without_a_plist(tmp_path: Path) -> None:
+    assert _bcheck({"VIGIL_BACKUP_DIR": str(tmp_path / "nowhere")}, tmp_path / "x").ok is False
+
+
+def test_run_checks_includes_backup_freshness(
+    cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("VIGIL_BACKUP_DIR", raising=False)
+    monkeypatch.setattr(doctor, "BACKUP_PLIST", tmp_path / "absent.plist")
+    http = httpx2.Client(transport=httpx2.MockTransport(_handler))
+    names = {c.name: c for c in run_checks(cfg, Secrets({}), http=http, docker=None, repos=[])}
+    assert names["backup freshness"].ok is None
+    d = tmp_path / "d"
+    _bset(d, datetime.now(UTC) - timedelta(hours=2))
+    monkeypatch.setenv("VIGIL_BACKUP_DIR", str(d))
+    names = {c.name: c for c in run_checks(cfg, Secrets({}), http=http, docker=None, repos=[])}
+    assert names["backup freshness"].ok is True
+
+
+def test_tests_never_read_the_hosts_backup_plist() -> None:
+    assert not doctor.BACKUP_PLIST.is_relative_to(Path.home() / "Library")
