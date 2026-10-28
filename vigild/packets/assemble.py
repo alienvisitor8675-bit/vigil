@@ -232,14 +232,23 @@ def assemble_worker(
     fix_context: dict[str, str] | None = None,
     approval_edits: str | None = None,
     fix_round: dict[str, Any] | None = None,
+    fresh_fix: dict[str, str] | None = None,
 ) -> Packet:
-    """A worker's packet. `fix_round` (phase 2a, item 1) is a review round
+    """A worker's packet. `fresh_fix` (spec, diff, verifier, plan, changelog) is a fix round that
+    starts from nothing (#78): no context pack (the clone holds the work), spec.md,
+    and the PR diff and vigild's verifier summary, both fenced, bounded.
+
+     `fix_round` (phase 2a, item 1) is a review round
     sent back to the same worker: its branch already holds its earlier work,
     and the findings (from vigild's reviewer and auditor, quoting the diff)
     are fenced."""
     spec = contract["spec"]
     files = list(spec.get("files_in_scope") or [])
-    pack, dropped = _context_pack(repo, files, budget_chars, fix_context)
+    if fresh_fix is not None:
+        pack = "(left out: this fix round starts fresh; your branch holds the work)"
+        dropped: list[str] = []
+    else:
+        pack, dropped = _context_pack(repo, files, budget_chars, fix_context)
     contract_part = (
         "```json\n" + json.dumps(contract, indent=2, sort_keys=True) + "\n```\n\n"
         f"Done when:\n{_checklist(spec.get('done_when') or '')}\n"
@@ -249,6 +258,17 @@ def assemble_worker(
     if approval_edits:
         contract_part += f"\nThe owner's notes on approval (follow them):\n{approval_edits}\n"
     untrusted = dict(untrusted)
+    if fresh_fix is not None:
+        contract_part += (
+            "\nThe approved spec.md:\n\n" + _codeblock(fresh_fix["spec"][:FRESH_SPEC_CHARS]) + "\n"
+        )
+        untrusted["pr diff"] = fresh_fix["diff"][:FRESH_DIFF_CHARS]
+        if fresh_fix["verifier"]:
+            untrusted["verifier summary"] = fresh_fix["verifier"][:FRESH_VERIFIER_CHARS]
+        if fresh_fix.get("plan"):
+            untrusted["plan.md"] = fresh_fix["plan"][:FRESH_PLAN_CHARS]
+        if fresh_fix.get("changelog"):
+            untrusted["spec_changelog.md"] = fresh_fix["changelog"][:FRESH_CHANGELOG_CHARS]
     if fix_round:
         contract_part += (
             f"\n**Fix round {fix_round['round']}.** Your branch already holds your earlier "
@@ -298,6 +318,12 @@ def assemble_worker(
 
 
 REVIEW_DIFF_CHARS = 60_000
+# a fresh fix round (#78) stays far under 20k input tokens (~4 chars each)
+FRESH_SPEC_CHARS = 16_000
+FRESH_DIFF_CHARS = 30_000
+FRESH_VERIFIER_CHARS = 6_000
+FRESH_PLAN_CHARS = 12_000
+FRESH_CHANGELOG_CHARS = 6_000
 
 
 def _review_parts(
@@ -399,15 +425,20 @@ def assemble_coord(
     budget_chars: int = DEFAULT_BUDGET_CHARS,
     gate_errors: list[str] | None = None,
     amend: tuple[str, str, list[str]] | None = None,
+    fresh: bool = False,
 ) -> Packet:
-    """`amend` is (the spec to amend, whether it was approved, the owner's notes in
+    """`fresh` is a replan that starts the coord from nothing (#78): no context pack,
+    only the contract, the owner's note and spec (`amend`) and the untrusted failures
+    and plan.md the caller passes.
+
+    `amend` is (the spec to amend, whether it was approved, the owner's notes in
     order) for a replan with notes: the owner's text goes in its own section, never
     fenced, and the coord amends that spec rather than drafting from the request."""
     job_id = request["job_id"]
     items: list[str] = []
     dropped: list[str] = []
     used = 0
-    for doc in ("README.md", "docs/feature-map.md", "docs/architecture.md"):
+    for doc in () if fresh else ("README.md", "docs/feature-map.md", "docs/architecture.md"):
         text = _read(repo, doc)
         if text is None:
             continue
@@ -440,7 +471,10 @@ def assemble_coord(
     )
     parts = {
         "role_and_rules": _role_and_rules(Role.COORD, repo),
-        "context_pack": "\n\n".join(items) or "(empty)",
+        "context_pack": "(left out: this replan starts fresh from spec.md, plan.md, the "
+        "owner's note and the failures below)"
+        if fresh
+        else "\n\n".join(items) or "(empty)",
         "contract": contract,
     }
     if amend is not None:

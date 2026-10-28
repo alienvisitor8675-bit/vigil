@@ -1619,14 +1619,30 @@ class JobRunner:
                 tid: {"title": t.get("title"), "state": t.get("state")} for tid, t in replan.items()
             }
             untrusted["previous build failures"] = json.dumps(replan, indent=1)[:12000]
+        # A replan starts the coord fresh (#78, ADR-0005): spec.md, plan.md,
+        # spec_changelog.md, the note, the failures. The fork is for true escalation,
+        # attempt >= escalate_attempt, where attempt is 1 + the replans so far.
+        replans = self.store.q(
+            "SELECT COUNT(*) AS n FROM events WHERE job_id=? AND type='replan'", (job_id,)
+        )[0]["n"]
+        fresh = bool(replan or amend) and replans + 1 < self.cfg.routing.escalate_attempt
+        if fresh:
+            for name, label, cap in (
+                ("plan.md", "plan.md (the previous plan)", 12000),
+                ("spec_changelog.md", "spec_changelog.md", 6000),
+                ("spec.md", "spec.md (the current spec)", 16000),
+            ):
+                art = self.store.get_artifact(job_id, name)
+                if art is not None and not (name == "spec.md" and amend is not None):
+                    untrusted[label] = art.content[:cap]
         self.workspace.write_task(clone, request)
         packet = assemble_coord(
-            clone, request, untrusted=untrusted, gate_errors=gate_errors, amend=amend
+            clone, request, untrusted=untrusted, gate_errors=gate_errors, amend=amend, fresh=fresh
         )
         # Re-plan (item 3): the coord resumes its own last session, its whole
-        # context, with the failures in this packet. Phase 6's fix jobs reuse it.
+        # context, with the failures in this packet, unless it starts fresh.
         resume = None
-        if replan:
+        if replan and not fresh:
             prior = [
                 x
                 for x in self.store.list_sessions(job_id)
@@ -2739,20 +2755,38 @@ class JobRunner:
         self.workspace.write_task(clone, {**contract, "base_sha": base_sha})
         approval = self.store.get_artifact(job_id, "approval.json")
         edits = json.loads(approval.content).get("edits") if approval else None
-        packet = assemble_worker(
-            clone, contract, untrusted={}, approval_edits=edits, fix_round=self._fix_round(t)
-        )
-        # The same worker goes on: a fix round (or a retry after one) forks its
-        # last session's transcript, and so does an escalated attempt, from
-        # the failed attempt's whole context, not a summary (item 2).
-        # A crashed worker resumes its own transcript, and its turn count
-        # carries on (item 3).
+        # A fix round or a retry of a published task starts fresh (#78, ADR-0005):
+        # spec.md, plan.md, spec_changelog.md, the PR diff, the findings and the
+        # verifier's summary, never the worker's transcript. The fork is for true
+        # escalation (rule 5, or attempt >= routing.escalate_attempt). A crashed worker
+        # still resumes its own session (item 3); a landed dependency is in the work
+        # tree already, so that worker starts fresh too.
         escalated = str(t.tier_reason or "").startswith("rule5")
-        resume = (
-            self._resume_from(prev.id)
-            if prev and (published or escalated or crashed or after_deps)
-            else None
+        fix_round = self._fix_round(t)
+        attempt = int(contract.get("attempt") or 1)
+        forks = (
+            escalated
+            or crashed
+            or (bool(published) and attempt >= self.cfg.routing.escalate_attempt)
         )
+        fresh_fix: dict[str, str] | None = None
+        if published and not forks:
+            spec_art = self.store.get_artifact(job_id, "spec.md")
+            tests_art = self.store.get_artifact(job_id, "tests.json", task_id)
+            plan_art = self.store.get_artifact(job_id, "plan.md")
+            log_art = self.store.get_artifact(job_id, "spec_changelog.md")
+            fresh_fix = {
+                "spec": spec_art.content if spec_art else "",
+                "diff": self.workspace.full_diff(job.repo, base_sha, published),
+                "verifier": tests_art.content if tests_art else "",
+                "plan": plan_art.content if plan_art else "",
+                "changelog": log_art.content if log_art else "",
+            }
+        packet = assemble_worker(
+            clone, contract, untrusted={}, approval_edits=edits, fix_round=fix_round,
+            fresh_fix=fresh_fix,
+        )  # fmt: skip
+        resume = self._resume_from(prev.id) if prev and forks else None
         if after_deps:
             packet.parts["contract"] += (
                 "\n**Your dependency has landed on the base.** Your earlier changes are in "

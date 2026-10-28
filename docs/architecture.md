@@ -284,6 +284,12 @@ stateDiagram-v2
   previously approved spec and the note and returns an amended spec and a
   changelog, the gate runs on it, and the new item shows the diff. The job
   stays `spec_pending`; this is never an approval (B40).
+  **A replan starts the coord fresh** (#78, ADR-0005), with or without a note:
+  its packet holds spec.md (the amended baseline, or the current spec), the
+  note, plan.md, spec_changelog.md, the failure reason and the verifier summary
+  (all but the note and baseline fenced), no context pack, and no transcript is
+  resumed or forked. The attempt is 1 plus the replans so far; the fork stays
+  only at attempt >= `routing.escalate_attempt` (3).
 - **Inside building.** Workers run as a dependency graph (B43): each starts
   once its own dependencies have published, up to three sessions at once
   across the fleet, each in its own container, clone and `vigil/<task>`
@@ -298,7 +304,12 @@ stateDiagram-v2
   on its own PR; all clean is `ready`. A ready PR the reviewer passed can still
   go back: **fix with findings** (`POST /api/inbox/{id}/fix`, the owner from the
   inbox) sends the owner's chosen review and audit findings, and an optional note,
-  to the task's worker as the same fix round. The job goes `ready` to `building`
+  to the task's worker as the same fix round, **started fresh** (#78): a new
+  session whose packet holds spec.md, plan.md, spec_changelog.md, the PR diff,
+  the findings and the verifier summary (all but spec.md fenced), never the
+  worker's transcript; a retry of a published task starts the same way. The
+  fork stays for true escalation: rule 5 or attempt >=
+  `routing.escalate_attempt`; a crashed worker still resumes its own session. The job goes `ready` to `building`
   (an FSM edge only that action may take), the task `reviewed` to `fix`, and the
   round counts in `review_rounds`; the verifier, a re-review and a re-audit follow,
   and `in_review` to `ready` files a new Ready to merge item. Only a `ready` job

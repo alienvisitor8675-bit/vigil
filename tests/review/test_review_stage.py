@@ -167,9 +167,8 @@ def test_an_escalated_attempt_forks_the_failed_attempts_whole_transcript(world: 
     assert w.store.get_job(job).state.value == "ready"
     first, second, escalated = _workers(w, "w1")
     assert first.resume is None
-    # each fix round forks the worker's last session
-    assert second.resume is not None and second.resume.from_session == first.session_id
-    assert second.resume.fork is True
+    # a fix round starts fresh (#78): no fork below the escalation attempt
+    assert second.resume is None
     # the escalated attempt (rule 5) carries the whole failed attempt, history included
     assert w.store.get_task(f"{job}-w1").tier_reason.startswith("rule5")  # type: ignore[union-attr]
     assert escalated.resume is not None and escalated.resume.from_session == second.session_id
@@ -177,7 +176,6 @@ def test_an_escalated_attempt_forks_the_failed_attempts_whole_transcript(world: 
     assert escalated.resume.session_id == sdk == f"sdk-{second.session_id}"
     assert escalated.resume.entries == stored
     uuids = [e["uuid"] for e in escalated.resume.entries]
-    assert uuids == [f"u-{first.session_id}", f"a-{first.session_id}",
-                     f"u-{second.session_id}", f"a-{second.session_id}"]  # fmt: skip
+    assert uuids == [f"u-{second.session_id}", f"a-{second.session_id}"]
     forks = [e for e in w.store.events(job_id=job) if e.type == "fork"]
-    assert [f.data["escalated"] for f in forks] == [False, True]
+    assert [f.data["escalated"] for f in forks] == [True]

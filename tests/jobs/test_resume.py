@@ -149,8 +149,9 @@ def test_a_restart_requeues_the_safe_job_and_blocks_the_unsafe_one(world: World)
     assert {s.resume.from_session for s in resumed if s.resume} == {s.id for s in crashed}
 
 
-def test_a_replan_resumes_the_coord(world: World) -> None:
+def test_a_replan_forks_the_coord_only_at_the_escalation_attempt(world: World) -> None:
     w = world
+    w.runner.cfg.routing.escalate_attempt = 2  # below it a replan starts fresh (#78)
     w.standin.worker_edit = _flaky({"w1"})
     job = _approve(w)
     item = _failure_item(w, job)
