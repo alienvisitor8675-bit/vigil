@@ -8,6 +8,8 @@ it. Coord checks this file before asking the owner, and logs which ruling it
 applied.
 
 ## Merging and PRs
+- **2026-10-28**: Coord marks a PR ready on a clean review, not on green CI; auto-merge waits for CI.
+- **2026-10-28**: Rebase a PR onto main only, never onto a branch still under review; a stack the owner set up is retargeted after its base merges.
 - **2026-10-28**: The main ruleset requires a PR, squash only, the lint, types and test checks, linear history, no force pushes, and no bypass; "require up to date" is off (strict=false, checked through the API at 10:00) and auto-merge is on (#1).
 - **2026-10-28**: Coord marks a PR ready and the owner runs `gh pr merge --squash --auto`; rebase only for a textual conflict (#1).
 - **2026-10-28**: Merge tiers: docs-only or tests-only with green CI, the owner enables auto-merge on sight; code, the owner merges after a read; pinned paths, the owner reads the diff in person (#1).
@@ -17,7 +19,8 @@ applied.
 - **2026-10-24**: The owner merges nothing until the focused review of a gateway, verifier or hidden-test PR is clean; the PR keeps `needs-review` until then (#19).
 
 ## Money and usage
-- **2026-10-28**: The daily cap is $10 for the phase 2 done-when run (#63).
+- **2026-10-28**: Caps: $25 a day (pacing only), $200 a month (the real budget), $2 a task (#88).
+- **2026-10-28** (superseded 2026-10-28 by the line above): The daily cap is $10 for the phase 2 done-when run (#63).
 - **2026-10-28**: Coord asks for `/usage` only before a run longer than 2 hours, before an Opus worker, or when the last reading is more than 3 hours old; dispatch pauses at 60% weekly or 70% session, with a hard stop at 75% weekly (#1).
 - **2026-10-28**: Unattended runs are allowed within the usage lines, after a /compact and with a short brief; the owner can stop them per run (#1).
 - **2026-10-28** (superseded 2026-10-28 by the line above): No unattended runs until a spend guard exists (#1).
@@ -45,6 +48,7 @@ applied.
 - **2026-10-24**: Assertion failures carry an HMAC tag keyed by the host key, which the owner creates (#19).
 
 ## Repos (ParkAgent, visibility)
+- **2026-10-28**: vigil stays public for now (rulesets and auto-merge need Pro on a private repo, Actions minutes, runner isolation); revisit after phase 2 with GitHub Pro and an isolated runner VM.
 - **2026-10-28**: Coord may submit vigild jobs on `thomasbardhi01/vigil`; only the owner approves a spec out of `spec_pending`, and only the owner submits anything for ParkAgent; "never submit" applies only to unattended runs unless the run's brief says otherwise (#1).
 - **2026-10-27**: Sandbox hosts are generic; code never names "the tower" (#43).
 - **2026-10-24**: The private-repo hosted-model rule is waived for vigil only (hard-coded in `vigild/repos.py`) (#19).
@@ -60,6 +64,7 @@ applied.
 - **2026-10-26**: At the round limit the owner may read the final diff in place of a further review (#28).
 
 ## Product decisions (per feature)
+- **2026-10-28**: The lean coord packet ships behind `coord_packet` (default `classic`); the flip to `lean` is its own one-line PR carrying the spec-replay numbers for pa-0003 and vi-0002, merged on sight if both pass (#87).
 - **2026-10-28**: Backup: the marker is a plain copy, doctor checks freshness at 36 hours, and the check is skipped only while the plist is not installed (#57).
 - **2026-10-28**: `~/vigil-backups` is accepted as the interim backup destination until an external drive is attached; #23 closes when the first nightly set passes `vigil restore` (#23).
 - **2026-10-28**: vigild runs under launchd so a reboot does not stop the factory; the plist sets `PATH` from a placeholder, and coord does the switch-over with the owner present (#65).
@@ -67,3 +72,7 @@ applied.
 - **2026-10-27**: Bench smoke results post as one vigild comment per vigil PR, updated in place, and never on ParkAgent or any other repo; the mix is 7 PolyBench TypeScript and 3 SWE-bench Pro tasks (#8).
 - **2026-10-26**: The plan gate refuses a reused worker ID, and a job enters `in_review` only if every planned task has an open PR or is superseded (#25).
 - **2026-10-23**: Job artifacts go to the vault, not the target repo (#30).
+
+## Not adopted (don't re-propose)
+- **2026-10-28** (ADR-0006 I): no multi-agent teams or debate; no memory or recall tools for workers; no LLM-generated instruction files and no longer CLAUDE.md (layer 3 is measured before it grows); no LLM-as-judge selection; no mid-trajectory critics; no RL on weights; no evolved verifiers; no more prompt text. The incident-to-playbook epic stays gated by replay.
+- **2026-10-28** (omp / OMH research): neither project as a library or a layer; no inter-agent messaging bus (`ask_coord` stays the only channel: a single writer, read-only subagents); no fall-through model chains (the private-repo rule, budget predictability); no external memory server (one source of truth); no LLM-as-judge in rewards; omp's approval tiers never substitute for the guard plugin or the egress proxy; snapcompact, stream-abort rules, collab links and search providers are out of scope.
