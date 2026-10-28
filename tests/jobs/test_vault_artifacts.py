@@ -162,7 +162,19 @@ def test_a_branch_sent_before_this_rule_is_refused_and_never_forced(
 def _foreign_commit(bare: Path, base: str) -> str:
     """A commit on the remote branch that is not in the vault (someone else's push)."""
     tree = git(bare, "rev-parse", f"{base}^{{tree}}")
-    sha = git(bare, "commit-tree", tree, "-p", base, "-m", "owner's own fix")
+    sha = git(
+        bare,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit-tree",
+        tree,
+        "-p",
+        base,
+        "-m",
+        "owner's own fix",
+    )
     git(bare, "update-ref", f"refs/heads/{BRANCH}", sha)
     return sha
 
@@ -174,7 +186,9 @@ def test_a_remote_commit_the_vault_lacks_is_never_overwritten(
     first = _session(ws, tmp_path, bare, "# Map\none\n")
     base = ws.base_sha(TID)
     url = _pub(ws, first, base, Pulls())
-    foreign = git(bare, "commit-tree", git(bare, "rev-parse", f"{BRANCH}^{{tree}}"),
+    # an identity of its own: the dev image (and CI) has no global git config
+    foreign = git(bare, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree",
+                  git(bare, "rev-parse", f"{BRANCH}^{{tree}}"),
                   "-p", BRANCH, "-m", "owner's own fix")  # fmt: skip
     git(bare, "update-ref", f"refs/heads/{BRANCH}", foreign)
     second = _session(ws, tmp_path, bare, "# Map\ntwo, longer\n", start=first)

@@ -7,7 +7,9 @@
 # Pins (two-week rule: released on or before 2026-10-08): CPython 3.14.8 (the
 # executor image's base, by digest; pyproject requires exactly 3.14.8);
 # uv 0.12.24 (2026-10-08, by digest); git from Debian trixie as of
-# 2026-10-08 (snapshot). vigil's dependencies come from uv.lock, frozen, and
+# 2026-10-08 (snapshot), and rsync from the same snapshot (vigil backup, #57;
+# tests/test_dev_image_tools.py checks every binary the suite runs is here).
+# vigil's dependencies come from uv.lock, frozen, and
 # its exclude-newer already holds them to the same date.
 
 FROM ghcr.io/astral-sh/uv:0.12.24@sha256:3af4716e991d6956a41e573eab705d0ee08500cd829ed30293eb8472f372c65a AS uv
@@ -19,7 +21,7 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
  && echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${SNAPSHOT} trixie main" \
       > /etc/apt/sources.list.d/snapshot.list \
  && apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git ca-certificates rsync \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=uv /uv /uvx /usr/local/bin/
