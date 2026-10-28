@@ -22,10 +22,10 @@ fm = _load("check-feature-map.py")
 cm = _load("check-claude-md.py")
 
 MAP = """
-| Feature | Phase | What it does | Entry points | Core code | Guardrails | Tests | Status |
-|---|---|---|---|---|---|---|---|
-| A | 1 | x | `GET /api/things/{id}` | `pkg/a.py`, `pkg/{b,c}.py` | — | `tests/test_a.py` | shipped |
-| B | 2 | y | `POST /api/later` | `pkg/missing.py` | — | — | planned (phase 2) |
+| ID | Feature | Phase | What it does | Entry points | Core code | Guardrails | Tests | Status |
+|---|---|---|---|---|---|---|---|---|
+| a | A | 1 | x | `GET /api/things/{id}` | `pkg/a.py`, `pkg/{b,c}.py` | — | `tests/test_a.py` | shipped |
+| b | B | 2 | y | `POST /api/later` | `pkg/missing.py` | — | — | planned (phase 2) |
 """
 
 
@@ -109,7 +109,7 @@ def test_a_planned_page_row_with_no_route_or_code_yet_passes(tmp_path: Path) -> 
     """/watch (round 2): a phase-3 row names a page, a stream topic and code
     that don't exist yet. Planned, that's fine; shipped, the paths must exist."""
     row = (
-        "| Watch page | 3 | x | `/watch`; `GET /api/stream?topics=code,tower` | `vigild/web/`, "
+        "| watch-page | Watch page | 3 | x | `/watch`; `GET /api/stream?topics=code,tower` | `vigild/web/`, "
         "`vigild/api/stream.py` | — | `tests/web/test_watch.py` | {status} |\n"
     )
     root = _tree(tmp_path, ["pkg/a.py", "pkg/b.py", "pkg/c.py", "tests/test_a.py"])

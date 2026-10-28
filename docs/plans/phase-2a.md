@@ -32,7 +32,7 @@ move with them.
   closed file` at exit, because the docker client is never closed. Close it.
 - **Verifier marker readable by the test.** PREPARE runs as root with only
   SETUID/SETGID, and drops to uid 10001 for the prepare hook and the test,
-  so the test can no longer read the marker (architecture.md B33).
+  so the test can no longer read the marker (architecture.md decision `verifier`).
   ParkAgent's hook starts PostgreSQL, so the hook runs as 10001 too.
 - **Runbook: secrets the owner generates** (owner, 2026-10-23).
   - The owner creates self-generated secrets, never an agent:
@@ -92,7 +92,7 @@ move with them.
   - **vigild restart:** reconcile **re-queues** work that's safe to resume
     (image key unchanged, budget left, under the attempt cap). Everything
     else blocks, as in phase 1.
-  - **Deps:** a parent task auto-resumes when its deps job merges (B39).
+  - **Deps:** a parent task auto-resumes when its deps job merges (decision `dependency-changes`).
   - **Re-plan:** the coord resumes with the failure in its packet. Phase 6
     reuses this for fix jobs.
 - **Tests:**
@@ -121,7 +121,7 @@ move with them.
 - **Tests:** one test per breaker that trips it, checks that dispatch for
   its scope pauses and exactly one page opens, and then resets it.
 
-## 5. Deps jobs (B39)
+## 5. Deps jobs (decision `dependency-changes`)
 
 - **Delivers:**
   - **Executor:** deterministic, no model. A lockfile-only update runs in a
@@ -242,7 +242,7 @@ unmetered, before #16.
 | 2.3 | **Evidence footer with "what changed and why".** #14's Stage A footer, written by vigild. It opens with a **template, not a model** (ruling 5): spec intent, files changed with line counts, and the test delta. The per-attempt event sequence goes in the footer's event-log range; until it exists, the range shows `pending`. | `vigild/github/publish.py` |
 | 2.4 | **Merge-risk grade.** #14 Stage A. Advisory; it only ever raises review. | `vigild/review/risk.py` |
 | 2.5 | **Canary tokens.** Fake AWS, `.env` and GitHub credentials in every session container. Reading or exfiltrating one pages the owner and stops the session. The egress proxy and the gateway's body scan both match on them. Test it. | `vigild/executors/canary.py` |
-| 2.6 | **The original 2b scope**, unchanged: the CLI (`run`, `batch`, `ls --live`, `trace`, `kill`); `vigil mcp` (B8) with `vigil_approve` as the only state-changing tool; the session proxy (read, join, the `code` event); the bridge (`vigil_talk`, `vigil_listen`, `vigil-bridge`); doc layers 4, 5 and 7, with the search subagent and the staleness score; ADR-0002; verify level 1 (Hypothesis, Schemathesis). | `cli/vigil/`, `vigild/mcp/`, `vigild/proxy/`, `vigild/bridge/` (one per sub-item) |
+| 2.6 | **The original 2b scope**, unchanged: the CLI (`run`, `batch`, `ls --live`, `trace`, `kill`); `vigil mcp` (decision `mcp-server`) with `vigil_approve` as the only state-changing tool; the session proxy (read, join, the `code` event); the bridge (`vigil_talk`, `vigil_listen`, `vigil-bridge`); doc layers 4, 5 and 7, with the search subagent and the staleness score; ADR-0002; verify level 1 (Hypothesis, Schemathesis). | `cli/vigil/`, `vigild/mcp/`, `vigild/proxy/`, `vigild/bridge/` (one per sub-item) |
 | 2.7 | **Layer 9 with invariant IDs.** `docs/product/` per repo, with invariant IDs plus their owning files and tests. Packets cite them by ID, and the hidden-test author receives the invariants relevant to its task. vigil's own model is seeded; ParkAgent's is seeded by the owner. | `vigild/product.py` |
 | 2.8 | **Per-role output and thinking budgets**, with terse output templates. *Untiered by the owner; placed here.* | `vigild/gateway/service.py` |
 | 2.9 | **Lean retries.** A retry starts from the spec, the plan and the failure categories, not the full history. *Untiered; placed here.* | `vigild/jobs/runner.py` |

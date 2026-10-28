@@ -3,14 +3,14 @@
 - **Status:** Proposed, 2026-10-26
 - **Deciders:** the owner; drafted by a docs worker
 - **Layer:** 4 of the documentation standard (`docs/design.md`).
-- **Supersedes:** nothing. It replaces the claims B40 makes about
+- **Supersedes:** nothing. It replaces the claims decision `hidden-tests-runner-files` makes about
   isolation once its rollout is done (see "Consequences").
 
 This record describes issues as classes. The repo is public.
 
 ## Context
 
-Hidden tests (B40, learning rulings 10, 13, 14) decide a task whose scope
+Hidden tests (decision `hidden-tests-runner-files`, learning rulings 10, 13, 14) decide a task whose scope
 names a runner file. A fresh `hidden_test_author` session writes them; vigild
 keeps them; only the verifier runs them, as their own base/head pair. A pass
 means the owner merges a draft PR with less review than a normal one, so the
@@ -46,7 +46,7 @@ and the isolation between them is made of uids, modes and cleanup.**
 | vigild (host) | Trusted. Holds the host key, the vault and the store. |
 | The verifier, host side | Trusted. Starts containers, reads one trailer, decides. |
 | The broker | vigild code; trusted to enforce its protocol. |
-| The test process | Vigild's helper plus the author's tests. Trusted to run, not to be hostile (B33 says so). |
+| The test process | Vigild's helper plus the author's tests. Trusted to run, not to be hostile (decision `verifier` says so). |
 | The subject | Untrusted. Reaches the tests only through the broker. |
 
 The goal: nothing the subject does changes the verdict, reads the tests or
@@ -54,7 +54,7 @@ reads the tag, whatever the subject's code does.
 
 ## History, by class
 
-Each row is a class and what closed it (details in B33 and B40).
+Each row is a class and what closed it (details in decisions `verifier` and `hidden-tests-runner-files`).
 
 | Where | Class | Fix |
 |---|---|---|
@@ -80,7 +80,7 @@ does not close.
 4. **Fail-closed paths report as ordinary failures.** The guard and
    preparation refusals end a run as a failure of the task. They should be
    an escalation to the owner, because the task did nothing wrong.
-5. **The documentation claimed more than the code delivers.** B40 reads as
+5. **The documentation claimed more than the code delivers.** decision `hidden-tests-runner-files` reads as
    if the isolation were complete.
 
 Items 1 to 3 are one class: **two principals share a kernel object
@@ -169,7 +169,7 @@ tests that ran.
   the reason. A missing hash on a spec approved before this change is the
   same.
 - This folds in the "harden the verifier" item. The clean-container re-run it
-  asked for already exists (B33: fresh vault checkout, new container every
+  asked for already exists (decision `verifier`: fresh vault checkout, new container every
   run), so this adds the pinning and its documentation only. No open issue
   for it was found; this record is its place.
 
@@ -190,13 +190,13 @@ matter if that layer regresses. As classes:
 5. a function constructor called without `new`.
 
 Each gets a failing test and a fix in rollout step (c), after the container
-split, and B40 says the static layer is a second layer and the container
+split, and decision `hidden-tests-runner-files` says the static layer is a second layer and the container
 split is the boundary. (The structural boundary today is the unreadable
 subject copy; after (b) it is the separate container.)
 
 ## Residual risks
 
-Accepted, and stated in B40 once the series is done.
+Accepted, and stated in decision `hidden-tests-runner-files` once the series is done.
 
 - **Kernel and container-runtime escapes.** A subject that escapes its
   container has the host's rights. The mitigations are no capabilities, no
@@ -256,10 +256,10 @@ with a clean review. The owner turns it on.
 
 **(c) The #20 static fixes.**
 - Done when: each of the five classes has a failing test that is now green,
-  and B40 names the static layer as the second layer.
+  and decision `hidden-tests-runner-files` names the static layer as the second layer.
 
 **(d) The docs, and the switch.**
-- Done when: B40 and the feature map describe what the code does, the
+- Done when: decision `hidden-tests-runner-files` and the feature map describe what the code does, the
   runbook says how to turn the switch on, the round-3 documentation finding
   is closed, and the owner turns `hidden_tests.enabled` on for a repo after
   a clean review.
@@ -274,12 +274,12 @@ with a clean review. The owner turns it on.
   "Owner decisions (2026-10-26)").
 - **Complexity.** A protocol to maintain, and a second image path (the
   subject runs in the repo's dev image, never the session image).
-- **What B40 says until it's done.** It says what the code does today and
+- **What decision `hidden-tests-runner-files` says until it's done.** It says what the code does today and
   no more: black-box tests, a uid split, a broker, a guard that checks at
-  each call, and no claim that the isolation is complete. B40 points at this
+  each call, and no claim that the isolation is complete. decision `hidden-tests-runner-files` points at this
   record. The switch stays off, so no task's acceptance depends on the open
   items.
-- **Docs.** `docs/architecture.md` B40 and the feature map change in each
+- **Docs.** `docs/architecture.md` decision `hidden-tests-runner-files` and the feature map change in each
   PR that changes behaviour.
 
 ## Alternatives

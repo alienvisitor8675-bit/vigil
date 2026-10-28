@@ -143,7 +143,7 @@ way: delete the line, add the new one, restart vigild.
 
 Non-secret settings (hosts, ports, image names, the data directory) live in
 `configs/*.yaml`, not here. Langfuse's variables are gone: Phoenix replaced
-it (`docs/architecture.md` B23). Langfuse v4 remains an option for a machine
+it (`docs/architecture.md` decision `trace-store`). Langfuse v4 remains an option for a machine
 with about 16 GiB to spare for the Docker VM.
 
 ### The GitHub App "vigil-worker"
@@ -323,7 +323,7 @@ verification takes about a third longer; each run still has its own
 15-minute cap. A test whose id changes every run (a `test.each` title with
 `crypto.randomUUID()` or a generated key) is matched by file and title
 without its parameters, by count, and `tests.json` lists it under
-`ran.unstable`. A random value the rule does not recognise (see B33) is
+`ran.unstable`. A random value the rule does not recognise (see decision `verifier`) is
 checked by count per file instead, so a deleted test still fails.
 
 `redact` also drops PEM private keys. On start, vigild re-applies it to

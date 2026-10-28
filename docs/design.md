@@ -128,7 +128,7 @@ flowchart LR
   subgraph Eval7["phase 7 Eval (planned)"]
     RP[Weekly replay: Opus + best local → evidence rows]
   end
-  VF[vigild verifier · built, B33]
+  VF[vigild verifier · built, decision `verifier`]
   D -.spec time.-> HT
   HT -.own run.-> VF
   PR -.-> VF
@@ -495,7 +495,7 @@ How Vigil gets better from its own jobs.
 
 **The loops.**
 - **Inner, per job: the attempt protocol is the existing retry.** It runs inside the current rules:
-  - **Retry.** It is the owner-only retry from the inbox (architecture B35).
+  - **Retry.** It is the owner-only retry from the inbox (architecture decision `worker-failure`).
   - **Context.** The retried attempt forks the failed attempt's full context ("Escalation forks full context") and adds the verifier's category-level feedback. Nothing is reset.
   - **Cap and counter.** It shares the task's $2 cap and the contract's `attempt` counter.
   - **Spans.** Each attempt is its own episode span with its own reward, so credit never leaks from a recovery to a failed first attempt.
@@ -546,7 +546,7 @@ How Vigil gets better from its own jobs.
 - **What `reward.json` is for.** It is finalised after the audit and is **never an input to any decision about the job itself**. It feeds only the job's learning record and the ladder.
 - **Audit samples.** Top-reward jobs are a **separate audit sample**. The ladder's statistics come from the random sample only. Reward–audit agreement is tracked per component, and a component below its threshold is frozen out of the reward until it is recalibrated.
 
-**Hidden tests.** *Implemented for runner-file tasks only (owner ruling 2026-10-23, hotfix 4), but disabled by host policy (`hidden_tests.enabled` is off) until ADR-0003's work merges: `docs/architecture.md` B40. The learning epic extends it to every task.*
+**Hidden tests.** *Implemented for runner-file tasks only (owner ruling 2026-10-23, hotfix 4), but disabled by host policy (`hidden_tests.enabled` is off) until ADR-0003's work merges: `docs/architecture.md` decision `hidden-tests-runner-files`. The learning epic extends it to every task.*
 - **Who writes them:** at spec time, a second, fresh-context session writes acceptance tests from the spec and the product model only. The spec author's session is never the worker's session.
 - **They must fail on base.**
 - **Where they live:** vigild stores them. They are **never on the branch**, which makes them the one stage artifact not committed under `.vigil/`, and they run only in the verifier.
@@ -697,7 +697,7 @@ llama-server -m /models/<candidate>.gguf \
 
 Flag notes:
 - `-c 131072 --parallel 2` gives two 64k slots. If KV doesn't fit, quantize KV (`-ctk q8_0 -ctv q8_0`) or drop to one slot.
-- `--metrics` exposes server-wide Prometheus counters, with no per-request labels. Per-session GPU attribution comes from llama-server's per-response `timings` at the gateway (B12) and from the tower exporter.
+- `--metrics` exposes server-wide Prometheus counters, with no per-request labels. Per-session GPU attribution comes from llama-server's per-response `timings` at the gateway (decision `gpu-attribution`) and from the tower exporter.
 - **Bind to the Tailscale address only, never `0.0.0.0`**, and allow only the Mac mini in the Tailscale ACL. The API key lives in the Mac mini's `~/.config/vigil/env` as `LLAMA_API_KEY`.
 
 **Pinning and running.** Pin the llama.cpp release and each GGUF file's sha256 in `models.lock`. Run the server as a systemd unit on the host. The prebuilt CUDA 12.8 and 13.x release binaries include Blackwell (sm\_120).
@@ -713,7 +713,7 @@ ADR-0004's rules also apply there: sandbox containers can't reach the model port
 - Each second it samples GPU utilization, VRAM and watts for each GPU, plus CPU, RAM and the cumulative energy counter.
 - It serves the samples as Prometheus `/metrics` and as JSON.
 
-`vigild` pulls the samples and attributes each second to the sessions with a request in flight. It summarizes per session as joules per token and GPU-seconds per token (`docs/architecture.md` B11, B12).
+`vigild` pulls the samples and attributes each second to the sessions with a request in flight. It summarizes per session as joules per token and GPU-seconds per token (`docs/architecture.md` decisions `tower-exporter`, `gpu-attribution`).
 
 **Model lifecycle.** This is unchanged in principle:
 - One worker model is resident.
@@ -980,7 +980,7 @@ The UI has nine pages "and nothing else" (`docs/ui.md`), and none is called Lear
 Three rules:
 - **Only the owner changes it.** No session does, and no packet carries a way to.
 - **Every change is audited.** vigild writes a `config_loaded` event at each start with the sha256 of every policy file and the diff from the previous load. A policy file whose hash changed with no owner-merged commit behind it stops vigild from starting.
-- **Nothing in a repo overrides it.** A repo or task value for a host key is **refused with an error, not ignored**. The one existing exception is the contract's own limits, which may go below the caps and never above (architecture B14).
+- **Nothing in a repo overrides it.** A repo or task value for a host key is **refused with an error, not ignored**. The one existing exception is the contract's own limits, which may go below the caps and never above (architecture decision `budget-hard-stop`).
 
 **Verify levels and the gate contract as host policy.** The verification ladder (this document, above) has the spec set a level per criterion, with `why_not_higher` at level 0, and the learning loop has the spec carry a `reward_schema`. Host policy is the **allowed range and the floor**: a spec chooses a level inside what the host allows for that shape, and neither a repo nor a spec can lower the floor or edit the gate contract. The per-criterion choice stays in the spec.
 
@@ -1002,7 +1002,7 @@ Three rules:
 
 **`.vigil/` is a locked path for all sessions**, like `gate.json`: a session cannot write it, and vigild refuses a bundle whose diff touches it. **Changes arrive only as proposal PRs** (Stage C), or as the owner's own commit. Before Stage C, the owner edits it by hand.
 
-**`.vigil/` is already in use, and the worker writes there (owner ruling: lock by subpath).** Layer 6 of the documentation tree commits stage artifacts on the job's branch under `.vigil/<job>/` (`spec.md`, `plan.md`, `intake.json`, `review.json`, `audit.json`, `close.md`) and `.vigil/<job>/<task>/worker_report.json` (`vigild/jobs/runner.py` reads them from the vault; architecture B34 has the harness commit new files "under `.vigil/`"). A worker also writes `.vigil/<job>/<task>/ask_coord.json`, and the workspace writes `.vigil/task.json` (git-ignored). So `.vigil/` stays one directory and the lock is by subpath: a session may write only `.vigil/<its job>/<its task>/` and the fixed `.vigil/task.json`. Every other path under `.vigil/` (`vigil.yaml` and the seven directories above) is locked, and vigild checks it on the imported bundle, so the lock does not rest on the harness alone. Those names are **reserved and enforced in the job-id validator**: no job id may equal one.
+**`.vigil/` is already in use, and the worker writes there (owner ruling: lock by subpath).** Layer 6 of the documentation tree commits stage artifacts on the job's branch under `.vigil/<job>/` (`spec.md`, `plan.md`, `intake.json`, `review.json`, `audit.json`, `close.md`) and `.vigil/<job>/<task>/worker_report.json` (`vigild/jobs/runner.py` reads them from the vault; architecture decision `harness-commit` has the harness commit new files "under `.vigil/`"). A worker also writes `.vigil/<job>/<task>/ask_coord.json`, and the workspace writes `.vigil/task.json` (git-ignored). So `.vigil/` stays one directory and the lock is by subpath: a session may write only `.vigil/<its job>/<its task>/` and the fixed `.vigil/task.json`. Every other path under `.vigil/` (`vigil.yaml` and the seven directories above) is locked, and vigild checks it on the imported bundle, so the lock does not rest on the harness alone. Those names are **reserved and enforced in the job-id validator**: no job id may equal one.
 **`.vigil/lessons/` replaces layer 5** (`docs/knowledge/lessons.jsonl`, phase 2) as the one lessons store, before layer 5 is built, so the lock covers it.
 
 **Repo prompts versus vigil's prompts.** Vigil's role prompts are `prompts/<role>.md` in the vigil repo: host-level, versioned, changed only by a PR with an eval run attached. A repo's `.vigil/prompts/` therefore may only add an **appendix**, and only for the roles that do the work.
@@ -1050,7 +1050,7 @@ Part A's amendment numbers (A1, A6, A12, A15) and its seeded-defect set are cite
 This folds in the PR evidence pack (#13). Nothing here is a gate input or a reward input.
 
 **The footer.** Every PR vigild opens gets a footer of references.
-- **Who writes it:** vigild alone, in the one place a PR body is built (`vigild/github/publish.py`, `publish_branch`, which takes `body` and passes it to `create_pull`), by the same mechanism as the PR body that links the spec. It is not a second mechanism. The worker never writes a PR body, holds no GitHub token (architecture B25), and has no contract field that reaches one.
+- **Who writes it:** vigild alone, in the one place a PR body is built (`vigild/github/publish.py`, `publish_branch`, which takes `body` and passes it to `create_pull`), by the same mechanism as the PR body that links the spec. It is not a second mechanism. The worker never writes a PR body, holds no GitHub token (architecture decision `publishing`), and has no contract field that reaches one.
 - **Fields.** Each shows the literal `pending` until its source exists, and `skipped: <reason>` when it never will:
 
   | Field | Source | Until then |
@@ -1110,7 +1110,7 @@ This folds in the PR evidence pack (#13). Nothing here is a gate input or a rewa
 
 A **red CI run on an open PR reopens the same task**, inside its existing `attempt` counter and its $2 cap. Nothing resets.
 
-- **Reading CI.** vigild polls the PR's check runs. The App already holds `checks:read` (architecture B19), but B19's ceiling lists only contents, pull_requests, metadata and issues, and a classic commit status needs `statuses:read`, which the App does not hold. **Planned (owner ruling):** the owner grants `statuses:read` in GitHub, and the code gets a ceiling entry for it; this PR changes neither.
+- **Reading CI.** vigild polls the PR's check runs. The App already holds `checks:read` (architecture decision `github-app`), but decision `github-app`'s ceiling lists only contents, pull_requests, metadata and issues, and a classic commit status needs `statuses:read`, which the App does not hold. **Planned (owner ruling):** the owner grants `statuses:read` in GitHub, and the code gets a ceiling entry for it; this PR changes neither.
 - **The edge.** A task in `pr_open` goes back to building with the failing log attached (fenced, redacted). Today the job FSM has `in_review → building` and no edge out of `ready` for a CI failure after the PR is open. A new job edge (`ready → building` on a red check) and the task-level `pr_open → building` are needed. Every transition writes an `events` row and the FSM stays the only place state changes.
 - **Counters.** The reopen counts as an attempt. If `attempt` is at its limit or the $2 cap would be crossed, the task goes to the owner's inbox instead.
 - **Test weakening.** A fix that **modifies or deletes tests** is flagged as possible test-weakening and **routed to the owner**, with the diff of the test files.

@@ -31,7 +31,7 @@ When a phase adds or bumps a pin, it updates this file in the same PR.
 | fastapi | 0.143.0 | 2026-10-08 | 0.159.1 | vigild API, native SSE | https://pypi.org/project/fastapi/ · https://fastapi.tiangolo.com/release-notes/ |
 | uvicorn | 0.54.0 | 2026-09-25 | same | vigild server | https://pypi.org/project/uvicorn/ |
 | pydantic | 2.14.0 | 2026-10-08 | 2.14.1 | contract models | https://pypi.org/project/pydantic/ |
-| httpx2 | 2.13.1 | 2026-09-23 | 2.16.0 | the one HTTP client (B9) | https://pypi.org/project/httpx2/ · https://github.com/pydantic/httpx2 |
+| httpx2 | 2.13.1 | 2026-09-23 | 2.16.0 | the one HTTP client (decision `http-client`) | https://pypi.org/project/httpx2/ · https://github.com/pydantic/httpx2 |
 | mcp | 2.3.0 | 2026-10-02 | same | `vigil mcp` (`MCPServer`) | https://pypi.org/project/mcp/ · https://github.com/modelcontextprotocol/python-sdk/blob/main/docs/migration.md |
 | typer | 0.27.3 | 2026-10-06 | same | CLI | https://pypi.org/project/typer/ |
 | PyYAML | 6.0.3 | 2025-09-25 | same | configs | https://pypi.org/project/PyYAML/ |

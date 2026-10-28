@@ -3,7 +3,7 @@
 The spec for phase 3. vigild serves the UI on Tailscale only. It is plain
 HTML, CSS and a little vanilla JS, with no build step, no framework and no
 component library. Every number on screen comes from the same REST API the
-CLI and the MCP server use (`docs/architecture.md` B6, B7).
+CLI and the MCP server use (`docs/architecture.md` decisions `web-ui-stack`, `api-auth`).
 
 ## Look: a surveillance console
 
