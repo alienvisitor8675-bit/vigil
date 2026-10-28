@@ -4,9 +4,13 @@
   uv run python -m vigil doctor
   uv run python -m vigil dev-image --repo owner/name [--rebuild]
   uv run python -m vigil hidden show <task>
+  uv run python -m vigil backup [--dest DIR] [--keep-days 14]
+  uv run python -m vigil restore <backup.db> [--no-dry-run --target DIR]
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import typer
 
@@ -40,6 +44,88 @@ def hidden_show(task: str = typer.Argument(..., help="a task id, e.g. pa-0002-w2
     except HiddenError as e:
         typer.echo(str(e))
         raise typer.Exit(1) from e
+
+
+def _data_dir(override: str | None) -> Path:
+    from vigild import config
+
+    if override:
+        return Path(override).expanduser()
+    if env := config.env_override("VIGIL_DATA_DIR"):
+        return Path(env).expanduser()
+    return config.load().vigild.data_path
+
+
+def _vigild_listening() -> bool:
+    import socket
+
+    from vigild import config
+
+    try:
+        bind = config.load().vigild.api
+        with socket.create_connection((bind.host, bind.port), timeout=1):
+            return True
+    except Exception:
+        return False
+
+
+@app.command()
+def backup(
+    dest: str = typer.Option(
+        "", "--dest", envvar="VIGIL_BACKUP_DIR", help="Outside the repo and the data dir."
+    ),
+    keep_days: int = typer.Option(14, "--keep-days", min=1, help="Prune older dated sets."),
+    data_dir: str = typer.Option("", "--data-dir", help="Default: VIGIL_DATA_DIR or the config."),
+) -> None:
+    """Back up the database (SQLite online backup, mode 600) and the vault
+    (rsync) into a dated set; keep N days. Never reads ~/.config/vigil/."""
+    from vigild.backup import BackupError, run_backup
+
+    if not dest:
+        typer.echo("no destination: pass --dest or set VIGIL_BACKUP_DIR")
+        raise typer.Exit(2)
+    try:
+        made = run_backup(_data_dir(data_dir or None), Path(dest), keep_days=keep_days)
+    except BackupError as e:
+        typer.echo(f"backup failed: {e}")
+        raise typer.Exit(1) from e
+    typer.echo(f"backed up {made.db.name} and {made.vault.name}")
+
+
+@app.command()
+def restore(
+    backup_file: str = typer.Argument(..., help="a vigil-<stamp>.db from `vigil backup`"),
+    dry_run: bool = typer.Option(
+        True, "--dry-run/--no-dry-run", help="Default: check the backup, write nothing."
+    ),
+    target: str = typer.Option("", "--target", help="Data dir to restore into (empty dir)."),
+    allow_live: bool = typer.Option(False, "--allow-live", help="Permit the live data dir."),
+    data_dir: str = typer.Option("", "--data-dir", help="The live data dir, for the guard."),
+) -> None:
+    """Verify a backup opens read-only, passes integrity_check and has the
+    expected user_version. With --no-dry-run --target DIR, restore it; refuses
+    while vigild runs, and the live data dir without --allow-live."""
+    from vigild.backup import BackupError
+    from vigild.backup import restore as do_restore
+
+    live = _data_dir(data_dir or None)
+    if not dry_run and not target:
+        typer.echo("a real restore needs --target")
+        raise typer.Exit(2)
+    try:
+        lines = do_restore(
+            Path(backup_file),
+            Path(target) if target else live,
+            live_dir=live,
+            dry_run=dry_run,
+            allow_live=allow_live,
+            running=_vigild_listening,
+        )
+    except BackupError as e:
+        typer.echo(f"restore refused: {e}")
+        raise typer.Exit(1) from e
+    for line in lines:
+        typer.echo(line)
 
 
 @app.command()

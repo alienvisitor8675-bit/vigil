@@ -341,6 +341,22 @@ flowchart TD
 - `dev_images`: validation records (B26). `ui_sessions`: hashed UI
   cookies (B7).
 
+### Backup and restore (issue #23)
+
+`vigil backup` runs nightly from launchd (`deploy/launchd/dev.vigil.backup.plist`,
+a template; the owner installs it). It writes one dated set to a destination
+from host config (`--dest` or `VIGIL_BACKUP_DIR`; never in the repo, the data
+dir or `~/.config/vigil/`): `vigil-<UTC stamp>.db`, a SQLite online backup of
+`vigil.db` made under umask 077 (mode 600 from creation, consistent while
+vigild writes), and `vigil-<stamp>.vault/`, an rsync of `vault/`. It prunes
+sets older than 14 days, touching only names of that pattern. It never reads
+the secrets directory; that is backed up separately, encrypted, by the owner.
+`vigil restore <db>` is a dry run by default: it opens the file read-only,
+runs `PRAGMA integrity_check`, and compares `user_version` with
+`len(MIGRATIONS)`. A real restore (`--no-dry-run --target DIR`) writes only
+into an empty dir, refuses the live data dir without `--allow-live`, and
+refuses that while vigild is listening. Code: `vigild/backup.py`.
+
 Every record table carries `provenance: claude | local | human`, enforced
 by a CHECK constraint. `human` means not model output: you, or vigild's own
 code. Hosted non-Claude output (Jev) has no value of its own and is tagged
