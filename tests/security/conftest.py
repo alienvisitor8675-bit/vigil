@@ -3,10 +3,11 @@ Images: `uv run python scripts/build-images.py`."""
 
 from __future__ import annotations
 
-import contextlib
 import shutil
+import uuid
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -39,6 +40,8 @@ def runtime(cfg: Config) -> DockerRuntime:
     return DockerRuntime(cfg, client)
 
 
+SESSION_LABEL = "dev.vigil.session"
+RUN_LABEL = "vigil.test-run"
 LAYERED = ("parkagent", "vigil")
 
 
@@ -80,6 +83,7 @@ def make_spec(
     ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
     n = [0]
     made: list[str] = []
+    run_id = uuid.uuid4().hex
 
     def make(role: Role = Role.WORKER) -> SessionSpec:
         n[0] += 1
@@ -121,20 +125,49 @@ def make_spec(
     finally:
         # a session id repeats from run to run, so a network a test left behind makes the
         # next run's create fail with 409: remove each one this test made, containers too
-        _remove_session_networks(made)
+        _teardown_run(_docker(), session_ids=made, run_id=run_id)
         shutil.rmtree(tmp_path / "data", ignore_errors=True)
 
 
-def _remove_session_networks(session_ids: list[str]) -> None:
-    client = _docker()
-    for sid in session_ids:
-        # `names` filters by substring: keep only the exact name
-        for net in client.networks.list(names=[f"vigil-{sid}"]):  # type: ignore[attr-defined]
-            if net.name != f"vigil-{sid}":
-                continue
+def _not_found(e: Exception) -> bool:
+    # docker.errors.NotFound, matched by name so this helper needs no docker import
+    return type(e).__name__ == "NotFound"
+
+
+def _quietly(fn: Callable[[], object]) -> None:
+    try:
+        fn()
+    except Exception as e:
+        if not _not_found(e):
+            raise
+
+
+def _by_label(listing: Any, labels: list[str]) -> list[Any]:
+    """Objects carrying any of `labels` ("key=value"), each once, selected by label only."""
+    seen: dict[str, Any] = {}
+    for label in labels:
+        for obj in listing.list(filters={"label": label}):
+            seen.setdefault(obj.id, obj)
+    return list(seen.values())
+
+
+def _teardown_run(client: Any, *, session_ids: list[str], run_id: str) -> None:
+    """Remove only what this test run made: containers and networks labelled
+    `dev.vigil.session=<sid>` for its sids or `vigil.test-run=<run id>`. Never by name.
+    A container on one of those networks that is not this run's is disconnected, not
+    removed. Not-found is ignored, so a second call is a no-op."""
+    labels = [f"{SESSION_LABEL}={sid}" for sid in session_ids] + [f"{RUN_LABEL}={run_id}"]
+    mine = {c.id for c in _by_label(client.containers, labels)}
+    for c in _by_label(client.containers, labels):
+        _quietly(lambda c=c: c.remove(force=True))
+    for net in _by_label(client.networks, labels):
+        try:
             net.reload()
-            for c in net.containers:
-                with contextlib.suppress(Exception):  # already gone
-                    c.remove(force=True)
-            with contextlib.suppress(Exception):
-                net.remove()
+        except Exception as e:
+            if _not_found(e):
+                continue
+            raise
+        for c in list(net.containers):
+            if c.id not in mine:
+                _quietly(lambda net=net, c=c: net.disconnect(c, force=True))
+        _quietly(net.remove)
