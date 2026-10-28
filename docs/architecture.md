@@ -18,7 +18,7 @@ inference. The tower serves models and nothing else.
 
 | Component | Runs where | How | Job |
 |---|---|---|---|
-| `vigild` | Mac mini | native Python 3.14 process (`uv run python -m vigild`; launchd in phase 2) | jobs and the inbox, routing, budgets, the model gateway, container lifecycle, metering, publishing, REST API, web UI |
+| `vigild` | Mac mini | native Python 3.14 process (`uv run python -m vigild`), kept alive by a launchd agent (`deploy/launchd/dev.vigil.vigild.plist`) | jobs and the inbox, routing, budgets, the model gateway, container lifecycle, metering, publishing, REST API, web UI |
 | `vigil` CLI + MCP server | Mac mini (or any tailnet machine) | `uv run python cli/vigil …`; `vigil mcp` is phase 2 | thin clients of the REST API; `doctor` and `dev-image` in phase 1 |
 | Claude executor | Mac mini, one container per session | Docker Desktop, linux/arm64 image | Claude Agent SDK, headless; coord, worker, reviewer and auditor sessions |
 | OpenCode executor (phase 4) | Mac mini, one container per session | Docker Desktop, linux/arm64 image | `opencode serve` (v2) driven over HTTP |
@@ -109,7 +109,7 @@ edits this table (or, from phase 2 on, an ADR).
 
 | # | Choice | Picked | Why |
 |---|---|---|---|
-| B1 | How `vigild` runs | Native on the Mac, not in a container (launchd from phase 2) | It creates clones on host paths and bind-mounts them, and it drives the Docker socket. A containerized vigild would need the socket (root-equivalent) plus host/container path translation for every mount, and would buy no isolation. |
+| B1 | How `vigild` runs | Native on the Mac, not in a container; a launchd agent starts it at login and restarts it when it exits | It creates clones on host paths and bind-mounts them, and it drives the Docker socket. A containerized vigild would need the socket (root-equivalent) plus host/container path translation for every mount, and would buy no isolation. |
 | B2 | vigild's database | SQLite in WAL mode through the stdlib `sqlite3` module | One writer and one machine. No server, and no ORM dependency. |
 | B3 | Workspace per task | A **per-task clone** from a local mirror, `git clone --no-hardlinks` (copied objects, so a worker can't write through a shared inode into the mirror), with **no remote**; vigild records the base commit it cloned at outside the clone. Mirrors are fetched with a read-scoped App token, one fetch at a time per repo, ignoring host git config and credentials | A worktree's `.git` points outside the mount, so git fails in the container. A clone is self-contained. Review round 1 (blocker 2, item 22) removed the shared inodes, the forgeable `origin/<base>` and the ambient credentials. |
 | B4 | Egress enforcement | Each session gets its own `internal: true` Docker network. A **smokescreen** sidecar sits on that network and the default bridge, and the worker has `HTTP_PROXY`/`HTTPS_PROXY` set to it | Host nftables doesn't exist on Docker Desktop for Mac. An internal network has no default route, so the proxy is the only way out. smokescreen blocks private ranges by default; the one private address it opens is the gateway's (`allow_addresses: 192.168.65.254:8788`). Sessions aren't told apart by TLS, so `allow_missing_role: true` puts every request on the ACL's default policy. **DNS is not the boundary;** the tests assert a connection fails. |

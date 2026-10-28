@@ -559,11 +559,63 @@ to a scratch dir, e.g. `VIGIL_DATA_DIR=$(mktemp -d) uv run python cli/vigil doct
 It overrides `data_dir` in `configs/vigild.yaml`. Opening the live DB from
 another branch's code can migrate it past steps main has never run.
 
+### Run vigild under launchd
+
+Production vigild runs as a launchd agent, so a reboot or a crash doesn't
+stop the factory: `RunAtLoad` starts it at login and `KeepAlive` restarts it
+whenever it exits (at most every 30 s, so a refused start doesn't hammer
+GitHub). It logs to `~/vigil-data/logs/vigild.log`. The template is
+`deploy/launchd/dev.vigil.vigild.plist`; it doesn't install itself.
+
+**Before you install it:**
+- **Docker Desktop starts at login:** Docker Desktop → Settings → General →
+  "Start Docker Desktop when you sign in to your computer". Until Docker is
+  up, vigild's container work fails; launchd's restarts cover the gap.
+- **The Mac logs in after a reboot.** A launchd agent runs only in a logged-in
+  session. Either turn on automatic login (System Settings → Users & Groups;
+  not offered while FileVault is on), or log in by hand after each reboot.
+- **The trace stack** (Phoenix and the collector) comes back with Docker:
+  compose sets `restart: unless-stopped`.
+
+**Install** (the owner does this; a build session does not):
+
+1. Stop any vigild you started by hand (only one may hold the API's 8787 and
+   the gateway's 8788).
+2. `mkdir -p ~/vigil-data/logs`
+3. Copy `deploy/launchd/dev.vigil.vigild.plist` to
+   `~/Library/LaunchAgents/dev.vigil.vigild.plist`, and replace
+   `__REPO_CHECKOUT__` (the main checkout), `__UV_PATH__` (`command -v uv`),
+   `__HOME__` (your home directory, absolute; launchd doesn't expand `~`) and
+   `__PATH__`: the `PATH` of the shell that runs vigild successfully today
+   (`echo $PATH` there). launchd's own `PATH` is only
+   `/usr/bin:/bin:/usr/sbin:/sbin`. Check that the value holds
+   `~/.docker/bin` (written out absolute) and uv's directory. No
+   `DOCKER_HOST` is needed: the Docker SDK follows the CLI's current context
+   (`desktop-linux`, `~/.docker/run/docker.sock`); Docker Desktop has no
+   `/var/run/docker.sock` unless that option is on.
+4. `plutil -lint ~/Library/LaunchAgents/dev.vigil.vigild.plist`
+5. `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.vigil.vigild.plist`
+6. Check: `launchctl print gui/$(id -u)/dev.vigil.vigild | grep -E "state|pid"`,
+   `tail ~/vigil-data/logs/vigild.log`, and
+   `curl -s -o /dev/null -w "%{http_code}\n" 127.0.0.1:8787/api/health`
+   (401 without a token means it's up).
+
+**Day to day:**
+- Restart (after pulling main, or a config or secret change):
+  `launchctl kickstart -k gui/$(id -u)/dev.vigil.vigild`.
+- Stop until the next login: `launchctl bootout gui/$(id -u)/dev.vigil.vigild`.
+  `launchctl kill` alone isn't enough: `KeepAlive` starts it again.
+- The log isn't rotated; truncate it with `: > ~/vigil-data/logs/vigild.log`
+  when it grows.
+
 ### Start vigild
 
 ```sh
 uv run python -m vigild
 ```
+
+Run by hand only when the launchd agent isn't installed or is booted out
+(see above).
 
 - **At start** vigild:
   - reads each repo's visibility live through the App (there is no YAML
