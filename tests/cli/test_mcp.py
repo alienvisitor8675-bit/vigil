@@ -66,10 +66,11 @@ def test_the_default_url_is_the_loopback_api(cfg: Config) -> None:
     assert f"http://{cfg.vigild.api.host}:{cfg.vigild.api.port}" == DEFAULT_URL
 
 
-async def test_the_tool_set_is_exactly_the_five() -> None:
+async def test_the_tool_set_is_exactly_the_eight() -> None:
     async with Client(_server(Seen())) as c:
         names = {t.name for t in (await c.list_tools()).tools}
-    assert names == {"submit_job", "job_status", "list_inbox", "inbox_act", "kill"}
+    assert names == {"submit_job", "job_status", "list_inbox", "inbox_act", "kill",
+                     "submit_batch", "batch_status", "approve_all"}  # fmt: skip
     assert names == set(TOOLS)
 
 
@@ -89,6 +90,9 @@ async def test_submit_job_posts_the_job_fields() -> None:
         ("job_status", {"job_id": "pa-0001"}, "GET", "/api/jobs/pa-0001"),
         ("list_inbox", {}, "GET", "/api/inbox"),
         ("kill", {"job_id": "pa-0001"}, "POST", "/api/jobs/pa-0001/kill"),
+        ("submit_batch", {"name": "n", "jobs": [REQ]}, "POST", "/api/batch"),
+        ("batch_status", {"batch_id": "b-0001"}, "GET", "/api/batch/b-0001"),
+        ("approve_all", {"batch_id": "b-0001"}, "POST", "/api/batch/b-0001/approve-all"),
         ("inbox_act", {"item_id": 4, "action": "approve"}, "POST", "/api/inbox/4/approve"),
         ("inbox_act", {"item_id": 4, "action": "retry"}, "POST", "/api/inbox/4/retry"),
         ("inbox_act", {"item_id": 4, "action": "abandon"}, "POST", "/api/inbox/4/abandon"),
@@ -131,6 +135,30 @@ async def test_a_traversal_job_id_is_refused_before_any_call(tool: str, bad: str
     seen = Seen()
     r = await _call(seen, tool, {"job_id": bad})
     assert r.is_error and seen.requests == []
+
+
+BAD_BATCH = ["../x", "b-1/kill", "b-1?x=1", "b 1", "", "pa-0001", "b-", "b-1\n", "%2e%2e"]
+
+
+@pytest.mark.parametrize("bad", BAD_BATCH)
+@pytest.mark.parametrize("tool", ["batch_status", "approve_all"])
+async def test_a_bad_batch_id_is_refused_before_any_call(tool: str, bad: str) -> None:
+    seen = Seen()
+    r = await _call(seen, tool, {"batch_id": bad})
+    assert r.is_error and seen.requests == []
+
+
+async def test_submit_batch_posts_name_and_jobs() -> None:
+    seen = Seen(202, {"batch_id": "b-0001"})
+    await _call(seen, "submit_batch", {"name": "n", "jobs": [REQ]})
+    assert json.loads(seen.requests[0].content) == {"name": "n", "jobs": [REQ]}
+
+
+async def test_batch_tools_never_show_the_token() -> None:
+    for tool, args in (("batch_status", {"batch_id": "b-1"}), ("approve_all", {"batch_id": "b-1"}),
+                       ("submit_batch", {"name": "n", "jobs": [REQ]})):  # fmt: skip
+        r = await _call(Seen(500, {"detail": f"Bearer {TOKEN}"}), tool, args)
+        assert r.is_error and TOKEN not in r.content[0].text
 
 
 async def test_abandon_with_a_bad_job_id_and_a_bad_item_id_are_refused() -> None:
@@ -235,3 +263,31 @@ async def test_a_job_submitted_over_stdio_lands_in_the_inbox(
     calls = [e.data for e in store.events(job_id=job_id) if e.type == "mcp_call"]
     assert {c["route"] for c in calls} == {"/api/jobs", "/api/jobs/{job_id}"}
     assert all(c["channel"] == "mcp" for c in calls)
+
+
+async def test_a_batch_over_stdio_is_submitted_seen_and_approved(
+    vigild: str, tokens: Tokens, store: Store, tmp_path: Path
+) -> None:
+    env = {"PATH": os.environ["PATH"], "VIGIL_API_URL": vigild, "VIGIL_API_TOKEN": tokens.admin,
+           "HOME": str(tmp_path)}  # fmt: skip
+    params = StdioServerParameters(
+        command=sys.executable, args=[str(ROOT / "cli" / "vigil"), "mcp"], env=env
+    )
+    async with Client(params) as c:
+        out = await c.call_tool(
+            "submit_batch", {"name": "pair", "jobs": [REQ, {**REQ, "title": "T2"}]}
+        )
+        assert not out.is_error, out
+        batch_id = out.structured_content["batch_id"]  # type: ignore[index]
+        ids = out.structured_content["jobs"]  # type: ignore[index]
+        assert len(ids) == 2
+        st = await c.call_tool("batch_status", {"batch_id": batch_id})
+        assert not st.is_error, st
+        assert tokens.admin not in json.dumps(st.model_dump(mode="json"))
+        inbox = httpx2.get(f"{vigild}/api/inbox", headers=auth(tokens.read)).json()
+        assert sorted(i["job_id"] for i in inbox["specs"]) == sorted(ids)
+        ap = await c.call_tool("approve_all", {"batch_id": batch_id})
+        assert not ap.is_error, ap
+        assert tokens.admin not in json.dumps(ap.model_dump(mode="json"))
+    routes = {e.data["route"] for e in store.events() if e.type == "mcp_call"}
+    assert {"/api/batch", "/api/batch/{batch_id}", "/api/batch/{batch_id}/approve-all"} <= routes

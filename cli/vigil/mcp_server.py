@@ -22,9 +22,12 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 DEFAULT_URL = "http://127.0.0.1:8787"
 CHANNEL = ("X-Vigil-Channel", "mcp")
-TOOLS = ("submit_job", "job_status", "list_inbox", "inbox_act", "kill")
+TOOLS = ("submit_job", "job_status", "list_inbox", "inbox_act", "kill",
+         "submit_batch", "batch_status", "approve_all")  # fmt: skip
 # vigild's job ids: a short repo prefix, a dash, a counter (`pa-0007`)
 JOB_ID = re.compile(r"^[a-z0-9]{1,8}-[0-9]{1,9}$")
+# a batch id (`b-0001`), as `vigil batch status` checks it
+BATCH_ID = re.compile(r"^b-[0-9]+$")
 Action = Literal["approve", "replan", "retry", "abandon", "reset"]
 
 
@@ -54,6 +57,11 @@ def build_server(client: httpx2.Client, token: str | None = None) -> MCPServer:
         if not JOB_ID.fullmatch(job_id):
             raise ToolError("job_id is not a job id (like pa-0007)")
         return quote(job_id, safe="")
+
+    def batch_path(batch_id: str) -> str:
+        if not BATCH_ID.fullmatch(batch_id):
+            raise ToolError("batch_id is not a batch id (like b-0001)")
+        return quote(batch_id, safe="")
 
     def item_path(item_id: int) -> str:
         if isinstance(item_id, bool) or not isinstance(item_id, int) or item_id < 1:
@@ -126,6 +134,22 @@ def build_server(client: httpx2.Client, token: str | None = None) -> MCPServer:
     def kill(job_id: str) -> dict[str, Any]:
         """Stop a job cleanly and abandon it (POST /api/jobs/{id}/kill). Open PRs stay."""
         return clean(call("POST", f"/api/jobs/{job_path(job_id)}/kill", {"channel": "mcp"}))  # type: ignore[no-any-return]
+
+    @mcp.tool()
+    def submit_batch(name: str, jobs: list[dict[str, Any]]) -> dict[str, Any]:
+        """Submit 1 to 10 jobs as one batch (POST /api/batch). Each job has the fields
+        submit_job takes. All are made or none. Returns the batch id and job ids."""
+        return clean(call("POST", "/api/batch", {"name": name, "jobs": jobs}))  # type: ignore[no-any-return]
+
+    @mcp.tool()
+    def batch_status(batch_id: str) -> dict[str, Any]:
+        """Per-job state and cost of a batch, and its total (GET /api/batch/{id})."""
+        return clean(call("GET", f"/api/batch/{batch_path(batch_id)}"))  # type: ignore[no-any-return]
+
+    @mcp.tool()
+    def approve_all(batch_id: str) -> dict[str, Any]:
+        """Approve every open spec of a batch (POST /api/batch/{id}/approve-all)."""
+        return clean(call("POST", f"/api/batch/{batch_path(batch_id)}/approve-all"))  # type: ignore[no-any-return]
 
     return mcp
 

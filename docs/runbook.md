@@ -622,7 +622,8 @@ claude mcp list                      # vigil should show as connected
 
 Start Claude Code from a shell where `VIGIL_API_TOKEN` is exported; the server inherits it.
 In the session, `/mcp` lists the server's tools: `submit_job`, `job_status`, `list_inbox`,
-`inbox_act` (approve, replan with a note, retry, abandon, reset) and `kill`. A job submitted
+`inbox_act` (approve, replan with a note, retry, abandon, reset), `kill`, and the batch tools
+`submit_batch`, `batch_status` and `approve_all` (batch ids look like `b-0001`). A job submitted
 there appears in the inbox as a spec; each call is an `mcp_call` event with `channel: mcp`
 on the job, and a kill's transition carries the channel too.
 
