@@ -9,19 +9,21 @@ without Docker; `DockerRuntime` runs them (tests/security/ runs it for real).
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import re
 import secrets
 import shlex
 import shutil
 import socket
+import tarfile
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from vigild.config import Config
+from vigild.config import Config, SandboxHost
 from vigild.executors.base import EventSink, ExecOutcome, SessionSpec
 from vigild.executors.egress import acl_yaml, allowlist, proxy_config_yaml
 from vigild.verifier import MAX_REPORT, REPORT_DIR, RunResult
@@ -33,8 +35,13 @@ HOOK_DIR = "/run/vigil"  # root-owned tmpfs: the Stop hook's inputs (2a round 2,
 HARNESS_CAPS = ("SETUID", "SETGID", "KILL")
 
 
-def _hardening(cfg: Config) -> dict[str, Any]:
+def _hardening(cfg: Config, host: SandboxHost | None = None) -> dict[str, Any]:
+    extra: dict[str, Any] = {}
+    if host is not None and host.remote:
+        # every vigild container on a remote host runs inside its slice (ADR-0004 rule 5)
+        extra["cgroup_parent"] = host.cgroup_slice
     return {
+        **extra,
         "read_only": True,
         "cap_drop": ["ALL"],
         "security_opt": ["no-new-privileges"],
@@ -48,7 +55,9 @@ def _mount(source: str, target: str, read_only: bool) -> dict[str, Any]:
     return {"Target": target, "Source": source, "Type": "bind", "ReadOnly": read_only}
 
 
-def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, Any]:
+def worker_kwargs(
+    cfg: Config, spec: SessionSpec, *, network: str, host: SandboxHost | None = None
+) -> dict[str, Any]:
     uid = cfg.vigild.container.uid
     col = cfg.egress.collector
     proxy = f"http://{cfg.egress.proxy.alias}:{cfg.egress.proxy.port}"
@@ -64,7 +73,11 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
     env = {
         "VIGIL_ROLE": spec.role.value,
         "VIGIL_MODEL": spec.model,
-        "VIGIL_GATEWAY_URL": f"http://{cfg.egress.gateway.host}:{cfg.egress.gateway.port}",
+        "VIGIL_GATEWAY_URL": (
+            host.gateway_url
+            if host is not None and host.remote
+            else f"http://{cfg.egress.gateway.host}:{cfg.egress.gateway.port}"
+        ),
         "VIGIL_MAX_TURNS": str(spec.max_turns),
         "VIGIL_MAX_BUDGET_USD": str(spec.max_budget_usd),
         "VIGIL_REQUIRE_PLUGIN": "guard",
@@ -121,7 +134,7 @@ def worker_kwargs(cfg: Config, spec: SessionSpec, *, network: str) -> dict[str, 
         "stdin_open": True,
         "labels": {LABEL: spec.session_id, "dev.vigil.role": spec.role.value},
         "working_dir": "/work",
-        **_hardening(cfg),
+        **_hardening(cfg, host),
         "cap_add": list(HARNESS_CAPS),
     }
 
@@ -134,7 +147,7 @@ def as_agent(cfg: Config, command: str) -> str:
     return f"{drop} -- sh -c {shlex.quote(command)}; exit $?"
 
 
-def proxy_kwargs(cfg: Config, spec: SessionSpec) -> dict[str, Any]:
+def proxy_kwargs(cfg: Config, spec: SessionSpec, host: SandboxHost | None = None) -> dict[str, Any]:
     return {
         "image": cfg.vigild.images.egress_proxy,
         "name": f"vigil-{spec.session_id}-egress",
@@ -142,7 +155,7 @@ def proxy_kwargs(cfg: Config, spec: SessionSpec) -> dict[str, Any]:
         "mounts": [_mount(str(spec.session_dir / "proxy"), "/etc/smokescreen", read_only=True)],
         "network": "bridge",
         "labels": {LABEL: spec.session_id, "dev.vigil.role": "egress"},
-        **_hardening(cfg),
+        **_hardening(cfg, host),
         "mem_limit": "128m",
         "pids_limit": 64,
     }
@@ -267,6 +280,7 @@ def verifier_kwargs(
     env: Mapping[str, str] | None = None,
     subject: Path | None = None,
     kit: Path | None = None,
+    host: SandboxHost | None = None,
 ) -> dict[str, Any]:
     """The verifier's container (owner direction, round 2): the repo's dev
     image, vigild's checkout read-only at /src, no network at all, the script
@@ -330,7 +344,7 @@ def verifier_kwargs(
         },
         "stdin_open": True,  # the report marker, then closed
         "labels": {LABEL: f"verify-{source.parent.name}", "dev.vigil.role": "verifier"},
-        **_hardening(cfg),
+        **_hardening(cfg, host),
         "cap_add": list(SUBJECT_CAPS if subject else VERIFIER_CAPS),
         "mem_limit": cfg.vigild.container.verifier_memory,
         "pids_limit": max(cfg.vigild.container.pids_limit, 2048),
@@ -350,7 +364,9 @@ def write_kit(dest: Path) -> Path:
     return dest
 
 
-def deps_kwargs(cfg: Config, image: str, work: Path, *, network: str) -> dict[str, Any]:
+def deps_kwargs(
+    cfg: Config, image: str, work: Path, *, network: str, host: SandboxHost | None = None
+) -> dict[str, Any]:
     """A deps job's build container (B39): the repo's dev image, its
     manifests and lockfiles at /work (nothing else of the repo, no .git), the
     agent uid with no capabilities, its own internal network whose proxy
@@ -379,7 +395,7 @@ def deps_kwargs(cfg: Config, image: str, work: Path, *, network: str) -> dict[st
         "tmpfs": {"/tmp": f"rw,exec,size=2g,uid={uid},gid={uid},mode=1777"},  # noqa: S108
         "working_dir": "/work",
         "labels": {LABEL: f"deps-{work.name}", "dev.vigil.role": "deps"},
-        **_hardening(cfg),
+        **_hardening(cfg, host),
     }
 
 
@@ -388,9 +404,10 @@ class DockerTestRunner:
     stream itself: at most `max_output` bytes are kept, and the container is
     killed at `timeout_s`. The verdict is the exit code docker reports."""
 
-    def __init__(self, cfg: Config, client: Any) -> None:
+    def __init__(self, cfg: Config, client: Any, host: SandboxHost | None = None) -> None:
         self.cfg = cfg
         self.client = client
+        self.host = host or cfg.sandbox_hosts.local
         # one runner per vigild, shared by the verifier and dev-image validation
         self._slots = threading.BoundedSemaphore(cfg.vigild.container.verifier_concurrency)
 
@@ -431,7 +448,9 @@ class DockerTestRunner:
 
         marker = f"VIGIL-REPORT-{secrets.token_hex(16)}"
         kit = write_kit(source.parent / "kit") if subject else None
-        kw = verifier_kwargs(self.cfg, image, source, command, env, subject, kit)
+        kw = verifier_kwargs(self.cfg, image, source, command, env, subject, kit, self.host)
+        require_local_files(self.host, kw["mounts"])
+        require_image(self.client, image)
         kw["mounts"] = _docker_mounts(kw["mounts"])
         c = self.client.containers.create(**kw)
         timed_out = threading.Event()
@@ -472,7 +491,14 @@ class DockerTestRunner:
         return RunResult(code, text, truncated=seen > max_output, reports=reports)
 
 
-def write_session_files(cfg: Config, spec: SessionSpec) -> None:
+def proxy_files(cfg: Config, spec: SessionSpec, host: SandboxHost | None) -> dict[str, str]:
+    return {
+        "acl.yaml": acl_yaml(allowlist(cfg, spec.role, host)),
+        "config.yaml": proxy_config_yaml(cfg, host),
+    }
+
+
+def write_session_files(cfg: Config, spec: SessionSpec, host: SandboxHost | None = None) -> None:
     sd = spec.session_dir
     (sd / "proxy").mkdir(parents=True, exist_ok=True)
     if (sd / "out").exists():
@@ -486,12 +512,23 @@ def write_session_files(cfg: Config, spec: SessionSpec) -> None:
     if spec.resume is not None:
         (sd / "resume.jsonl").write_text("".join(json.dumps(e) + "\n" for e in spec.resume.entries))
         (sd / "resume.jsonl").chmod(0o644)
-    (sd / "proxy" / "acl.yaml").write_text(acl_yaml(allowlist(cfg, spec.role)))
-    (sd / "proxy" / "config.yaml").write_text(proxy_config_yaml(cfg))
+    (sd / "proxy" / "acl.yaml").write_text(acl_yaml(allowlist(cfg, spec.role, host)))
+    (sd / "proxy" / "config.yaml").write_text(proxy_config_yaml(cfg, host))
     for p in (sd, sd / "proxy"):
         p.chmod(0o755)
     for f in (sd / "packet.md", sd / "proxy" / "acl.yaml", sd / "proxy" / "config.yaml"):
         f.chmod(0o644)
+
+
+def tar_files(files: dict[str, str]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, text in files.items():
+            data = text.encode()
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(data), 0o644
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
 
 
 def _close_attach(sock: Any) -> None:
@@ -528,28 +565,71 @@ def _docker_mounts(raw: list[dict[str, Any]]) -> list[Any]:
     ]
 
 
+def require_image(client: Any, image: str) -> None:
+    """A session or grader never builds or pulls: a missing image refuses the
+    run and names the build to run first (ADR-0004 §5)."""
+    import docker.errors
+
+    from vigild.executors.hosts import HostRefused
+
+    try:
+        client.images.get(image)
+    except docker.errors.ImageNotFound as e:
+        raise HostRefused(f"build {image} first") from e
+
+
+def require_local_files(host: SandboxHost, mounts: list[dict[str, Any]]) -> None:
+    """A remote host has none of vigild's files. Files reach it only through
+    `docker cp` or a tar stream over the Docker API (ADR-0004), which is not
+    built yet, so a spec that needs a bind mount is refused there."""
+    if host.remote and mounts:
+        from vigild.executors.hosts import HostRefused
+
+        raise HostRefused(
+            f"{host.name}: files reach a remote host over the Docker API, which is not built yet"
+        )
+
+
 class DockerRuntime:
-    def __init__(self, cfg: Config, client: Any = None) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        client: Any = None,
+        host: SandboxHost | None = None,
+        prune_ok: Callable[[str], bool] | None = None,
+    ) -> None:
         import docker
 
+        self.prune_ok = prune_ok or (lambda session: False)  # unknown: prune nothing
         self.cfg = cfg
         self.client = client or docker.from_env()
+        self.host = host or cfg.sandbox_hosts.local
 
     @contextmanager
     def _network(self, spec: SessionSpec, on_event: EventSink) -> Iterator[str]:
         """The session's internal network, its egress sidecar and the collector."""
         import docker.errors
 
-        write_session_files(self.cfg, spec)
+        write_session_files(self.cfg, spec, self.host)
         net_name = f"vigil-{spec.session_id}"
         net = self.client.networks.create(
             net_name, driver="bridge", internal=True, labels={LABEL: spec.session_id}
         )
         proxy = collector = None
         try:
-            pk = proxy_kwargs(self.cfg, spec)
-            pk["mounts"] = _docker_mounts(pk["mounts"])
-            proxy = self.client.containers.run(detach=True, **pk)
+            require_image(self.client, self.cfg.vigild.images.egress_proxy)
+            pk = proxy_kwargs(self.cfg, spec, self.host)
+            if self.host.remote:
+                # the remote host has none of vigild's files: the ACL goes in over the API
+                pk.pop("mounts")
+                proxy = self.client.containers.create(**pk)
+                proxy.put_archive(
+                    "/etc/smokescreen", tar_files(proxy_files(self.cfg, spec, self.host))
+                )
+                proxy.start()
+            else:
+                pk["mounts"] = _docker_mounts(pk["mounts"])
+                proxy = self.client.containers.run(detach=True, **pk)
             net.connect(proxy, aliases=[self.cfg.egress.proxy.alias])
             try:
                 collector = self.client.containers.get(self.cfg.vigild.collector.container)
@@ -571,8 +651,10 @@ class DockerRuntime:
     def run(self, spec: SessionSpec, gateway_token: str, on_event: EventSink) -> ExecOutcome:
         import docker.errors
 
+        self._prepare(spec)
         with self._network(spec, on_event) as net_name:
-            wk = worker_kwargs(self.cfg, spec, network=net_name)
+            wk = worker_kwargs(self.cfg, spec, network=net_name, host=self.host)
+            require_local_files(self.host, wk["mounts"])
             wk["mounts"] = _docker_mounts(wk["mounts"])
             worker = self.client.containers.create(**wk)
             try:
@@ -588,14 +670,25 @@ class DockerRuntime:
                 with suppress(docker.errors.APIError):
                     worker.remove(force=True)
 
+    def _prepare(self, spec: SessionSpec) -> None:
+        if self.host.remote:  # the disk budget (ADR-0004 rule 6): vigil's own labels only
+            from vigild.executors.disk import enforce_budget
+
+            enforce_budget(
+                self.client, int(self.host.disk_budget_gb * (1 << 30)), may_prune=self.prune_ok
+            )
+        require_image(self.client, spec.image or self.cfg.vigild.images.claude_executor)
+
     def probe(self, spec: SessionSpec, command: str, timeout: int = 120) -> tuple[int, str]:
         """Run `command` as the agent uid in the session's exact container,
         network and proxy, under a root PID 1 standing in for the harness. The
         security tests and `vigil doctor` use it."""
         import docker.errors
 
+        self._prepare(spec)
         with self._network(spec, lambda e: None) as net_name:
-            wk = worker_kwargs(self.cfg, spec, network=net_name)
+            wk = worker_kwargs(self.cfg, spec, network=net_name, host=self.host)
+            require_local_files(self.host, wk["mounts"])
             wk["mounts"] = _docker_mounts(wk["mounts"])
             wk.update(
                 entrypoint=["sh", "-c"],
@@ -636,7 +729,9 @@ class DockerRuntime:
             max_turns=0, max_minutes=timeout_s // 60, max_budget_usd=0.0,
         )  # fmt: skip
         with self._network(spec, lambda e: None) as net_name:
-            kw = deps_kwargs(self.cfg, image, work, network=net_name)
+            require_image(self.client, image)
+            kw = deps_kwargs(self.cfg, image, work, network=net_name, host=self.host)
+            require_local_files(self.host, kw["mounts"])
             kw["mounts"] = _docker_mounts(kw["mounts"])
             c = self.client.containers.create(command=[command], **kw)
             try:

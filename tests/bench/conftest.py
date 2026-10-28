@@ -106,6 +106,13 @@ def world(
     images.on_failure = runner.dev_image_failed
     assert runner.session_images is not None
     runner.session_images.on_failure = runner.dev_image_failed
+    # ADR-0004 rule 5: images are built in an explicit phase before any session or
+    # grader runs (slice 1b's loader does this for real tasks); here, by hand
+    base = subprocess.run(
+        ["git", "--git-dir", str(mirror), "rev-parse", "main"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()  # fmt: skip
+    runner.session_images.ensure_fresh(BENCH_REPO, base)
     jobs = JobService(cfg, store, runner)
     runner.jobs = jobs
     yield {"jobs": jobs, "runner": runner, "store": store, "standin": standin, "budget": budget}

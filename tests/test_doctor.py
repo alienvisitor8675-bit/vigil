@@ -12,7 +12,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from vigild import doctor
+from vigild import config, doctor
 from vigild.config import Config, Secrets
 from vigild.doctor import Check, render, run_checks
 
@@ -258,3 +258,27 @@ def test_run_checks_includes_backup_freshness(
 
 def test_tests_never_read_the_hosts_backup_plist() -> None:
     assert not doctor.BACKUP_PLIST.is_relative_to(Path.home() / "Library")
+
+
+def test_doctor_has_one_sandbox_host_line_with_only_local() -> None:
+    from vigild.doctor import _sandbox_host_lines
+
+    cfg = config.load()
+    (line,) = _sandbox_host_lines(cfg, object(), None)
+    assert line.ok is True and "local only" in line.note
+
+
+def test_doctor_prints_each_remote_hosts_rule_lines() -> None:
+    from tests.executors.hostfakes import with_remote
+    from vigild.doctor import _sandbox_host_lines
+
+    cfg = with_remote(config.load())
+    seen: list[str] = []
+
+    def fake(c: Config, hosts: object) -> list[Check]:
+        seen.append("called")
+        return [Check(f"sandbox host box-a: rule {n} x", n != 3, "") for n in range(1, 7)]
+
+    lines = _sandbox_host_lines(cfg, object(), fake)
+    assert seen and len(lines) == 6
+    assert render(lines).splitlines()[2].startswith("fail  sandbox host box-a: rule 3")

@@ -6,6 +6,7 @@ lists a hosted backend or decider route it may not use (vigild/repos.py).
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -287,6 +288,96 @@ class Vigild(_M):
         return Path(self.data_dir).expanduser()
 
 
+# --- sandbox hosts (ADR-0004) ---------------------------------------------------
+
+LOCAL_HOST = "local"
+DEFAULT_CONTEXT = "default"  # docker.from_env(): the Docker on this machine
+PRIVATE_NETS = tuple(
+    ipaddress.ip_network(n)
+    for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")
+)
+
+
+def is_private_address(value: str) -> bool:
+    """RFC 1918, or the 100.64.0.0/10 range a private overlay network uses."""
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return any(ip in net for net in PRIVATE_NETS)
+
+
+class SandboxHost(_M):
+    name: str
+    docker_context: str = DEFAULT_CONTEXT
+    arch: Literal["arm64", "amd64"]
+    memory_gb: float = Field(gt=0)  # the caps of the host's dedicated slice
+    cpus: float = Field(gt=0)
+    disk_budget_gb: float = Field(gt=0)  # the most space vigil's images and containers may use
+    uses: list[Literal["jobs", "bench"]] = Field(min_length=1)
+    gateway_url: str  # how this host's containers reach vigild's gateway
+    engine_pin: str | None = None  # this host's exact Docker Engine version
+    private_address: str | None = None  # the host's address, the gateway's allowed source
+    cgroup_slice: str = "vigil.slice"  # every vigild container sets it as cgroup_parent
+
+    @property
+    def remote(self) -> bool:
+        return self.docker_context != DEFAULT_CONTEXT
+
+    @model_validator(mode="after")
+    def _rules(self) -> SandboxHost:
+        if not self.gateway_url.startswith("http://"):
+            raise ValueError(f"{self.name}: gateway_url must be http://host:port")
+        if self.name == LOCAL_HOST and self.remote:
+            raise ValueError("the `local` host stays on the default Docker context")
+        if self.remote:
+            if not self.engine_pin:
+                raise ValueError(f"{self.name}: a remote host needs its engine_pin")
+            if not self.private_address:
+                raise ValueError(f"{self.name}: a remote host needs its private_address")
+            if not is_private_address(self.private_address):
+                raise ValueError(f"{self.name}: private_address is not a private address")
+            if not self.cgroup_slice.endswith(".slice"):
+                raise ValueError(f"{self.name}: cgroup_slice must be a systemd slice")
+        return self
+
+
+class BenchPolicy(_M):
+    allow_emulation: bool = False
+
+
+class SandboxHostsFile(_M):
+    bench: BenchPolicy = Field(default_factory=BenchPolicy)
+    gateway_bind: str | None = None
+    hosts: list[SandboxHost]
+
+    @model_validator(mode="after")
+    def _rules(self) -> SandboxHostsFile:
+        names = [h.name for h in self.hosts]
+        if len(set(names)) != len(names):
+            raise ValueError("sandbox host names must be unique")
+        if names.count(LOCAL_HOST) != 1:
+            raise ValueError("configs/sandbox_hosts.yaml needs exactly one `local` host")
+        if self.remote_hosts() and not (
+            self.gateway_bind and is_private_address(self.gateway_bind)
+        ):
+            raise ValueError("remote hosts need gateway_bind, a private address")
+        return self
+
+    def remote_hosts(self) -> list[SandboxHost]:
+        return [h for h in self.hosts if h.remote]
+
+    def host(self, name: str) -> SandboxHost:
+        for h in self.hosts:
+            if h.name == name:
+                return h
+        raise ConfigError(f"unknown sandbox host {name!r}")
+
+    @property
+    def local(self) -> SandboxHost:
+        return self.host(LOCAL_HOST)
+
+
 class Config(_M):
     backends: BackendsFile
     repos: ReposFile
@@ -296,6 +387,7 @@ class Config(_M):
     egress: Egress
     vigild: Vigild
     review: ReviewPolicy
+    sandbox_hosts: SandboxHostsFile
 
     def preset(self, name: str) -> Preset:
         try:
@@ -319,6 +411,7 @@ FILES = {
     "egress": "egress.yaml",
     "vigild": "vigild.yaml",
     "review": "review.yaml",
+    "sandbox_hosts": "sandbox_hosts.yaml",
 }
 
 

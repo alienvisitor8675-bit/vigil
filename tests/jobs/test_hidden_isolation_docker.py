@@ -37,6 +37,7 @@ from tests.jobs.test_coord_loop import (
     _approve,
     _flag_edit,
     _named,
+    build_first,
 )
 from vigild.api.app import create_app
 from vigild.budget import Budget
@@ -181,6 +182,7 @@ def dworld(
     images.on_failure = runner.dev_image_failed
     assert runner.session_images is not None
     runner.session_images.on_failure = runner.dev_image_failed
+    build_first(images, runner.session_images)  # the build step has run (ADR-0004)
     jobs = JobService(cfg, store, runner)
     runner.jobs = jobs
     services = Services(cfg=cfg, store=store, tokens=tokens, jobs=jobs)

@@ -68,6 +68,7 @@ from vigild.contract.models import (
 from vigild.db import SessionRoleError, Store, iso, utcnow
 from vigild.devimage import DevImages, SessionImages, StaleDevImage, missing_tools
 from vigild.executors.base import ExecOutcome, Executor, Resume, SessionSpec
+from vigild.executors.hosts import HostRefused
 from vigild.gateway.service import TOKEN_TTL_MARGIN_MIN, Gateway
 from vigild.github.publish import LegacyBranch, PublishError, artifact_paths, vigild_paths
 from vigild.hidden import ARTIFACT as HIDDEN_ARTIFACT
@@ -713,17 +714,46 @@ class JobRunner:
             safe(repo)
 
     def _session_image(self, repo: str, base_sha: str) -> str | None:
-        """The repo's session image (owner direction, round 3), built when its
-        dev image or the executor layer changed; the dev image comes first."""
+        """The repo's session image (owner direction, round 3): the executor
+        layer over its dev image. Only looked up here; a session never builds
+        (ADR-0004 §5), so a missing image refuses with the build to run."""
         if self.session_images is None:
-            self.dev_images.ensure_fresh(repo, base_sha)
+            self.dev_images.resolve(repo, base_sha)
             return None
-        return self.session_images.ensure_fresh(repo, base_sha)
+        return self.session_images.resolve(repo, base_sha)
+
+    def _host_refused(self, job_id: str | None, e: HostRefused, what: str) -> None:
+        """A sandbox host refused a session, a grader or a deps run (ADR-0004):
+        a page with Resume, once per job and reason. A missing image and a
+        stale one page through DevImages with Rebuild; this is for the rest
+        (a host that can't take it, a full disk budget, a remote copy not
+        built)."""
+        who = f"{job_id}: " if job_id else ""
+        error = redact(str(e))[:500]
+        for item in self.store.list_inbox():
+            if (
+                item.job_id == job_id
+                and item.status == "open"
+                and item.body.get("kind") == "host_refused"
+                and item.body.get("error") == error
+            ):
+                return
+        self._page(
+            job_id,
+            f"{who}sandbox host refused {what}",
+            {
+                "kind": "host_refused",
+                "error": error,
+                "next": "fix what it names (build the image, free disk, check "
+                "configs/sandbox_hosts.yaml), then resume",
+            },
+            resumable=True,
+        )
 
     def start_deferred(self) -> int:
         """Start the builds reconcile queued. vigild calls this only once its
         gateway is listening (N11); each session checks its repo's dev image
-        itself, building it when the lockfiles changed."""
+        itself and refuses if it isn't built (ADR-0004 §5)."""
         started, self.deferred = self.deferred, []
         for job_id in started:
             if self.store.get_job(job_id).state in (JobState.BUILDING, JobState.IN_REVIEW):
@@ -1096,7 +1126,11 @@ class JobRunner:
                     spec.traceparent = tr.traceparent
                     self.store.update_session(s.id, detail={"trace_id": tr.trace_id})
                     with self.telemetry.span(tr, "vigil.spawn", {"vigil.image": spec.image or ""}):
-                        out = self.executor.run(spec, token, self._event_sink(s))
+                        try:
+                            out = self.executor.run(spec, token, self._event_sink(s))
+                        except HostRefused as e:  # no host may run it: nothing ran
+                            self._host_refused(spec.job_id, e, "the session")
+                            out = ExecOutcome("failed", None, {}, f"sandbox host refused: {e}")
                     tr.set("vigil.status", out.status)
                     if cap is not None:  # a review or audit: did it go past its cap?
                         self.gateway.drain(s.id)
@@ -1273,8 +1307,12 @@ class JobRunner:
                 job.repo, self.workspace.head_sha(job.repo, job.base)
             )
             check_backend(self.cfg, job.repo, preset, private=live_private(job.repo))
-        except (StaleDevImage, RepoPolicyError) as e:
-            why = "dev image not fresh" if isinstance(e, StaleDevImage) else "backend refused"
+        except (StaleDevImage, HostRefused, RepoPolicyError) as e:
+            why = (
+                "dev image not fresh"
+                if isinstance(e, StaleDevImage | HostRefused)
+                else "backend refused"
+            )
             self._page(
                 job_id, f"{job_id}: {why}; coord not started", {"error": str(e)}, resumable=True
             )
@@ -1632,8 +1670,14 @@ class JobRunner:
             test_cmd = str(contract["spec"].get("test_cmd") or "")
 
             def probe(files: list[str]) -> set[str] | None:
-                image = self.dev_images.ensure_fresh(job.repo, base_now)
-                return self.verifier.collect_probe(job.repo, image, base_now, test_cmd, files)
+                try:
+                    image = self.dev_images.resolve(job.repo, base_now)
+                    return self.verifier.collect_probe(job.repo, image, base_now, test_cmd, files)
+                except StaleDevImage as e:  # DevImages paged it, with Rebuild
+                    raise HiddenError(f"the dev image isn't ready: {e}") from e
+                except HostRefused as e:
+                    self._host_refused(job.id, e, "the hidden-test probe")
+                    raise HiddenError(f"sandbox host refused: {e}") from e
 
             place = place_for(
                 job.id, str(contract["task_id"]), test_cmd,
@@ -1750,7 +1794,7 @@ class JobRunner:
         try:
             clone = self.workspace.clone(job.repo, clone_id, branch=branch, base=job.base)
             base_sha = self.workspace.base_sha(clone_id)
-            image = self.dev_images.ensure_fresh(job.repo, base_sha)
+            image = self.dev_images.resolve(job.repo, base_sha)
             session_image = self._session_image(job.repo, base_sha)
             # the author's own contract: it may write exactly its placement path (the
             # harness commits only what is in this scope or under .vigil/)
@@ -1784,6 +1828,12 @@ class JobRunner:
                 mounts=self.workspace.overlays(clone), packet=packet.text, image=session_image,
                 max_output_tokens=self.cfg.budgets.session_max_output_tokens,
             )  # fmt: skip
+        except (StaleDevImage, HostRefused) as e:
+            self.budget.settle(rid, 0.0)
+            self.store.update_session(s.id, status="failed")
+            if isinstance(e, HostRefused):
+                self._host_refused(job_id, e, "the hidden-test author")
+            return None, f"the sandbox image isn't ready: {e}"[:300]
         except Exception as e:
             self.budget.settle(rid, 0.0)
             self.store.update_session(s.id, status="failed")
@@ -1815,11 +1865,16 @@ class JobRunner:
         except (WorkspaceError, HiddenError) as e:
             self.store.update_session(s.id, status="failed")
             return None, str(e)[:300]
-        check = self.verifier.check_hidden_on_base(
-            repo=job.repo, image=image, task_id=task_id, base_sha=base_sha, hidden=suite,
-            runner_config=self.cfg.repo(job.repo).runner_config, overlap=overlap,
-            scope=list(contract["spec"].get("files_in_scope") or []),
-        )  # fmt: skip
+        try:
+            check = self.verifier.check_hidden_on_base(
+                repo=job.repo, image=image, task_id=task_id, base_sha=base_sha, hidden=suite,
+                runner_config=self.cfg.repo(job.repo).runner_config, overlap=overlap,
+                scope=list(contract["spec"].get("files_in_scope") or []),
+            )  # fmt: skip
+        except HostRefused as e:
+            self.store.update_session(s.id, status="failed")
+            self._host_refused(job_id, e, "the hidden-test base check")
+            return None, f"sandbox host refused: {e}"[:300]
         if not check["ok"]:
             self.store.update_session(s.id, status="failed")
             return None, str(check.get("why") or "the hidden tests did not fail on the base")
@@ -2458,9 +2513,9 @@ class JobRunner:
             clone = self.workspace.clone(job.repo, task_id, branch=branch, base=job.base)
         base_sha = self.workspace.base_sha(task_id)
         try:
-            image = self.dev_images.ensure_fresh(job.repo, base_sha)  # what the verifier runs
+            image = self.dev_images.resolve(job.repo, base_sha)  # what the verifier runs
             session_image = self._session_image(job.repo, base_sha)  # what the worker runs in
-        except StaleDevImage as e:
+        except (StaleDevImage, HostRefused) as e:
             self.budget.settle(reservation, 0.0)
             return self._fail(
                 job_id,
@@ -2709,6 +2764,11 @@ class JobRunner:
                     hidden=entry_suite(hidden_entry),
                     scope=list(contract["spec"].get("files_in_scope") or []),
                 )
+            except HostRefused as e:  # the grader's host refused: no verdict
+                self._host_refused(job_id, e, "the grader")
+                return self._fail(
+                    job_id, s, task_id, f"{task_id}: sandbox host refused", {"error": str(e)[:1000]}
+                )
             except Exception as e:  # docker or git trouble: no verdict, nothing accepted
                 log.exception("verifier failed on %s", task_id)
                 return self._fail(
@@ -2926,12 +2986,17 @@ class JobRunner:
         base_sha = self.workspace.base_sha(task_id)
         lockfiles = list(self.cfg.repo(job.repo).dev_lockfiles)
         try:
-            image = self.dev_images.ensure_fresh(job.repo, base_sha)
+            image = self.dev_images.resolve(job.repo, base_sha)
+            res = self.deps.run(job.repo, base_sha, lockfiles, reqs, image)
+        except HostRefused as e:
+            self._host_refused(job_id, e, "the deps run")
+            return self._fail(
+                job_id, s, task_id, f"{task_id}: sandbox host refused", {"error": str(e)}
+            )
         except StaleDevImage as e:
             return self._fail(
                 job_id, s, task_id, f"{task_id}: dev image not fresh", {"error": str(e)}
             )
-        res = self.deps.run(job.repo, base_sha, lockfiles, reqs, image)
         self.store.add_artifact(
             job_id, "deps_report.json",
             json.dumps({"added": res.added, "errors": res.errors, "output": res.output}),
@@ -3053,6 +3118,29 @@ class JobRunner:
             self._resume_dependents(job.id)
         return merged_jobs
 
+    def _build_after_deps(self, job: Job) -> None:
+        """The deps PR changed the lockfiles, so the parent's base has a new image
+        key. This is vigild's own handler, not a session or a grader, so it runs
+        the explicit build step (ADR-0004 §5) and then the parent resumes with no
+        owner press. A build that fails has paged through DevImages (Rebuild); the
+        parent still resumes and its image lookup refuses the same way."""
+        try:
+            base_sha = self.workspace.head_sha(job.repo, job.base)
+            if self.session_images is not None:
+                self.session_images.ensure_fresh(job.repo, base_sha)
+            else:
+                self.dev_images.ensure_fresh(job.repo, base_sha)
+        except StaleDevImage:
+            log.warning("deps merged for %s but its new image did not build", job.id)
+        except Exception as e:
+            log.exception("building the image after the deps merge failed for %s", job.id)
+            self._page(
+                job.id,
+                f"{job.id}: building the image after the deps merge failed",
+                {"error": redact(str(e))[:500]},
+                resumable=True,
+            )
+
     def _resume_dependents(self, dep_id: str) -> None:
         """Every job blocked on this (deps) job goes back to work (B39)."""
         for job in self.store.list_jobs():
@@ -3071,6 +3159,7 @@ class JobRunner:
             for item in self.store.list_inbox():
                 if item.job_id == job.id and item.body.get("kind") == "needs_deps":
                     self.store.resolve_inbox_item(item.id, "vigild")
+            self._build_after_deps(job)
             self.on_resume(job.id)
 
     # --- stages 5-6: review and audit (phase 2a, item 1) ---------------------------------
@@ -3852,6 +3941,12 @@ class JobRunner:
                 clone, {**t.contract, "base_sha": head, "head": head, "role": role.value}
             )
             session_image = self._session_image(job.repo, base_sha)
+        except (StaleDevImage, HostRefused) as e:  # DevImages paged a stale image with Rebuild
+            self.budget.settle(rid)
+            self.store.update_session(s.id, status="failed")
+            if isinstance(e, HostRefused):
+                self._host_refused(job.id, e, "the review session")
+            return None, f"the sandbox image isn't ready: {e}"[:300]
         except Exception:
             self.budget.settle(rid)
             self.store.update_session(s.id, status="failed")

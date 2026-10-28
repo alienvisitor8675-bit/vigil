@@ -126,6 +126,7 @@ def run_checks(
     docker: Any,
     repos: list[str] | None = None,
     include_claude_mods: bool = True,
+    host_checks: Any = None,
 ) -> list[Check]:
     out: list[Check] = []
     vis: dict[str, bool] = {}  # each repo's live visibility, as read here
@@ -372,6 +373,7 @@ def run_checks(
                     ),
                 )
             )
+        out += _sandbox_host_lines(cfg, docker, host_checks)
         from vigild.db import Store
 
         store = Store.open(cfg.vigild.data_path / "vigil.db")
@@ -396,3 +398,19 @@ def run_checks(
     out.append(_experiment_line(cfg))
     out.append(backup_freshness_check())
     return out
+
+
+def _sandbox_host_lines(cfg: Config, docker: Any, host_checks: Any) -> list[Check]:
+    """ADR-0004: one line per remote sandbox host per rule. With only the
+    default `local`, one line says so and nothing remote is touched."""
+    remote = cfg.sandbox_hosts.remote_hosts()
+    if not remote:
+        return [Check("sandbox hosts", True, "local only (no remote host configured)")]
+    from vigild.executors.hostcheck import check_hosts
+    from vigild.executors.hosts import Hosts, client_for
+
+    hosts = Hosts(cfg, make_client=lambda h: client_for(h) if h.remote else docker)
+    try:
+        return (host_checks or check_hosts)(cfg, hosts)
+    finally:
+        hosts.close_remote()

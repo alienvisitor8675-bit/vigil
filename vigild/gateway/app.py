@@ -37,6 +37,12 @@ def create_gateway_app(gw: Gateway) -> FastAPI:
         stream: AsyncIterator[bytes] = body
         return StreamingResponse(stream, status_code=status, headers=out_headers)
 
+    @app.get("/health")
+    async def health() -> dict[str, bool]:
+        # no token, no state: a sandbox host's doctor probe reaches it through
+        # the egress proxy to prove the path to the gateway (ADR-0004)
+        return {"ok": True}
+
     @app.post("/v1/messages")
     async def messages(request: Request) -> Response:
         return await _proxy(request, "/v1/messages")

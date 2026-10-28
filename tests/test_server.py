@@ -57,3 +57,23 @@ def test_vigil_data_dir_points_vigild_at_a_scratch_dir(tmp_path: Any, monkeypatc
     assert v.cfg.vigild.data_path == tmp_path / "scratch"
     assert (tmp_path / "scratch" / "vigil.db").exists()
     v.store.conn.close()
+
+
+def test_vigild_refuses_to_start_on_a_failing_remote_host() -> None:
+    import pytest
+
+    from tests.executors.hostfakes import FakeHostClient, FakeSsh, with_remote
+    from vigild import config
+    from vigild.executors.hosts import Hosts
+    from vigild.server import check_sandbox_hosts
+
+    cfg = with_remote(config.load())
+    hosts = Hosts(cfg, make_client=lambda h: FakeHostClient(version="0.0.1"))
+    with pytest.raises(SystemExit, match="rule 2"):
+        check_sandbox_hosts(
+            cfg, hosts, ssh=FakeSsh(), resolve=lambda n: ["10.1.2.4"],
+            prober_for=lambda h, c: None, lookup=lambda c: "ssh://u@h",
+        )  # fmt: skip
+    # only `local` configured: nothing is reached and it starts
+    local = config.load()
+    check_sandbox_hosts(local, Hosts(local, make_client=lambda h: 1 / 0))

@@ -375,6 +375,15 @@ class BarePublisher:
         )
 
 
+def build_first(images: DevImages, sessions: SessionImages) -> None:
+    """Stand in for the explicit build step (ADR-0004 §5; `vigil dev-image`),
+    which has run before a job dispatches: a session only resolves the image,
+    so these fakes build it on first lookup. tests/test_build_phase.py covers
+    the real `resolve`, which never builds."""
+    images.resolve = lambda repo, base, **kw: images.ensure_fresh(repo, base, **kw)  # type: ignore[method-assign]
+    sessions.resolve = lambda repo, base: sessions.ensure_fresh(repo, base)  # type: ignore[method-assign]
+
+
 @dataclass
 class World:
     client: TestClient
@@ -427,6 +436,7 @@ def world(
     images.on_failure = runner.dev_image_failed
     assert runner.session_images is not None
     runner.session_images.on_failure = runner.dev_image_failed
+    build_first(images, runner.session_images)
     jobs = JobService(cfg, store, runner)
     runner.jobs = jobs
     services = Services(cfg=cfg, store=store, tokens=tokens, jobs=jobs)

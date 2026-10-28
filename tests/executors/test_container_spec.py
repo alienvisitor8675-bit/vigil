@@ -16,6 +16,14 @@ from vigild.jobs.model import Role
 from vigild.workspace import Workspace
 
 
+class PresentImages:
+    """Every image is built already: a run only refuses a missing one."""
+
+    @staticmethod
+    def get(image: str) -> object:
+        return object()
+
+
 @pytest.fixture
 def spec(tmp_path: Path, fixture_repo: dict[str, Path], cfg: Config) -> SessionSpec:
     ws = Workspace(tmp_path / "data", remote_url=lambda r: str(fixture_repo["bare"]))
@@ -227,6 +235,7 @@ def test_verifier_containers_run_one_at_a_time(cfg: Config, tmp_path: Path) -> N
 
     class Client:
         containers = Containers()
+        images = PresentImages()
 
     assert cfg.vigild.container.verifier_concurrency == 1
     runner = DockerTestRunner(cfg, Client())
@@ -338,6 +347,8 @@ def test_a_finished_log_stream_is_closed(cfg: Config, tmp_path: Path) -> None:
         def remove(self, **kw: object) -> None: ...
 
     class Client:
+        images = PresentImages()
+
         class containers:
             @staticmethod
             def create(**kw: object) -> Container:

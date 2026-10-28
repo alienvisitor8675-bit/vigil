@@ -53,6 +53,11 @@ class StaleDevImage(RuntimeError):
     pass
 
 
+class MissingImage(StaleDevImage):
+    """The image isn't built (or changed since it was validated). Builds are an
+    explicit phase (ADR-0004 §5): a session or grader never starts one."""
+
+
 SHELL_BUILTINS = {"cd", "true", "false", "test", "[", "echo", "exit", "export", "set"}
 
 
@@ -212,6 +217,40 @@ class DevImages:
                 raise StaleDevImage(f"{repo}: dev image {tag} failed its {v.stage}")
             return tag
 
+    def resolve(self, repo: str, base_sha: str, *, source: str = "mirror") -> str:
+        """The validated image for this base, or a refusal. Never builds: a
+        session or a grader calls this, and the build is the explicit step
+        (`ensure_fresh`: `vigil dev-image`, or the owner's rebuild)."""
+        key = self.key(repo, base_sha, source)
+        tag = self.tag(repo, key)
+        last = self.latest(repo, key)
+        if last is not None and not last["ok"]:
+            raise StaleDevImage(
+                f"{repo}: dev image {tag} failed its {last['stage']}; rebuild it from the inbox"
+            )
+        if last is None or self.docker.image_id_of(tag) != last["image_id"]:
+            self._missing(repo, key, tag, base_sha, "dev image")
+        return tag
+
+    def _missing(self, repo: str, key: str, tag: str, base_sha: str, what: str) -> None:
+        if self.on_failure is not None:
+            self.on_failure(
+                repo,
+                f"{repo}: {what} {tag} is not built",
+                {
+                    "kind": "dev_image",
+                    "repo": repo,
+                    "key": key,
+                    "image": tag,
+                    "stage": "missing",
+                    "base_sha": base_sha,
+                    "failed_suites": [],
+                    "detail": {"build": f"build {tag} first"},
+                    "actions": ["rebuild", "dismiss"],
+                },
+            )
+        raise MissingImage(f"build {tag} first")
+
     def build_and_validate(
         self, repo: str, base_sha: str, key: str, source: str = "mirror"
     ) -> Validation:
@@ -345,6 +384,20 @@ class SessionImages:
 
     def tag(self, repo: str, key: str) -> str:
         return self.dev.tag(repo, key).replace("vigil-dev/", "vigil-session/", 1)
+
+    def resolve(self, repo: str, base_sha: str) -> str:
+        """The built session image, or a refusal. Never builds (ADR-0004 §5)."""
+        dev_tag = self.dev.resolve(repo, base_sha)
+        key = self.key(dev_tag)
+        tag = self.tag(repo, key)
+        last = self.dev.latest(repo, key)
+        if last is not None and not last["ok"]:
+            raise StaleDevImage(
+                f"{repo}: session image {tag} failed its {last['stage']}; rebuild it from the inbox"
+            )
+        if last is None or self.dev.docker.image_id_of(tag) != last["image_id"]:
+            self.dev._missing(repo, key, tag, base_sha, "session image")
+        return tag
 
     def ensure_fresh(self, repo: str, base_sha: str, *, force: bool = False) -> str:
         dev_tag = self.dev.ensure_fresh(repo, base_sha, force=force)

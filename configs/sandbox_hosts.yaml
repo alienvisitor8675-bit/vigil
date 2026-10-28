@@ -1,0 +1,33 @@
+# Sandbox hosts (ADR-0004): where sessions and graders run. Separate from model
+# hosts (configs/backends.yaml). No code in vigild/ names a machine; a host is
+# only what this file says. Without a remote entry, nothing here changes: the
+# default `local` is the Docker on the machine vigild runs on.
+bench:
+  # With no amd64 bench host, a bench task runs on `local` under emulation,
+  # labelled `emulated`. The owner turns this off by hand once an x86 sandbox
+  # host passes `vigil doctor` (ADR-0004, owner's answer 2).
+  allow_emulation: true
+# The private address vigild's gateway also listens on, only when a remote host
+# is listed. Each remote host's `gateway_url` points at it.
+gateway_bind: null
+hosts:
+  - name: local
+    docker_context: default     # docker.from_env(): the built-in default entry
+    arch: arm64                 # checked against `docker info`
+    memory_gb: 11               # the Docker Desktop VM; no slice is enforced locally
+    cpus: 8
+    disk_budget_gb: 200
+    uses: [jobs, bench]
+    gateway_url: http://host.docker.internal:8788
+# A remote entry looks like this (see docs/runbook.md "Add a sandbox host"):
+#  - name: <free text>
+#    docker_context: <a Docker context whose endpoint is ssh://...>
+#    arch: amd64
+#    memory_gb: <the slice's memory cap>
+#    cpus: <the slice's cpu cap>
+#    disk_budget_gb: <most space vigil's images and containers may use>
+#    uses: [bench]
+#    engine_pin: "<exact Docker Engine version>"
+#    private_address: <the host's address on the private network>
+#    cgroup_slice: vigil.slice
+#    gateway_url: http://<gateway_bind>:8788

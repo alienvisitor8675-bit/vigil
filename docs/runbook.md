@@ -195,6 +195,15 @@ status issue (#1), and waits for you.
 
 ## Running phase 1
 
+### One machine with Docker (the default)
+
+vigild, its sessions and its graders all use the Docker on the machine vigild
+runs on. `configs/sandbox_hosts.yaml` lists one host, `local`, and that is all
+you need: no context, no key, no second listener. Everything below describes
+this setup unless it says "sandbox host". Add a sandbox host only when a
+workload needs another architecture or more room (ADR-0004); see "Add a
+sandbox host" below.
+
 ### Docker Desktop on this Mac
 
 - 4.94 with a 12 GiB VM. That fits Phoenix (2 GiB cap), the collector
@@ -239,12 +248,16 @@ docker compose --env-file ~/.config/vigil/env up -d --build
 ### Dev images
 
 Each repo's tests run only in its own dev image (`images/dev/<repo>.Dockerfile`,
-named in `configs/repos.yaml`). **vigild builds and validates it itself**,
-when the repo's lockfiles change at the base commit (the first job after a
-lockfile change waits for it; ParkAgent's takes about 3 minutes cold and is
-about 3.8 GB): the build installs from the lockfiles, with the network; the
+named in `configs/repos.yaml`). **Building it is an explicit step**
+(ADR-0004): a session or grader never builds, so after the repo's lockfiles
+change at the base commit, the next job is refused with `build <image> first`
+and an inbox item with **Rebuild**, until you press it or run
+`vigil dev-image` (ParkAgent's takes about 3 minutes cold and is about
+3.8 GB). The build installs from the lockfiles, with the network; the
 validation runs every suite in `dev_suites` on a clean checkout, in the
-image, with no network. There is no timer and no launchd job.
+image, with no network. A deps PR you merge is the one exception: vigild's own deps-merge handler
+builds the parent's new image and resumes the parent, with no press from
+you. There is no timer and no launchd job.
 
 - **When it fails**, every session for that repo is refused and the inbox
   gets one item per image saying what failed (the build's tail, or each
@@ -260,8 +273,8 @@ image, with no network. There is no timer and no launchd job.
 
 - **Session images.** A repo's coord and worker sessions run in its session
   image: the executor layer (`images/claude-executor/Dockerfile`) built over
-  its dev image, so workers can run the real suite offline. vigild builds it
-  right after the dev image, and rebuilds it when the dev image or the layer
+  its dev image, so workers can run the real suite offline. `vigil dev-image` builds it
+  right after the dev image, and Rebuild builds it again when the dev image or the layer
   changes (ParkAgent's: about 4.8 GB, the layer about 25 s with a warm build
   cache). It fails, pages and rebuilds like a dev image. The generic
   `vigil/claude-executor` image (`scripts/build-images.py`) is the same layer
@@ -436,6 +449,102 @@ round, so the second trips routing rule 5 as any fix round does; the 200 then ca
 `notice` ("this round runs on <preset> (escalated)") and so does the `fix_with_findings`
 event. A task that has used its `routing.escalate_review_rounds` (2) is refused with a
 409: replan, or merge as is. Only a `ready` job takes a fix (an `in_review` one is refused).
+
+### Add a sandbox host
+
+Optional (ADR-0004). A sandbox host is another machine whose Docker runs
+sessions and graders, for example an x86 box for benchmark tasks. It is not a
+model host (`configs/backends.yaml`). **Do not touch the machine before you
+have read this section.** The owner's own x86 machine has a step-by-step
+checklist in `docs/deploy/owner-x86-sandbox.md`.
+
+**What the SSH key is.** The key vigild uses equals root on the sandbox host:
+whoever holds it can drive that host's Docker daemon. So it lives only on the
+vigild machine, the sandbox host holds no secret, and the host's
+`authorized_keys` entry for it is restricted to speaking the Docker API. The
+exact line (one line; put the public key last):
+
+```
+command="docker system dial-stdio",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 <the public key> vigil-sandbox
+```
+
+**Steps, in order.**
+1. **A user and the restricted key.** A dedicated user (say `vigil`) in the
+   `docker` group, with the line above in its `~/.ssh/authorized_keys`.
+   Nothing else is in that file.
+2. **userns-remap.** In `/etc/docker/daemon.json` set
+   `"userns-remap": "default"` and restart Docker. Rootless Docker is not
+   supported until `tests/security/test_threats.py` passes under it.
+   `docker info` must then list `name=userns` under Security Options.
+3. **Pin the engine.** Install an exact Docker Engine version, hold it
+   (`apt-mark hold docker-ce`), and write the same string as `engine_pin`.
+   An upgrade is a deliberate edit of the pin.
+4. **The slice.** A systemd slice, `vigil.slice`, with `MemoryMax=` and
+   `CPUQuota=` set to the host's `memory_gb` and `cpus` (a drop-in under
+   `/etc/systemd/system/vigil.slice.d/`; `systemctl daemon-reload`). Docker
+   must use the systemd cgroup driver (`"exec-opts":
+   ["native.cgroupdriver=systemd"]`). vigild sets `cgroup_parent` to it on
+   every container it creates there.
+5. **No GPU for sandboxes.** The default runtime stays `runc`; no
+   `nvidia` runtime as default, and vigild never passes a device request.
+6. **The Docker context on the vigild machine.**
+   `docker context create <name> --docker "host=ssh://vigil@<private address>"`.
+   The endpoint is `ssh://`, never `tcp://`, and must resolve to a private
+   address (RFC 1918, or the 100.64.0.0/10 range of a private overlay).
+7. **Images.** Build the executor and proxy images on the sandbox host
+   (run `scripts/build-images.py` with `DOCKER_CONTEXT=<name>` set, so the
+   Docker CLI builds there); a session or grader
+   never builds or pulls, and a missing image refuses with
+   `build <image> first`.
+8. **The gateway listener.** Set `gateway_bind` to vigild's own private
+   address and the host's `gateway_url` to `http://<gateway_bind>:8788`.
+   With a remote host listed, vigild also listens there and accepts only the
+   hosts' `private_address` values; any other source is dropped before HTTP.
+   Keep the private network's own access rules on as well, as defence in
+   depth. The loopback listener is unchanged.
+9. **The config entry.** Add the host to `configs/sandbox_hosts.yaml` (the
+   commented template there lists every field) and set `uses: [bench]`.
+10. **Check it.**
+    ```sh
+    uv run python cli/vigil doctor --repo thomasbardhi01/vigil
+    ```
+    Doctor prints one line per rule for each remote host (`sandbox host
+    <name>: rule 1` … `rule 6`):
+    1. ssh only, a private target, and the context's own target and port tried
+       three ways, each **refused**: a plain command (the session must act like
+       `docker system dial-stdio` with stdin closed), a pty (`-tt`) and a port
+       forward (`-N -L`). A broken key or an unreachable host is a failure;
+    2. the engine equals `engine_pin`, `userns` is present, rootless is
+       refused, and the architecture matches;
+    3. egress: a probe container reaches the gateway's `GET /health` and fails
+       to reach the internet, the host's own other ports, the other private
+       addresses and every model endpoint in `backends.yaml`;
+    4. no GPU: the default runtime is not a GPU runtime and the probe sees no
+       `/dev/nvidia*`;
+    5. the probe reads the slice's memory and CPU limits and fails if they are
+       missing or larger than the config;
+    6. the disk budget: usage of vigil-labelled images and containers against
+       `disk_budget_gb`. vigild prunes only its own labelled items, least
+       recently used first, when usage passes the budget: stopped session
+       containers of jobs that are merged, done or abandoned (or that no job
+       references), and images no container uses. It never touches a running
+       container, a live job's session (its result may not be imported yet) or
+       a verifier or deps container. If the budget can't be met without live
+       work, the new session is refused and doctor says so.
+
+    vigild refuses to start while a configured remote host fails a rule.
+
+**Emulation.** With no amd64 bench host, a bench task runs on `local`
+under emulation, labelled `emulated` (`bench.allow_emulation: true`, the
+pilot setting). Once an x86 sandbox host passes doctor, turn it off by hand.
+
+**Not built: remote file transfer.** Copying a worker's clone and packet
+to a remote host over the Docker API is not written. A remote host
+therefore **cannot run a session or a grader yet**: a remote placement is
+refused in code, before anything runs, with a reason on a Resume page.
+`local` is unaffected. Adding a host and passing doctor is still worth
+doing now; nothing runs there until the transfer is built (bench slice 1b
+needs it).
 
 ### Check everything
 

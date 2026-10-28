@@ -24,6 +24,7 @@ from vigild.config import Config, Secrets
 from vigild.db import Store
 from vigild.devimage import DevImages
 from vigild.gateway.app import create_gateway_app
+from vigild.gateway.private import private_config
 from vigild.gateway.service import Gateway
 from vigild.jobs.runner import JobRunner
 from vigild.jobs.service import JobService, Runner
@@ -139,6 +140,9 @@ async def serve(v: Vigild, on_ready: Callable[[], Any] | None = None) -> None:
         uvicorn.Config(create_app(v.services), host=api.host, port=api.port, log_level="info"),
         uvicorn.Config(create_gateway_app(v.gateway), host=gw.host, port=gw.port, log_level="info"),
     ]
+    private = private_config(v.cfg, configs[1].app)
+    if private is not None:  # a remote sandbox host is configured (ADR-0004)
+        configs.append(private)
     if api.tailscale_host:
         configs.append(
             uvicorn.Config(
@@ -182,6 +186,17 @@ def _github_app(v: Vigild) -> Any:
     )
 
 
+def build_executors(cfg: Config, client: Any, store: Any) -> tuple[Any, Any, Any]:
+    """The session executor and the grader, both chosen per image by the hosts
+    (ADR-0004). Normal jobs resolve to `local`, which shares `client`."""
+    from vigild.executors.disk import prunable_sessions
+    from vigild.executors.hosts import HostExecutor, Hosts, HostTestRunner, client_for
+
+    hosts = Hosts(cfg, make_client=lambda h: client_for(h) if h.remote else client)
+    hosts.prune_ok = prunable_sessions(store)  # live work is never pruned
+    return hosts, HostExecutor(hosts), HostTestRunner(hosts)
+
+
 def build_runner(v: Vigild, app: Any) -> JobRunner:
     """The real executor, workspace and publisher behind the job service."""
     import docker
@@ -189,7 +204,6 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
 
     from vigild.db import utcnow
     from vigild.devimage import DockerImages, SessionImages
-    from vigild.executors.runtime import DockerRuntime, DockerTestRunner
     from vigild.github.app import READ_ONLY
     from vigild.jobs.deps import DepsExecutor, HttpRegistry
     from vigild.jobs.runner import GitHubPRs, GitHubPublisher, NoPublisher, Publisher
@@ -206,8 +220,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
 
     ws = Workspace(v.cfg.vigild.data_path, token_for=read_token)
     publisher: Publisher = GitHubPublisher(app, app.http, ws) if app else NoPublisher()
-    runtime = DockerRuntime(v.cfg, client)
-    tests = DockerTestRunner(v.cfg, client)
+    hosts, runtime, tests = build_executors(v.cfg, client, v.store)
     images = DevImages(v.cfg, v.store, DockerImages(client), ws, tests)
     gh = v.cfg.vigild.github
 
@@ -240,6 +253,7 @@ def build_runner(v: Vigild, app: Any) -> JobRunner:
         pr_state=GitHubPRs(app).state if app else None,
     )
     runner.closers.append(client.close)
+    runner.closers.append(hosts.close_remote)
     images.on_failure = runner.dev_image_failed
     sessions.on_failure = runner.dev_image_failed
     runner.jobs = v.services.jobs
@@ -303,6 +317,41 @@ def start_pollers(v: Vigild, app: Any, runner: JobRunner) -> threading.Event:
     return stop
 
 
+def check_sandbox_hosts(cfg: Config, hosts: Any = None, **kw: Any) -> None:
+    """ADR-0004: vigild refuses to start if a configured remote sandbox host
+    fails a rule, and prunes each remote host's own labelled images to its disk
+    budget. With only the default `local`, nothing remote is touched."""
+    from vigild.executors.disk import enforce_budget
+    from vigild.executors.hostcheck import HostRuleError, require_hosts
+    from vigild.executors.hosts import HostRefused, Hosts
+
+    if not cfg.sandbox_hosts.remote_hosts():
+        return
+    own = hosts is None
+    hosts = hosts or Hosts(cfg)
+    try:
+        for h in cfg.sandbox_hosts.remote_hosts():
+            try:  # stopped work and unused images only; live work is never touched
+                gone = enforce_budget(
+                    hosts.client(h),
+                    int(h.disk_budget_gb * (1 << 30)),
+                    may_prune=hosts.prune_ok or (lambda session: False),
+                )
+                log.info("sandbox host %s: pruned %d over-budget item(s)", h.name, len(gone))
+            except HostRefused as e:  # rule 6 below reports it; new sessions are refused
+                log.warning("sandbox host %s: %s", h.name, e)
+            except Exception as e:  # unreachable: rule 1 below reports it
+                log.warning(
+                    "sandbox host %s: disk budget not checked (%s)", h.name, type(e).__name__
+                )
+        require_hosts(cfg, hosts, **kw)
+    except HostRuleError as e:
+        raise SystemExit(f"vigild: {e}") from e
+    finally:
+        if own:
+            hosts.close()
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     from vigild.repos import RepoPolicyError, set_visibility_source, verify_visibility
@@ -321,6 +370,7 @@ def main() -> None:
     log.info("visibility (live): %s", {r: "private" if p else "public" for r, p in seen.items()})
     # every later read (dispatch, each Jev call) asks GitHub again
     set_visibility_source(app.is_private)
+    check_sandbox_hosts(v.cfg)
     runner = build_runner(v, app)
     v.services.jobs.runner = runner
     # Hold every job a restart interrupted. Approved builds start only once the
