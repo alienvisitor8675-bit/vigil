@@ -14,7 +14,7 @@ import httpx2
 
 from vigild import config
 from vigild.config import Config, Secrets
-from vigild.repos import JEV, live_private, repo_rule_errors
+from vigild.repos import JEV, is_bench_repo, live_private, repo_rule_errors
 
 TIMEOUT = 15.0
 
@@ -46,6 +46,27 @@ def _port_open(host: str, port: int) -> bool:
     with socket.socket() as s:
         s.settimeout(2)
         return s.connect_ex((host, port)) == 0
+
+
+def _experiment_line(cfg: Config) -> Check:
+    """The experiment line's spend this month (bench; owner, 2026-10-27). Read-only:
+    doctor never writes the store."""
+    from vigild.budget import Budget
+    from vigild.db import Store
+
+    cap = cfg.budgets.experiment_monthly_usd
+    db = cfg.vigild.data_path / "vigil.db"
+    if not db.exists():
+        return Check("experiment budget", None, f"no vigil.db yet; cap ${cap:.2f} a month")
+
+    def spend() -> tuple[bool, str]:
+        b = Budget(Store.open(db), cfg.budgets)
+        spent, held = b.spent_experiment_month(), b.open_experiment()
+        return spent + held <= cap + 1e-9, (
+            f"${spent:.2f} spent + ${held:.2f} held of ${cap:.2f} this month (UTC)"
+        )
+
+    return _safe("experiment budget", spend)
 
 
 def run_checks(
@@ -92,7 +113,7 @@ def run_checks(
             Path(key_path).expanduser().read_bytes(),
             http=http,
             claude_mods=cfg.vigild.github.claude_mods,
-            allowed_repos=list(cfg.repos.repos),
+            allowed_repos=[r for r in cfg.repos.repos if not is_bench_repo(r)],
         )
         hdr = app._app_headers
         out.append(
@@ -134,9 +155,14 @@ def run_checks(
             word = "private" if private else "public"
             return (False, "; ".join(errors)) if errors else (True, f"{word}, live")
 
-        for repo in repos if repos is not None else list(cfg.repos.repos):
+        # bench repos are not on GitHub: nothing about them is asked of it
+        on_github = [
+            r for r in (repos if repos is not None else list(cfg.repos.repos))
+            if not is_bench_repo(r)
+        ]  # fmt: skip
+        for repo in on_github:
             out.append(_safe(f"visibility: {repo}", lambda r=repo: visibility(r)))
-        for repo in repos if repos is not None else list(cfg.repos.repos):
+        for repo in on_github:
             out.append(
                 _safe(
                     f"token mint+revoke: {repo}",
@@ -318,4 +344,5 @@ def run_checks(
                 return True, str(row["image"])
 
             out.append(_safe(f"dev image: {repo}", last_build))
+    out.append(_experiment_line(cfg))
     return out

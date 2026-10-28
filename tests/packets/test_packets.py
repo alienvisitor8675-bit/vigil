@@ -295,3 +295,16 @@ def test_packet_for_a_tests_only_task_says_to_pin_existing_behaviour(clone: Path
     assert "must run and pass on the unchanged code" in p.text
     assert "spec_ambiguous:" in p.text
     assert "must fail at the base" not in p.text
+
+
+def test_reviewer_prompt_checks_every_acceptance_criterion() -> None:
+    """pa-0003: the reviewer came back clean twice while the spec's AC bounds and
+    assertions were missing from the diff. The prompt makes the check a step."""
+    text = " ".join((PROMPTS_DIR / "reviewer.md").read_text().split())
+    assert "each acceptance criterion" in text
+    assert "every case, assertion and bound it lists exists in the diff" in text
+    assert "Count bounds literally" in text and "2-4 cases" in text
+    assert "the AC id, what is missing, file:line" in text
+    # the step is one of the numbered checks, before the structured output
+    steps = [ln for ln in text.split("1. ", 1)[1].split(" End with ")[0].split(". ")]
+    assert any("acceptance criterion" in s for s in steps)
