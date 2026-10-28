@@ -22,6 +22,7 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.12.24"
+          enable-cache: true
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
@@ -37,6 +38,7 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.12.24"
+          enable-cache: true
       - run: uv sync --locked
       - run: uv run mypy
 
@@ -47,8 +49,9 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.12.24"
+          enable-cache: true
       - run: uv sync --locked
       - run: git config --global user.email ci@vigil.invalid && git config --global user.name vigil-ci
       # Docker and live tests are deselected by pytest's addopts. They run on
       # the Mac (pytest -m docker, pytest -m live) and their output goes in the PR.
-      - run: uv run pytest -q
+      - run: uv run pytest -q -n auto

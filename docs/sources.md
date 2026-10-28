@@ -42,6 +42,7 @@ When a phase adds or bumps a pin, it updates this file in the same PR.
 | docker (docker-py) | 7.2.0 | 2026-07-09 | same | container lifecycle | https://pypi.org/project/docker/ |
 | pytest | 9.1.1 | 2026-06-19 | same | tests | https://pypi.org/project/pytest/ |
 | pytest-asyncio | 1.4.0 | 2026-05-26 | same | tests | https://pypi.org/project/pytest-asyncio/ |
+| pytest-xdist (and execnet) | 3.8.0 | 2025-07-01 | same | tests, CI `-n auto` | https://pypi.org/project/pytest-xdist/ |
 | ruff | 0.16.10 | 2026-10-01 | 0.17.1 | lint + format | https://pypi.org/project/ruff/ |
 | mypy | 2.4.0 | 2026-10-01 | same | types | https://pypi.org/project/mypy/ |
 | claude-agent-sdk (Python) | 0.2.165 (bundles CLI 2.1.294; vigil runs its own CLI through `cli_path`) | 2026-10-08 | 0.2.172 | Claude executor image | https://pypi.org/project/claude-agent-sdk/#history · https://github.com/anthropics/claude-agent-sdk-python |
