@@ -304,15 +304,15 @@ def test_a_session_waiting_for_a_slot_never_starts(world: World) -> None:
     job = _request(w)
     minted: list[str] = []
     w.runner.gateway.issue_token = lambda *a, **k: minted.append("t") or "vgw_x"  # type: ignore[method-assign,return-value]
-    _kill(w, job)
     s = w.store.create_session(job, Role.WORKER, task_id=None, backend_preset="claude-sonnet")
+    rid = w.budget.reserve(session_id=s.id, task_id=None, amount=0.1, purpose="worker")
+    _kill(w, job)  # (the kill's settle may already have released it; #60: nothing reserves after)
     here = w.runner.workspace.data_dir
     spec = SessionSpec(
         session_id=s.id, role=Role.WORKER, job_id=job, task_id=None, repo=REPO,
         preset="claude-sonnet", model="m", clone=here, session_dir=here, max_turns=1,
         max_minutes=1, max_budget_usd=0.1,
     )  # fmt: skip
-    rid = w.budget.reserve(session_id=s.id, task_id=None, amount=0.1, purpose="worker")
     out = w.runner._run_session(s, spec, rid, {})
     assert out.status == "killed" and minted == [] and w.standin.calls == [("coord", job)]
     assert _open_reservations(w) == []

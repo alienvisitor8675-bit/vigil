@@ -421,6 +421,15 @@ class Gateway:
         th = body.get("thinking")
         thinking = isinstance(th, dict) and th.get("type") == "enabled" and "budget_tokens" in th
         with self._inflight_lock:
+            # A kill revokes, then drains, then settles; a call that passed `authorize`
+            # before the revoke must not place its hold (or grow a reservation) after
+            # the drain. Checked under the lock the drain waits on (#60).
+            if self.store.q(
+                "SELECT 1 FROM gateway_tokens WHERE session_id=? GROUP BY session_id"
+                " HAVING SUM(revoked_at IS NULL) = 0",
+                (session_id,),
+            ):
+                raise GatewayError(401, "authentication_error", "invalid or revoked session token")
             held = self._inflight.get(session_id, 0.0)
             headroom = self.budget.session_headroom(session_id) - held
             need = self.worst_case(model, {"max_tokens": want}, len(raw))

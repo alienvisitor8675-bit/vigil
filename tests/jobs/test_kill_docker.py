@@ -107,6 +107,9 @@ def test_a_running_job_leaves_no_container_network_or_reservation(
         for sid in sids:
             assert _labelled(client, sid) == ([], [])  # nothing of the job is left
         assert _open_reservations(w) == [] and body["reservations_open"] == []
+        # #60: no page or item on the killed job, and no session row left running
+        assert not [q for q in w.store.list_inbox() if q.job_id == job]
+        assert not [s for s in w.store.list_sessions(job) if s.status in ("created", "running")]
         # by label only: the bystander is still running
         bystander.reload()
         assert bystander.status == "running"

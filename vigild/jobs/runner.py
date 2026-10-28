@@ -174,7 +174,13 @@ class Publisher(Protocol):
 
 class Pager(Protocol):
     def page(
-        self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
+        self,
+        job_id: str | None,
+        title: str,
+        body: dict[str, Any],
+        *,
+        resumable: bool = False,
+        own_job: bool = True,
     ) -> Any: ...
     def file_for_approval(self, job_id: str) -> list[str]: ...
     def gate_spec(self, job_id: str) -> list[str]: ...
@@ -443,6 +449,7 @@ class JobRunner:
                              "actions": ["retry", "abandon"]},
                             resumable=True,
                         )  # fmt: skip
+                    self._close_killed(j)  # a run that outlived the kill's wait ends here
                     with self._running_lock:
                         run = next_run(j)
                         if run is None:
@@ -794,7 +801,7 @@ class JobRunner:
 
     def _breaker_page(self, job_id: str | None, title: str, body: dict[str, Any]) -> Any:
         assert self.jobs is not None
-        return self.jobs.page(job_id, title, body)
+        return self.jobs.page(job_id, title, body, own_job=False)  # a breaker's page is global
 
     def _tree_root(self, job: Job) -> str:
         root = job
@@ -883,7 +890,7 @@ class JobRunner:
         actually reached the cap. Anything else (open reservations fill the
         day, a wave too big for what's left) is the job's own problem: None,
         and the caller pages the job."""
-        if e.cap in ("experiment", "bench_task"):
+        if e.cap in ("experiment", "bench_task", "abandoned"):
             return None  # the experiment line is its own hard stop; no global breaker
         kind = CAP_KIND.get(e.cap, Kind.DAILY)
         if kind is Kind.PER_TASK and task_id and self.budget.task_spent(task_id) > 0:
@@ -941,13 +948,17 @@ class JobRunner:
         check is the last thing before the push, for the worker, the deps job and the
         re-send of an open PR alike."""
         if self._abandoned(job.id):
+            killed = bool(
+                self.store.q("SELECT 1 FROM events WHERE job_id=? AND type='job_killed'", (job.id,))
+            )
+            how = "killed" if killed else "abandoned"  # an inbox abandon is not a kill
             self.store.add_event(
                 "publish_skipped",
-                {"reason": "the job was killed", "branch": kw.get("branch"),
+                {"reason": f"the job was {how}", "branch": kw.get("branch"),
                  "head": kw.get("head")},
                 Provenance.HUMAN, job_id=job.id,
             )  # fmt: skip
-            raise PublishSkipped(f"{job.id} was killed; nothing is published")
+            raise PublishSkipped(f"{job.id} was {how}; nothing is published")
         if job.source == "bench":
             url = self.bench_publisher.publish(**kw)
             self.store.add_event(
@@ -1304,6 +1315,16 @@ class JobRunner:
             return self.store.get_job(job_id).state is JobState.ABANDONED
         except KeyError:
             return False
+
+    def _close_killed(self, job_id: str) -> None:
+        """A session of an abandoned job always ends `killed` (#60), including when its run
+        outlived the kill's wait or halted in the verifier. Only the task reset, the failure
+        event and the page are skipped."""
+        if not self._abandoned(job_id):
+            return
+        for s in self.store.list_sessions(job_id):
+            if s.status in LIVE_SESSION:
+                self.store.update_session(s.id, status="killed", ended_at=iso())
 
     def busy(self, job_id: str) -> bool:
         """Whether a run already holds the job (a second start would be dropped)."""
@@ -2555,6 +2576,7 @@ class JobRunner:
         state: str = "failed",
     ) -> bool:
         if self._abandoned(job_id):  # killed: the close-out stands; nothing resets it
+            self._close_killed(job_id)  # but its session ends `killed`, never left running
             return False
         if s is not None:
             self.store.update_session(s.id, status=state)
@@ -2792,6 +2814,9 @@ class JobRunner:
             s.id, detail={"image": session_image, "session_base": session_base}
         )
         out = self._run_session(s, spec, reservation, attrs)
+        if self._abandoned(job_id):  # the kill is the reason it ended: nothing resumes or books
+            self._close_killed(job_id)
+            return False
         if out.status in ("failed", "killed") and not out.result.get("status"):
             # no result line: the container crashed or was killed (item 3)
             self.store.update_session(s.id, status="crashed")
@@ -2857,6 +2882,7 @@ class JobRunner:
                     "resumable": False,
                 },
                 Provenance.CLAUDE,
+                own_job=True,
             )
             return self._fail(
                 job_id,
@@ -2929,6 +2955,7 @@ class JobRunner:
                         scope=list(contract["spec"].get("files_in_scope") or []),
                     )
             except Halted:
+                self._close_killed(job_id)
                 return False  # killed between two runs: no verdict and nothing is written
             except HostRefused as e:  # the grader's host refused: no verdict
                 self._host_refused(job_id, e, "the grader")
@@ -3691,6 +3718,8 @@ class JobRunner:
             return "dispatch" if moved else "done"
         if more:
             return "next"  # clean so far; the next pass reviews the rest
+        if self._abandoned(job_id):
+            return "done"  # killed during the pass: nothing more is written
         left, legacy = self._unstripped(self.store.get_job(job_id))
         if left:
             self._block(job_id, f".vigil/ on the PR head of {sorted(left)}")
@@ -3849,6 +3878,7 @@ class JobRunner:
         self.store.create_inbox_item(
             "ready", "ready_to_merge", job_id, f"Ready to merge: {job.title}",
             {"prs": prs, "actions": ["fix"]},
+            own_job=True,
         )  # fmt: skip
 
     def _review_task(self, job: Any, t: Any) -> tuple[str, Any]:

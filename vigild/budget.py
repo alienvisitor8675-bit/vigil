@@ -143,6 +143,7 @@ class Budget:
         if amount <= 0:
             raise ValueError("a reservation must be positive")
         with self.store.tx() as c:
+            self._refuse_abandoned(session_id=session_id, task_id=task_id, job_id=job_id)
             pool = self.pool_of(session_id=session_id, task_id=task_id, job_id=job_id)
             bench = pool == EXPERIMENT
             task_cap = self.cfg.bench_task_usd if bench else self.cfg.per_task_usd
@@ -188,6 +189,14 @@ class Budget:
                 ),
             )
             return int(cur.lastrowid or 0)
+
+    def _refuse_abandoned(
+        self, *, session_id: str | None, task_id: str | None, job_id: str | None
+    ) -> None:
+        """A killed job opens no new reservation (#60): its sessions are over and the
+        kill settled what it held."""
+        if self.store.is_abandoned(job_id=job_id, session_id=session_id, task_id=task_id):
+            raise BudgetExceeded("abandoned", "the job was abandoned; nothing new is reserved")
 
     def settle(self, reservation_id: int, amount: float | None = None) -> float:
         """Close a reservation; its session's metered cost (or `amount`, for a
@@ -287,6 +296,7 @@ class Budget:
         the caps as usual; if that is refused, the draw is undone."""
         rid, take = 0, 0.0
         with self.store.tx() as c:
+            self._refuse_abandoned(session_id=session_id, task_id=None, job_id=None)
             row = c.execute(
                 "SELECT amount_usd, status, pool FROM reservations WHERE id=?", (parent_id,)
             ).fetchone()

@@ -10,6 +10,7 @@ it is logged; it never skips approval and never invents an edge.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -21,6 +22,7 @@ from vigild.jobs.model import Job, JobState, Role
 from vigild.provenance import Provenance
 
 S = JobState
+log = logging.getLogger(__name__)
 
 
 class Actor(StrEnum):
@@ -355,6 +357,25 @@ def transition(
         kill_hold = frm in HOLDS and to is S.ABANDONED and _killed(ctx)
 
         if frm in TERMINAL:
+            # final means final (#60): whoever asks, by whatever channel, with or without
+            # an override. The refusal is logged and recorded.
+            log.warning(
+                "refused %s -> %s on %s by %s via %s: %s is final",
+                frm.value, to.value, job_id, actor.value, channel, frm.value,
+            )  # fmt: skip
+            store.add_event(
+                "transition_refused",
+                {
+                    "from": frm.value,
+                    "to": to.value,
+                    "actor": actor.value,
+                    "channel": channel,
+                    "override": force,
+                    "evidence": evidence,
+                },
+                Provenance.HUMAN,
+                job_id=job_id,
+            )
             raise TransitionError(f"{job_id} is {frm.value}; no transition out of it")
         if to in HOLDS:
             if frm in HOLDS:

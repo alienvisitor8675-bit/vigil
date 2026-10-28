@@ -655,6 +655,7 @@ class JobService:
                     for w in pdoc.workers
                 ],
             },
+            own_job=True,
         )
 
     def file_deps(
@@ -724,26 +725,41 @@ class JobService:
                     "size": "S", "files_in_scope": list(pol.dev_lockfiles), "depends_on": [],
                 }],
             },
+            own_job=True,
         )  # fmt: skip
         return []
 
     def page(
-        self, job_id: str | None, title: str, body: dict[str, Any], *, resumable: bool = False
+        self,
+        job_id: str | None,
+        title: str,
+        body: dict[str, Any],
+        *,
+        resumable: bool = False,
+        own_job: bool = True,
     ) -> InboxItem:
         """A question or page for the owner: the third inbox queue. A resumable
         page carries the job back to work when the owner resumes it. A bench run pages
         nobody: the page is recorded
         as an event (and its item closed at once), for the run's report."""
         body = {**body, "resumable": resumable}
+        if own_job and job_id is not None and self.store.is_abandoned(job_id=job_id):
+            return self.store.create_inbox_item(
+                "questions", "page", job_id, title, body, own_job=True
+            )
         if job_id is not None and self.store.is_bench(job_id=job_id):
-            item = self.store.create_inbox_item("questions", "page", job_id, title, body)
+            item = self.store.create_inbox_item(
+                "questions", "page", job_id, title, body, own_job=own_job
+            )
             self.store.resolve_inbox_item(item.id, "bench")
             self.store.add_event(
                 "bench_page", {"title": title, "tag": "harness", **body}, Provenance.HUMAN,
                 job_id=job_id,
             )  # fmt: skip
             return self.store.get_inbox_item(item.id)
-        item = self.store.create_inbox_item("questions", "page", job_id, title, body)
+        item = self.store.create_inbox_item(
+            "questions", "page", job_id, title, body, own_job=own_job
+        )
         self.store.add_event(
             "page", {"item": item.id, "title": title, **body}, Provenance.HUMAN, job_id=job_id
         )
@@ -1125,9 +1141,12 @@ class JobService:
         out: dict[str, Any] = {"job_id": job_id, "killed": False, "already": None}
 
         def already(state: JobState, *, effects: dict[str, Any] | None = None) -> dict[str, Any]:
+            msg = f"{job_id} is already {state.value}; nothing to kill"
+            if effects is not None:  # abandoned from the inbox: the stop ran, there was no kill
+                msg = f"{job_id} was already {state.value}; stopped anything it still had running"
             return {
                 **out, "state": state.value, "already": state.value, "completed": True,
-                "message": f"{job_id} is already {state.value}; nothing to kill",
+                "message": msg,
                 **(effects or {}),
             }  # fmt: skip
 
